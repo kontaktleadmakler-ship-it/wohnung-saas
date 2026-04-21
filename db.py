@@ -1,36 +1,37 @@
-import sqlite3
+import os
+import psycopg2
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+def get_conn():
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL fehlt")
+        return None
+
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
 
 def init_db():
-    conn = sqlite3.connect("leads.db")
+    conn = get_conn()
+    if not conn:
+        return
+
     cur = conn.cursor()
 
-    # USERS
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        password TEXT
-    )
+        CREATE TABLE IF NOT EXISTS listings (
+            id SERIAL PRIMARY KEY,
+            title TEXT,
+            price TEXT,
+            rooms TEXT,
+            size TEXT,
+            location TEXT,
+            url TEXT UNIQUE
+        );
     """)
-
-    # LEADS
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS leads (
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        price INTEGER,
-        rooms REAL,
-        size REAL,
-        link TEXT,
-        source TEXT
-    )
-    """)
-
-    # Demo User (nur beim ersten Start)
-    cur.execute("SELECT * FROM users WHERE username='admin'")
-    if not cur.fetchone():
-        cur.execute("INSERT INTO users (username, password) VALUES (?,?)",
-                    ("admin", "1234"))
 
     conn.commit()
+    cur.close()
     conn.close()
+    print("✅ DB ready")
