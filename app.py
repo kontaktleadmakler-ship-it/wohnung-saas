@@ -5,29 +5,30 @@ from flask import Flask, render_template, request, redirect, url_for, session
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
 
-# -----------------------------
-# DATABASE CONFIG (FIXED)
-# -----------------------------
-DATABASE_URL = os.environ.get("DATABASE_URL")
 
-if not DATABASE_URL:
-    print("❌ DATABASE_URL fehlt! Bitte in Render Environment Variables setzen.")
+# -----------------------------
+# DATABASE (SAFE FIX)
+# -----------------------------
+def get_db_url():
+    return os.environ.get("DATABASE_URL")
 
 
 def db():
-    """
-    Safe DB connection for Render PostgreSQL
-    """
+    DATABASE_URL = get_db_url()
+
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL fehlt!")
+        return None
+
     try:
-        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-        return conn
+        return psycopg2.connect(DATABASE_URL, sslmode="require")
     except Exception as e:
         print("❌ DB CONNECTION ERROR:", e)
         return None
 
 
 # -----------------------------
-# INIT DB TABLES
+# INIT DB
 # -----------------------------
 def init_db():
     conn = db()
@@ -54,13 +55,13 @@ def init_db():
 
 
 # -----------------------------
-# ROUTES
+# HOME / DASHBOARD
 # -----------------------------
 @app.route("/")
 def home():
     conn = db()
     if not conn:
-        return "DB not connected"
+        return "❌ DB not connected"
 
     cur = conn.cursor()
     cur.execute("SELECT * FROM listings ORDER BY id DESC LIMIT 50;")
@@ -72,20 +73,19 @@ def home():
     return render_template("dashboard.html", listings=rows)
 
 
+# -----------------------------
+# SCRAPER TEST ROUTE
+# -----------------------------
 @app.route("/scraper/run")
 def run_scraper():
-    """
-    Placeholder scraper trigger
-    """
     print("🚀 Scraper started")
 
     conn = db()
     if not conn:
-        return "DB not connected"
+        return "❌ DB not connected"
 
     cur = conn.cursor()
 
-    # TEST INSERT (damit du sofort Daten siehst)
     cur.execute("""
         INSERT INTO listings (title, price, location, url)
         VALUES (%s, %s, %s, %s)
@@ -99,9 +99,12 @@ def run_scraper():
     return redirect(url_for("home"))
 
 
+# -----------------------------
+# AUTH PLACEHOLDER
+# -----------------------------
 @app.route("/login")
 def login():
-    return "Login Page (placeholder)"
+    return "Login Page"
 
 
 @app.route("/logout")
@@ -111,7 +114,7 @@ def logout():
 
 
 # -----------------------------
-# START APP
+# START
 # -----------------------------
 if __name__ == "__main__":
     init_db()
