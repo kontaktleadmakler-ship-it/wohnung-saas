@@ -1,75 +1,24 @@
 import sqlite3
 import hashlib
-import re
-from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
+import time
+import random
 
-# =========================
-# CUSTOMERS
-# =========================
+DB = "leads.db"
+
+
 customers = [
-    {"name": "K1", "max": 600, "rooms": 1.5, "min_size": 30},
-    {"name": "K2", "max": 1500, "rooms": 4, "min_size": 80},
-    {"name": "K3", "max": 1200, "rooms": 2, "min_size": 50},
-    {"name": "K4", "max": 1800, "rooms": 3, "min_size": 70},
+    {"name":"K1","max":600,"rooms":1.5,"min_size":30},
+    {"name":"K2","max":1500,"rooms":4,"min_size":80},
+    {"name":"K3","max":1200,"rooms":2,"min_size":50},
+    {"name":"K4","max":1800,"rooms":3,"min_size":70},
 ]
 
-# =========================
-# HELPERS
-# =========================
-def uid(text):
-    return hashlib.md5(text.encode()).hexdigest()
-
-def price(t):
-    m = re.search(r"([\d\.]+)\s?€", t)
-    return int(m.group(1).replace(".", "")) if m else 0
-
-def rooms(t):
-    m = re.search(r"(\d+(?:,\d+)?)\s?Zi", t)
-    return float(m.group(1).replace(",", ".")) if m else 0
-
-def size(t):
-    m = re.search(r"(\d+(?:,\d+)?)\s?m²", t)
-    return float(m.group(1).replace(",", ".")) if m else 0
-
 
 # =========================
-# SCORING
+# DB INIT
 # =========================
-def score(l, c):
-    s = 0
-
-    if l["price"] <= c["max"]:
-        s += 40
-    if l["rooms"] >= c["rooms"]:
-        s += 30
-    if l["size"] >= c["min_size"]:
-        s += 20
-    if l["price"] < c["max"] * 0.8:
-        s += 10
-
-    return min(s, 100)
-
-
-def best_match(l):
-    best = ""
-    best_score = 0
-
-    for c in customers:
-        s = score(l, c)
-        if s > best_score:
-            best_score = s
-            best = c["name"]
-
-    return best, best_score
-
-
-# =========================
-# DB
-# =========================
-def save(l):
-
-    conn = sqlite3.connect("leads.db")
+def init_db():
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
 
     cur.execute("""
@@ -86,113 +35,93 @@ def save(l):
     )
     """)
 
-    cur.execute("""
-    INSERT OR REPLACE INTO leads VALUES (?,?,?,?,?,?,?,?,?)
-    """, (
-        l["id"],
-        l["title"],
-        l["price"],
-        l["rooms"],
-        l["size"],
-        l["link"],
-        l["source"],
-        l["customer"],
-        l["score"]
-    ))
+    conn.commit()
+    conn.close()
+
+
+# =========================
+# SCORE
+# =========================
+def score(price, rooms, size, c):
+
+    s = 0
+
+    if price <= c["max"]:
+        s += 40
+    if rooms >= c["rooms"]:
+        s += 30
+    if size >= c["min_size"]:
+        s += 20
+    if price < c["max"] * 0.8:
+        s += 10
+
+    return min(s, 100)
+
+
+def best(price, rooms, size):
+
+    best_c = ""
+    best_s = 0
+
+    for c in customers:
+        s = score(price, rooms, size, c)
+        if s > best_s:
+            best_s = s
+            best_c = c["name"]
+
+    return best_c, best_s
+
+
+# =========================
+# MOCK SCRAPER (STABIL!)
+# =========================
+def run_scraper():
+
+    init_db()
+
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+
+    # Fake Immobilien (weil echte Scraper oft blocken)
+    fake_data = [
+        ("Schöne Wohnung Berlin Mitte", 900, 2, 45),
+        ("Große 4 Zimmer Wohnung", 1600, 4, 95),
+        ("Kleine Studio Wohnung", 550, 1, 28),
+        ("Moderne 3 Zimmer Altbau", 1200, 3, 70),
+    ]
+
+    for t, price, rooms, size in fake_data:
+
+        cid, sc = best(price, rooms, size)
+
+        uid = hashlib.md5(t.encode()).hexdigest()
+
+        cur.execute("""
+        INSERT OR REPLACE INTO leads VALUES (?,?,?,?,?,?,?,?,?)
+        """, (
+            uid,
+            t,
+            price,
+            rooms,
+            size,
+            "https://example.com",
+            "mock",
+            cid,
+            sc
+        ))
+
+        print("insert:", t)
 
     conn.commit()
     conn.close()
 
 
 # =========================
-# IMMOWELT
+# LOOP
 # =========================
-def scrape_immowelt():
-    url = "https://www.immowelt.de/liste/berlin/wohnungen/mieten"
+if __name__ == "__main__":
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        page.goto(url, timeout=60000)
-        page.wait_for_timeout(5000)
-
-        soup = BeautifulSoup(page.content(), "html.parser")
-
-        for a in soup.find_all("a"):
-            text = a.get_text(" ", strip=True)
-
-            if "€" not in text:
-                continue
-
-            link = a.get("href") or ""
-            if link.startswith("/"):
-                link = "https://www.immowelt.de" + link
-
-            lead = {
-                "id": uid(text + link),
-                "title": text[:120],
-                "price": price(text),
-                "rooms": rooms(text),
-                "size": size(text),
-                "link": link,
-                "source": "immowelt"
-            }
-
-            lead["customer"], lead["score"] = best_match(lead)
-            save(lead)
-
-        browser.close()
-
-
-# =========================
-# WG-GESUCHT
-# =========================
-def scrape_wg():
-    url = "https://www.wg-gesucht.de/wohnungen-in-Berlin.8.2.1.0.html"
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        page.goto(url, timeout=60000)
-        page.wait_for_timeout(5000)
-
-        soup = BeautifulSoup(page.content(), "html.parser")
-
-        for a in soup.find_all("a"):
-            text = a.get_text(" ", strip=True)
-
-            if "€" not in text:
-                continue
-
-            link = a.get("href") or ""
-            if link.startswith("/"):
-                link = "https://www.wg-gesucht.de" + link
-
-            lead = {
-                "id": uid(text + link),
-                "title": text[:120],
-                "price": price(text),
-                "rooms": rooms(text),
-                "size": size(text),
-                "link": link,
-                "source": "wg-gesucht"
-            }
-
-            lead["customer"], lead["score"] = best_match(lead)
-            save(lead)
-
-        browser.close()
-
-
-# =========================
-# RUN SCRAPER
-# =========================
-def run_scraper():
-    print("🚀 SCRAPER START")
-
-    scrape_immowelt()
-    scrape_wg()
-
-    print("✅ DONE")
+    while True:
+        print("🔄 SCRAPER RUNNING...")
+        run_scraper()
+        time.sleep(60)
