@@ -1,17 +1,40 @@
 from flask import Flask, render_template, request, redirect, session
 import sqlite3
-from scraper import run_scraper
+import os
 
 app = Flask(__name__)
 app.secret_key = "v5saas"
 
-
-def db():
-    return sqlite3.connect("leads.db")
+DB = "leads.db"
 
 
 # =========================
-# LOGIN
+# 💾 DB INIT (WICHTIG!)
+# =========================
+def init_db():
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS leads (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        price INTEGER,
+        rooms REAL,
+        size REAL,
+        link TEXT,
+        source TEXT,
+        customer TEXT,
+        score INTEGER
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# =========================
+# 🔐 LOGIN
 # =========================
 @app.route("/", methods=["GET", "POST"])
 def login():
@@ -21,11 +44,18 @@ def login():
             session["user"] = "admin"
             return redirect("/dashboard")
 
-    return render_template("login.html")
+    return """
+    <h2>Login</h2>
+    <form method="post">
+        <input name="username" placeholder="user">
+        <input name="password" placeholder="pass" type="password">
+        <button type="submit">Login</button>
+    </form>
+    """
 
 
 # =========================
-# DASHBOARD
+# 📊 DASHBOARD
 # =========================
 @app.route("/dashboard")
 def dashboard():
@@ -33,34 +63,50 @@ def dashboard():
     if "user" not in session:
         return redirect("/")
 
-    conn = db()
+    init_db()
+
+    score_filter = request.args.get("score", "0")
+
+    try:
+        score_filter = int(score_filter)
+    except:
+        score_filter = 0
+
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT * FROM leads ORDER BY score DESC
-    """)
+        SELECT * FROM leads
+        WHERE score >= ?
+        ORDER BY score DESC
+    """, (score_filter,))
 
     leads = cur.fetchall()
     conn.close()
 
-    return render_template("dashboard.html", leads=leads)
+    html = "<h1>Dashboard</h1>"
+    html += "<a href='/logout'>Logout</a><br><br>"
+
+    html += "<form><input name='score' placeholder='min score'><button>Filter</button></form><br>"
+
+    if not leads:
+        html += "<h3>⚠️ Keine Daten in DB – Scraper starten!</h3>"
+    else:
+        for l in leads:
+            html += f"""
+            <div style='border:1px solid #ccc;padding:10px;margin:10px'>
+                <b>{l[1]}</b><br>
+                💶 {l[2]}€ | 🏠 {l[3]} Zi | 📏 {l[4]} m²<br>
+                ⭐ Score: {l[8]} | 👤 {l[7]}<br>
+                <a href="{l[5]}" target="_blank">Link</a>
+            </div>
+            """
+
+    return html
 
 
 # =========================
-# SCRAPER TRIGGER
-# =========================
-@app.route("/scrape")
-def scrape():
-
-    if "user" not in session:
-        return redirect("/")
-
-    run_scraper()
-    return redirect("/dashboard")
-
-
-# =========================
-# LOGOUT
+# 🚪 LOGOUT
 # =========================
 @app.route("/logout")
 def logout():
@@ -69,10 +115,12 @@ def logout():
 
 
 # =========================
-# START SERVER (WICHTIG FÜR RENDER)
+# 🚀 START (RENDER FIX)
 # =========================
 if __name__ == "__main__":
-    import os
+    init_db()
+
+    print("🔥 CRM RUNNING")
 
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
