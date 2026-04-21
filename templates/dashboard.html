@@ -1,30 +1,30 @@
-<h1>🏠 V5 CRM Dashboard</h1>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard</title>
+</head>
+<body>
+
+<h1>Leads Dashboard</h1>
 
 <a href="/logout">Logout</a>
 
-<hr>
-
+<h3>Filter</h3>
 <form method="GET">
-    Filter Score:
-    <input name="score" type="number" placeholder="min score (0-100)">
-    <button>Filter</button>
+    <input name="score" placeholder="Min Score">
+    <button type="submit">Filter</button>
 </form>
 
 <hr>
 
-{% for l in leads %}
-<div style="border:1px solid #ccc; margin:10px; padding:10px;">
-
-    <b>{{l[1]}}</b><br><br>
-
-    💰 {{l[2]}} €<br>
-    🛏 {{l[3]}} Zi<br>
-    📏 {{l[4]}} m²<br><br>
-
-    👤 {{l[7]}}<br>
-    ⭐ Score: {{l[8]}}<br><br>
-
-    🔗 <a href="{{l[5]}}" target="_blank">Open</a>
-
-</div>
+{% for lead in leads %}
+    <div style="border:1px solid #ccc; padding:10px; margin:10px;">
+        <b>{{ lead["name"] }}</b><br>
+        {{ lead["email"] }}<br>
+        {{ lead["phone"] }}<br>
+        Score: {{ lead["score"] }}
+    </div>
 {% endfor %}
+
+</body>
+</html>
