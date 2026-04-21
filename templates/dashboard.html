@@ -1,30 +1,29 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Dashboard</title>
-</head>
-<body>
-
 <h1>Leads Dashboard</h1>
 
+<a href="/scrape">🔄 Scrape jetzt</a>
 <a href="/logout">Logout</a>
 
-<h3>Filter</h3>
-<form method="GET">
-    <input name="score" placeholder="Min Score">
-    <button type="submit">Filter</button>
-</form>
+<table border="1">
+<tr>
+    <th>Title</th>
+    <th>Price</th>
+    <th>Rooms</th>
+    <th>Size</th>
+    <th>Source</th>
+    <th>Customer</th>
+    <th>Score</th>
+</tr>
 
-<hr>
-
-{% for lead in leads %}
-    <div style="border:1px solid #ccc; padding:10px; margin:10px;">
-        <b>{{ lead["name"] }}</b><br>
-        {{ lead["email"] }}<br>
-        {{ lead["phone"] }}<br>
-        Score: {{ lead["score"] }}
-    </div>
+{% for l in leads %}
+<tr>
+    <td><a href="{{ l[5] }}" target="_blank">{{ l[1] }}</a></td>
+    <td>{{ l[2] }}</td>
+    <td>{{ l[3] }}</td>
+    <td>{{ l[4] }}</td>
+    <td>{{ l[6] }}</td>
+    <td>{{ l[7] }}</td>
+    <td>{{ l[8] }}</td>
+</tr>
 {% endfor %}
 
-</body>
-</html>
+</table>
