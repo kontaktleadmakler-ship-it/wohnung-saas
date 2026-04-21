@@ -1,65 +1,35 @@
-import sqlite3
-import hashlib
+import os
 import time
+import hashlib
+import psycopg2
 import random
 
-DB = "leads.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 customers = [
     {"name":"K1","max":600,"rooms":1.5,"min_size":30},
     {"name":"K2","max":1500,"rooms":4,"min_size":80},
     {"name":"K3","max":1200,"rooms":2,"min_size":50},
-    {"name":"K4","max":1800,"rooms":3,"min_size":70},
 ]
 
 
-# =========================
-# DB INIT
-# =========================
-def init_db():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS leads (
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        price INTEGER,
-        rooms REAL,
-        size REAL,
-        link TEXT,
-        source TEXT,
-        customer TEXT,
-        score INTEGER
-    )
-    """)
-
-    conn.commit()
-    conn.close()
+def db():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 
-# =========================
-# SCORE
-# =========================
 def score(price, rooms, size, c):
-
     s = 0
-
     if price <= c["max"]:
         s += 40
     if rooms >= c["rooms"]:
         s += 30
     if size >= c["min_size"]:
         s += 20
-    if price < c["max"] * 0.8:
-        s += 10
-
-    return min(s, 100)
+    return s
 
 
 def best(price, rooms, size):
-
     best_c = ""
     best_s = 0
 
@@ -72,56 +42,55 @@ def best(price, rooms, size):
     return best_c, best_s
 
 
-# =========================
-# MOCK SCRAPER (STABIL!)
-# =========================
-def run_scraper():
+def run():
 
-    init_db()
-
-    conn = sqlite3.connect(DB)
+    conn = db()
     cur = conn.cursor()
 
-    # Fake Immobilien (weil echte Scraper oft blocken)
-    fake_data = [
-        ("Schöne Wohnung Berlin Mitte", 900, 2, 45),
-        ("Große 4 Zimmer Wohnung", 1600, 4, 95),
-        ("Kleine Studio Wohnung", 550, 1, 28),
-        ("Moderne 3 Zimmer Altbau", 1200, 3, 70),
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS leads (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        price INT,
+        rooms FLOAT,
+        size FLOAT,
+        link TEXT,
+        source TEXT,
+        customer TEXT,
+        score INT
+    )
+    """)
+
+    fake = [
+        ("Berlin Mitte Luxus", 900, 2, 50),
+        ("Altbau Wohnung", 1300, 3, 75),
+        ("Studenten Wohnung", 500, 1, 25),
     ]
 
-    for t, price, rooms, size in fake_data:
+    for t, price, rooms, size in fake:
 
         cid, sc = best(price, rooms, size)
 
         uid = hashlib.md5(t.encode()).hexdigest()
 
         cur.execute("""
-        INSERT OR REPLACE INTO leads VALUES (?,?,?,?,?,?,?,?,?)
+        INSERT INTO leads VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (id) DO NOTHING
         """, (
-            uid,
-            t,
-            price,
-            rooms,
-            size,
+            uid, t, price, rooms, size,
             "https://example.com",
-            "mock",
+            "worker",
             cid,
             sc
         ))
 
-        print("insert:", t)
+        print("inserted:", t)
 
     conn.commit()
     conn.close()
 
 
-# =========================
-# LOOP
-# =========================
-if __name__ == "__main__":
-
-    while True:
-        print("🔄 SCRAPER RUNNING...")
-        run_scraper()
-        time.sleep(60)
+while True:
+    print("SCRAPER RUNNING...")
+    run()
+    time.sleep(30)
