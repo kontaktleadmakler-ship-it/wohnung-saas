@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: wohnung-saas-web
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+
+  - type: worker
+    name: wohnung-saas-worker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scraper.py
