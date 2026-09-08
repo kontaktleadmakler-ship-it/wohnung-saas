@@ -1,9 +1,7 @@
-# scrapers/immonet.py (Gerüst)
-#
-# Praktisches Problem: gehört wie ImmoScout24 zur selben Unternehmensgruppe,
-# oft ähnliche/gespiegelte Inserate wie auf Schwesterportalen. Vor Rollout prüfen,
-# ob echte Zusatz-Abdeckung entsteht oder v. a. Duplikate von anderen Quellen.
+# scrapers/immonet.py
+import re
 from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 from .base import BaseScraper
 from .models import Listing, SearchParams
 
@@ -23,16 +21,60 @@ class ImmonetScraper(BaseScraper):
             return html
 
     def build_search_urls(self, params: SearchParams) -> list[str]:
-        # Parameter vor Rollout gegen die Live-Seite verifizieren.
         if params.nationwide or not params.region_codes:
-            return ["https://www.immonet.de/immobiliensuche/sel.do?suchart=miete&pageType=result"]
+            return ["https://www.immonet.de/immobiliensuche/sel.do?suchart=miete"]
         return [
-            f"https://www.immonet.de/immobiliensuche/sel.do?suchart=miete&pageType=result&region={code}"
+            f"https://www.immonet.de/immobiliensuche/sel.do?suchart=miete&region={code}"
             for code in params.region_codes
         ]
 
     def parse_listing_cards(self, html: str) -> list[dict]:
-        raise NotImplementedError("Selektoren gegen aktuelles Live-DOM verifizieren")
+        soup = BeautifulSoup(html, "html.parser")
+        cards = []
+        for card in soup.select("div.list-entry"):
+            link_el = card.select_one("a[href*='/angebot/']")
+            if not link_el:
+                continue
+            title_el = card.select_one("h3, h2")
+            price_el = card.select_one("div.list-entry__price")
+            rooms_el = card.select_one("span[data-testid='rooms']")
+            size_el = card.select_one("span[data-testid='area']")
+            location_el = card.select_one("div.list-entry__location")
+            cards.append({
+                "href": link_el.get("href", ""),
+                "external_id": re.search(r"angebot/(\d+)", link_el.get("href", "")).group(1) if re.search(r"angebot/(\d+)", link_el.get("href", "")) else "",
+                "title": title_el.get_text(strip=True) if title_el else "",
+                "price_text": price_el.get_text(strip=True) if price_el else None,
+                "rooms_text": rooms_el.get_text(strip=True) if rooms_el else None,
+                "size_text": size_el.get_text(strip=True) if size_el else None,
+                "location": location_el.get_text(strip=True) if location_el else None,
+            })
+        return cards
 
     def normalize(self, raw: dict) -> Listing | None:
-        raise NotImplementedError
+        if not raw.get("title") or not raw.get("external_id"):
+            return None
+        price = self._parse_number(raw.get("price_text"))
+        rooms = self._parse_number(raw.get("rooms_text"))
+        size = self._parse_number(raw.get("size_text"))
+        url = raw["href"] if raw["href"].startswith("http") else "https://www.immonet.de" + raw["href"]
+        return Listing(
+            source=self.SOURCE_KEY,
+            external_id=raw["external_id"],
+            url=url,
+            title=raw["title"],
+            price=price,
+            rooms=rooms,
+            size=size,
+            address=raw.get("location"),
+        )
+
+    @staticmethod
+    def _parse_number(text: str):
+        if not text:
+            return None
+        cleaned = re.sub(r"[^\d,\.]", "", text).replace(".", "").replace(",", ".")
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
