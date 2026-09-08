@@ -2,8 +2,9 @@ services:
   - type: web
     name: wohnung-saas-web
     env: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium
+    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
     startCommand: python app.py
+    healthCheckPath: /healthz
     envVars:
       - key: DATABASE_URL
         sync: false
@@ -17,18 +18,22 @@ services:
   - type: worker
     name: wohnung-saas-worker
     env: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium
+    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
     startCommand: python scraper.py
     envVars:
       - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: APP_PASSWORD
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: POLL_INTERVAL_SECONDS
-        value: "180"
+        value: "300"
       - key: MIN_NOTIFY_SCORE
-        value: "60"
+        value: "75"
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: "0"

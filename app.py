@@ -1,138 +1,88 @@
-import os
-import logging
-import threading
+from __future__ import annotations
+import os, threading, logging
 from functools import wraps
-
 from flask import Flask, render_template, request, redirect, url_for, session, flash
-
-import db
-import scraper as scraper_module
+import db, scraper as worker
 from scrapers.registry import list_sources
 from scrapers.regions import BUNDESLAENDER
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
-
-APP_PASSWORD = os.environ.get("APP_PASSWORD")  # Login-Passwort für das Dashboard
-
-log = logging.getLogger("app")
-
-# Manueller Scan läuft im Hintergrund-Thread des Web-Prozesses (kein separater
-# Trigger für den Worker-Service nötig). _scan_running verhindert, dass ein
-# Klick auf den Button einen zweiten Lauf parallel startet, während einer läuft.
-_scan_running = False
-_scan_lock = threading.Lock()
+app=Flask(__name__)
+app.secret_key=os.getenv('SECRET_KEY') or 'change-me-in-production'
+APP_PASSWORD=os.getenv('APP_PASSWORD')
+log=logging.getLogger('web')
+scan_thread=None
+scan_lock=threading.Lock()
 
 
-def login_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if APP_PASSWORD and not session.get("logged_in"):
-            return redirect(url_for("login"))
-        return view(*args, **kwargs)
-    return wrapped
+def auth(view):
+ @wraps(view)
+ def wrapper(*a,**kw):
+  if APP_PASSWORD and not session.get('logged_in'): return redirect(url_for('login',next=request.path))
+  return view(*a,**kw)
+ return wrapper
 
+@app.before_request
+def ensure_db():
+ if request.endpoint!='static':
+  try: db.init_db()
+  except Exception: log.exception('DB-Initialisierung fehlgeschlagen')
 
-@app.route("/login", methods=["GET", "POST"])
+@app.route('/login',methods=['GET','POST'])
 def login():
-    if request.method == "POST":
-        if not APP_PASSWORD or request.form.get("password") == APP_PASSWORD:
-            session["logged_in"] = True
-            return redirect(url_for("home"))
-        return render_template("login.html", error="Falsches Passwort")
-    return render_template("login.html", error=None)
+ if request.method=='POST':
+  if not APP_PASSWORD or request.form.get('password','')==APP_PASSWORD:
+   session['logged_in']=True; return redirect(request.args.get('next') or url_for('home'))
+  return render_template('login.html',error='Falsches Passwort')
+ return render_template('login.html',error=None)
+@app.route('/logout')
+def logout(): session.clear(); return redirect(url_for('login'))
 
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
-@app.route("/")
-@login_required
+@app.route('/')
+@auth
 def home():
-    min_score = int(request.args.get("min_score", 0))
-    profile_id = request.args.get("profile_id") or None
-    rows = db.get_dashboard_rows(min_score=min_score, profile_id=profile_id)
-    profiles = db.get_active_profiles()
-    return render_template(
-        "dashboard.html", rows=rows, profiles=profiles,
-        min_score=min_score, selected_profile=profile_id,
-        scan_running=_scan_running,
-    )
+ try: rows=db.get_dashboard_rows(int(request.args.get('min_score',0)),request.args.get('profile_id') or None)
+ except Exception: rows=[]; flash('Datenbank konnte nicht gelesen werden.')
+ return render_template('dashboard.html',rows=rows,profiles=db.get_active_profiles(),min_score=int(request.args.get('min_score',0)),selected_profile=request.args.get('profile_id') or '',scan_running=bool(scan_thread and scan_thread.is_alive()))
 
-
-@app.route("/scan/run", methods=["POST"])
-@login_required
+@app.route('/scan/run',methods=['POST'])
+@auth
 def run_scan():
-    global _scan_running
+ global scan_thread
+ with scan_lock:
+  if scan_thread and scan_thread.is_alive(): flash('Scan läuft bereits.'); return redirect(url_for('home'))
+  scan_thread=threading.Thread(target=_manual_scan,daemon=True); scan_thread.start()
+ flash('Scan gestartet. Der PostgreSQL-Lock verhindert parallele Scans auch zwischen Web und Worker.')
+ return redirect(url_for('home'))
 
-    with _scan_lock:
-        if _scan_running:
-            flash("Scan läuft bereits — bitte kurz warten.")
-            return redirect(url_for("home"))
-        _scan_running = True
+def _manual_scan():
+ try: worker.run_once()
+ except Exception: log.exception('Manueller Scan fehlgeschlagen')
 
-    def _run():
-        global _scan_running
-        try:
-            log.info("Manueller Scan gestartet")
-            scraper_module.run_once()
-            log.info("Manueller Scan abgeschlossen")
-        except Exception:
-            log.exception("Manueller Scan fehlgeschlagen")
-        finally:
-            _scan_running = False
-
-    threading.Thread(target=_run, daemon=True).start()
-    flash("Scan gestartet — Treffer erscheinen hier, sobald der Lauf durch ist. Fortschritt steht im Render-Log.")
-    return redirect(url_for("home"))
-
-
-@app.route("/profiles", methods=["GET", "POST"])
-@login_required
+@app.route('/profiles',methods=['GET','POST'])
+@auth
 def profiles():
-    if request.method == "POST":
-        profile_id = db.add_profile({
-            "name": request.form["name"],
-            "min_price": request.form.get("min_price") or 0,
-            "max_price": request.form["max_price"],
-            "min_rooms": request.form.get("min_rooms") or 0,
-            "max_rooms": request.form.get("max_rooms") or None,
-            "min_size": request.form.get("min_size") or 0,
-            "districts": request.form.get("districts", ""),
-            "keywords_exclude": request.form.get("keywords_exclude", ""),
-        })
-        db.set_profile_sources(profile_id, request.form.getlist("sources"))
-        db.set_profile_regions(profile_id, request.form.getlist("regions"))
-        return redirect(url_for("profiles"))
+ if request.method=='POST':
+  data=_profile_form(); pid=db.add_profile(data); db.set_profile_sources(pid,request.form.getlist('sources')); db.set_profile_regions(pid,request.form.getlist('regions')); flash('Profil angelegt.'); return redirect(url_for('profiles'))
+ return render_template('profiles.html',profiles=[db.get_profile(p['id']) for p in db.get_active_profiles()],available_sources=list_sources(),available_regions=BUNDESLAENDER)
 
-    return render_template(
-        "profiles.html",
-        profiles=db.get_active_profiles_with_sources(),
-        available_sources=list_sources(),
-        available_regions=BUNDESLAENDER,
-    )
+@app.route('/profiles/<int:pid>/edit',methods=['POST'])
+@auth
+def edit_profile(pid):
+ data=_profile_form(); data['active']=request.form.get('active')=='1'; db.update_profile(pid,data); db.set_profile_sources(pid,request.form.getlist('sources')); db.set_profile_regions(pid,request.form.getlist('regions')); flash('Profil gespeichert.'); return redirect(url_for('profiles'))
 
+@app.route('/profiles/<int:pid>/delete',methods=['POST'])
+@auth
+def delete_profile(pid): db.delete_profile(pid); flash('Profil gelöscht.'); return redirect(url_for('profiles'))
 
-@app.route("/profiles/<int:profile_id>/sources", methods=["POST"])
-@login_required
-def update_profile_sources(profile_id):
-    """Nachträgliche Änderung der Quellen/Regionen, ohne das ganze Profil neu anzulegen."""
-    db.set_profile_sources(profile_id, request.form.getlist("sources"))
-    db.set_profile_regions(profile_id, request.form.getlist("regions"))
-    return redirect(url_for("profiles"))
+@app.route('/healthz')
+def healthz():
+ try: db.init_db(); return {'ok':True},200
+ except Exception as e: return {'ok':False,'error':str(e)},503
 
+def _profile_form():
+ def num(name,default=0):
+  v=request.form.get(name,'').strip(); return float(v) if v else default
+ return {'name':request.form.get('name','').strip(),'min_price':num('min_price'),'max_price':num('max_price'),'min_rooms':num('min_rooms'),'max_rooms':(float(request.form['max_rooms']) if request.form.get('max_rooms') else None),'min_size':num('min_size'),'districts':request.form.get('districts',''),'keywords_exclude':request.form.get('keywords_exclude',''),'active':True}
 
-@app.route("/profiles/<int:profile_id>/delete", methods=["POST"])
-@login_required
-def delete_profile(profile_id):
-    db.delete_profile(profile_id)
-    return redirect(url_for("profiles"))
-
-
-if __name__ == "__main__":
-    db.init_db()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+if __name__=='__main__':
+ db.init_db(); app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))

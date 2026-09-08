@@ -1,93 +1,73 @@
-# scraper.py
-import os
-import time
-import logging
-
+from __future__ import annotations
+import logging, os, time
 import db
 from matching import score_listing
 from telegram import send_telegram, format_match_message
 from scrapers.registry import get_scraper
 from scrapers.models import SearchParams
-from scrapers.regions import resolve_region_codes, NATIONWIDE
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-log = logging.getLogger("orchestrator")
+logging.basicConfig(level=logging.INFO,format='%(asctime)s %(name)s %(levelname)s %(message)s')
+log=logging.getLogger('worker')
+POLL_INTERVAL_SECONDS=max(30,int(os.getenv('POLL_INTERVAL_SECONDS','300')))
+MIN_NOTIFY_SCORE=max(0,min(100,int(os.getenv('MIN_NOTIFY_SCORE','75'))))
 
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "180"))
-MIN_NOTIFY_SCORE = int(os.environ.get("MIN_NOTIFY_SCORE", "60"))
-
+def _locations(profile):
+    raw=profile.get('districts') or ''
+    vals=[x.strip() for x in raw.replace(';',',').split(',') if x.strip()]
+    if vals:return vals
+    if 'BE' in (profile.get('regions') or []):return ['Berlin']
+    return []
 
 def build_jobs(profiles):
-    """Leitet die distinct (source, region_scope)-Jobs aus allen aktiven Profilen ab.
-    Region_scope ist ein Tuple aus resolvten Codes, damit z.B. ['BY'] und ['BY'] von
-    zwei Profilen zu EINEM Job zusammenfallen."""
-    jobs = {}  # (source, region_tuple) -> set(profile_id, ...)
+    jobs={}
     for p in profiles:
-        region_tuple = tuple(sorted(resolve_region_codes(p.get("regions") or [])))
-        for source in (p.get("sources") or []):
-            key = (source, region_tuple)
-            jobs.setdefault(key, set()).add(p["id"])
+        regions=tuple(sorted(p.get('regions') or ['DE']))
+        locations=tuple(sorted(_locations(p)))
+        for source in p.get('sources') or []:
+            key=(source,regions,locations)
+            jobs.setdefault(key,set()).add(p['id'])
     return jobs
 
-
-def process_listing(listing, profiles_by_id, affected_profile_ids):
-    listing_id, is_new = db.upsert_listing(listing)
-
-    for profile_id in affected_profile_ids:
-        profile = profiles_by_id[profile_id]
-        s = score_listing(listing.__dict__, profile)
-        if s is None:
-            continue
-
-        is_first_notify = db.save_match(listing_id, profile_id, s)
-        if is_new and is_first_notify and s >= MIN_NOTIFY_SCORE:
-            msg = format_match_message(
-                profile["name"], s, listing.title, listing.price,
-                listing.rooms, listing.size, listing.address, listing.url,
-            )
-            if send_telegram(msg):
-                db.mark_notified(listing_id, profile_id)
-
+def process_listing(item,profiles_by_id,profile_ids):
+    listing_id,is_new=db.upsert_listing(item)
+    for pid in profile_ids:
+        p=profiles_by_id[pid]
+        result=score_listing(item.__dict__,p)
+        if not result:continue
+        score,components,reasons=result
+        first=db.save_match(listing_id,pid,score,components,reasons)
+        if first and score>=MIN_NOTIFY_SCORE:
+            msg=format_match_message(p['name'],score,item.title,item.price or item.price_total,item.rooms,item.size,item.address,item.url,item.source)
+            if send_telegram(msg): db.mark_notified(listing_id,pid)
 
 def run_once():
-    profiles = db.get_active_profiles_with_sources()
-    if not profiles:
-        log.info("Keine aktiven Profile - überspringe Lauf")
-        return
-
-    profiles_by_id = {p["id"]: p for p in profiles}
-    jobs = build_jobs(profiles)
-    log.info("%d Scrape-Jobs für %d aktive Profile", len(jobs), len(profiles))
-
-    for (source, region_tuple), affected_profile_ids in jobs.items():
-        try:
-            scraper = get_scraper(source)
-        except KeyError:
-            log.error("Unbekannte Quelle '%s' in Profil-Konfiguration - übersprungen", source)
-            continue
-
-        params = SearchParams(
-            nationwide=(region_tuple == (NATIONWIDE,) or not region_tuple),
-            region_codes=[] if region_tuple == (NATIONWIDE,) else list(region_tuple),
-        )
-
-        try:
-            listings = scraper.run(params)
-            log.info("[%s/%s] %d Inserate", source, region_tuple, len(listings))
-        except Exception:
-            log.exception("Job (%s, %s) komplett fehlgeschlagen", source, region_tuple)
-            continue  # ein kaputtes Portal darf die anderen Jobs nicht blockieren
-
-        for listing in listings:
+    profiles=db.get_active_profiles_with_sources()
+    if not profiles:return {'jobs':0,'listings':0}
+    lock=db.try_scan_lock()
+    if not lock:
+        log.warning('Scan bereits durch einen anderen Prozess gesperrt'); return {'jobs':0,'listings':0,'locked':True}
+    total=0
+    try:
+        byid={p['id']:p for p in profiles}; jobs=build_jobs(profiles)
+        for (source,regions,locations),pids in jobs.items():
+            try: scraper=get_scraper(source)
+            except KeyError: log.error('Unbekannte Quelle %s',source); continue
             try:
-                process_listing(listing, profiles_by_id, affected_profile_ids)
-            except Exception:
-                log.exception("Fehler beim Verarbeiten von %s", getattr(listing, "url", "?"))
+                params=SearchParams(nationwide='DE' in regions,region_codes=[] if 'DE' in regions else list(regions),locations=list(locations))
+                listings=scraper.run(params); log.info('[%s] %d Inserate',source,len(listings)); total+=len(listings)
+            except Exception: log.exception('[%s] Portal fehlgeschlagen',source); continue
+            for item in listings:
+                try:process_listing(item,byid,pids)
+                except Exception:log.exception('Listing-Verarbeitung fehlgeschlagen: %s',item.url)
+        return {'jobs':len(jobs),'listings':total}
+    finally: db.release_scan_lock(lock)
 
-
-if __name__ == "__main__":
+def worker_loop():
     db.init_db()
     while True:
-        log.info("Scraper-Lauf gestartet...")
-        run_once()
-        time.sleep(POLL_INTERVAL_SECONDS)
+        started=time.time()
+        try:run_once()
+        except Exception:log.exception('Gesamtlauf fehlgeschlagen')
+        time.sleep(max(0,POLL_INTERVAL_SECONDS-(time.time()-started)))
+
+if __name__=='__main__': worker_loop()

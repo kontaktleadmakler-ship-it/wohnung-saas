@@ -1,273 +1,147 @@
+from __future__ import annotations
 import os
+from contextlib import contextmanager
 import psycopg2
 import psycopg2.extras
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
+LOCK_KEY = 738291
 
+@contextmanager
+def connection():
+    if not DATABASE_URL: raise RuntimeError("DATABASE_URL fehlt")
+    conn=psycopg2.connect(DATABASE_URL, sslmode="require")
+    try: yield conn
+    finally: conn.close()
 
 def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL fehlt")
+    if not DATABASE_URL: raise RuntimeError("DATABASE_URL fehlt")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+    with connection() as c:
+        with c.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS profiles(
+              id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, min_price NUMERIC NOT NULL DEFAULT 0,
+              max_price NUMERIC NOT NULL, min_rooms NUMERIC NOT NULL DEFAULT 0, max_rooms NUMERIC,
+              min_size NUMERIC NOT NULL DEFAULT 0, districts TEXT, keywords_exclude TEXT,
+              active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS listings(
+              id BIGSERIAL PRIMARY KEY, source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL,
+              description TEXT, price NUMERIC, price_total NUMERIC, rooms NUMERIC, size NUMERIC,
+              location TEXT, city TEXT, postal_code TEXT, region_code TEXT, url TEXT NOT NULL,
+              contact_name TEXT, contact_phone TEXT, published_at TIMESTAMPTZ, first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), raw JSONB NOT NULL DEFAULT '{}'::jsonb,
+              CONSTRAINT listings_source_external_id_key UNIQUE(source, external_id)
+            );
+            CREATE TABLE IF NOT EXISTS matches(
+              listing_id BIGINT REFERENCES listings(id) ON DELETE CASCADE, profile_id INT REFERENCES profiles(id) ON DELETE CASCADE,
+              score INT NOT NULL CHECK(score BETWEEN 0 AND 100), price_score INT DEFAULT 0, rooms_score INT DEFAULT 0, size_score INT DEFAULT 0, location_score INT DEFAULT 0,
+              reasons JSONB NOT NULL DEFAULT '[]'::jsonb, notified BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY(listing_id, profile_id)
+            );
+            CREATE TABLE IF NOT EXISTS profile_sources(profile_id INT REFERENCES profiles(id) ON DELETE CASCADE, source TEXT NOT NULL, PRIMARY KEY(profile_id,source));
+            CREATE TABLE IF NOT EXISTS profile_regions(profile_id INT REFERENCES profiles(id) ON DELETE CASCADE, region_code TEXT NOT NULL, PRIMARY KEY(profile_id,region_code));
+            CREATE INDEX IF NOT EXISTS idx_listings_last_seen ON listings(last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_listings_source ON listings(source);
+            CREATE INDEX IF NOT EXISTS idx_matches_score ON matches(score DESC);
+            CREATE INDEX IF NOT EXISTS idx_matches_profile_created ON matches(profile_id,created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_profile_sources_source ON profile_sources(source);
+            CREATE INDEX IF NOT EXISTS idx_profile_regions_region ON profile_regions(region_code);
+            """)
+            cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS raw JSONB NOT NULL DEFAULT '{}'::jsonb")
+        c.commit()
 
-    # Profile werden jetzt in der DB verwaltet statt hart im Code (customers-Liste)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            min_price INT DEFAULT 0,
-            max_price INT NOT NULL,
-            min_rooms FLOAT DEFAULT 0,
-            max_rooms FLOAT,
-            min_size FLOAT DEFAULT 0,
-            districts TEXT,          -- kommagetrennte Liste, z.B. "Mitte,Kreuzberg,Neukölln"
-            keywords_exclude TEXT,   -- kommagetrennte Ausschlussbegriffe, z.B. "WG,Tausch,Zwischenmiete"
-            active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    """)
+def try_scan_lock():
+    conn=get_conn(); cur=conn.cursor(); cur.execute("SELECT pg_try_advisory_lock(%s)",(LOCK_KEY,)); ok=cur.fetchone()[0]
+    if ok: return conn
+    conn.close(); return None
 
-    # Listings: eine Zeile pro real gefundenem Inserat, dedupliziert über (source, external_id)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS listings (
-            id SERIAL PRIMARY KEY,
-            external_id TEXT,
-            title TEXT,
-            price NUMERIC,
-            rooms FLOAT,
-            size FLOAT,
-            location TEXT,
-            url TEXT,
-            source TEXT,
-            first_seen TIMESTAMP DEFAULT NOW(),
-            last_seen TIMESTAMP DEFAULT NOW()
-        );
-    """)
-
-    # Matches: n:m zwischen Listings und Profilen statt einer einzelnen "customer"-Spalte,
-    # damit ein Inserat mehrere Profile gleichzeitig treffen kann
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS matches (
-            listing_id INT REFERENCES listings(id) ON DELETE CASCADE,
-            profile_id INT REFERENCES profiles(id) ON DELETE CASCADE,
-            score INT NOT NULL,
-            notified BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT NOW(),
-            PRIMARY KEY (listing_id, profile_id)
-        );
-    """)
-
-    # Migration 001: Quellen pro Profil (n:m)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS profile_sources (
-            profile_id INT REFERENCES profiles(id) ON DELETE CASCADE,
-            source TEXT NOT NULL,               -- Registry-Key, z.B. 'immoscout24'
-            PRIMARY KEY (profile_id, source)
-        );
-    """)
-
-    # Migration 002: Regionen pro Profil (n:m). Kein Eintrag = bundesweit.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS profile_regions (
-            profile_id INT REFERENCES profiles(id) ON DELETE CASCADE,
-            region_code TEXT NOT NULL,          -- z.B. 'BY', 'BE', 'NW' (ISO 3166-2:DE ohne Präfix)
-            PRIMARY KEY (profile_id, region_code)
-        );
-    """)
-
-    # Migration 003: listings erweitern + Unique-Constraint korrigieren
-    cur.execute("""
-        ALTER TABLE listings
-            ADD COLUMN IF NOT EXISTS description TEXT,
-            ADD COLUMN IF NOT EXISTS price_total NUMERIC,
-            ADD COLUMN IF NOT EXISTS postal_code TEXT,
-            ADD COLUMN IF NOT EXISTS region_code TEXT,
-            ADD COLUMN IF NOT EXISTS contact_name TEXT,
-            ADD COLUMN IF NOT EXISTS contact_phone TEXT,
-            ADD COLUMN IF NOT EXISTS published_at TIMESTAMP;
-    """)
-
-    # external_id ist NICHT plattformübergreifend eindeutig (zwei Portale können zufällig
-    # dieselbe ID vergeben) -> composite unique statt globalem UNIQUE auf external_id.
-    cur.execute("ALTER TABLE listings DROP CONSTRAINT IF EXISTS listings_external_id_key;")
-    cur.execute("ALTER TABLE listings DROP CONSTRAINT IF EXISTS listings_url_key;")
-    cur.execute("""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint WHERE conname = 'listings_source_external_id_key'
-            ) THEN
-                ALTER TABLE listings
-                    ADD CONSTRAINT listings_source_external_id_key UNIQUE (source, external_id);
-            END IF;
-        END $$;
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
+def release_scan_lock(conn):
+    if not conn: return
+    try:
+        with conn.cursor() as cur: cur.execute("SELECT pg_advisory_unlock(%s)",(LOCK_KEY,)); conn.commit()
+    finally: conn.close()
 
 def get_active_profiles():
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM profiles WHERE active = TRUE;")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
-
-
-def get_profile_sources(profile_id) -> list[str]:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT source FROM profile_sources WHERE profile_id=%s;", (profile_id,))
-    rows = [r[0] for r in cur.fetchall()]
-    cur.close(); conn.close()
-    return rows
-
-
-def get_profile_regions(profile_id) -> list[str]:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT region_code FROM profile_regions WHERE profile_id=%s;", (profile_id,))
-    rows = [r[0] for r in cur.fetchall()]
-    cur.close(); conn.close()
-    return rows
-
-
-def set_profile_sources(profile_id, sources: list[str]):
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("DELETE FROM profile_sources WHERE profile_id=%s;", (profile_id,))
-    cur.executemany(
-        "INSERT INTO profile_sources (profile_id, source) VALUES (%s,%s);",
-        [(profile_id, s) for s in sources],
-    )
-    conn.commit(); cur.close(); conn.close()
-
-
-def set_profile_regions(profile_id, region_codes: list[str]):
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("DELETE FROM profile_regions WHERE profile_id=%s;", (profile_id,))
-    cur.executemany(
-        "INSERT INTO profile_regions (profile_id, region_code) VALUES (%s,%s);",
-        [(profile_id, r) for r in region_codes],
-    )
-    conn.commit(); cur.close(); conn.close()
-
+    with get_conn() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM profiles WHERE active ORDER BY id")
+            return cur.fetchall()
 
 def get_active_profiles_with_sources():
-    """Wie get_active_profiles(), aber inkl. sources[]/regions[] als Arrays."""
-    conn = get_conn(); cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        SELECT p.*,
-               COALESCE(array_agg(DISTINCT ps.source) FILTER (WHERE ps.source IS NOT NULL), '{}') AS sources,
-               COALESCE(array_agg(DISTINCT pr.region_code) FILTER (WHERE pr.region_code IS NOT NULL), '{}') AS regions
-        FROM profiles p
-        LEFT JOIN profile_sources ps ON ps.profile_id = p.id
-        LEFT JOIN profile_regions pr ON pr.profile_id = p.id
-        WHERE p.active = TRUE
-        GROUP BY p.id;
-    """)
-    rows = cur.fetchall()
-    cur.close(); conn.close()
-    return rows
+    with get_conn() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+              SELECT p.*, COALESCE(array_agg(DISTINCT ps.source) FILTER(WHERE ps.source IS NOT NULL),'{}') sources,
+                     COALESCE(array_agg(DISTINCT pr.region_code) FILTER(WHERE pr.region_code IS NOT NULL),'{}') regions
+              FROM profiles p LEFT JOIN profile_sources ps ON ps.profile_id=p.id LEFT JOIN profile_regions pr ON pr.profile_id=p.id
+              WHERE p.active GROUP BY p.id ORDER BY p.id
+            """)
+            return cur.fetchall()
 
+def get_profile(profile_id):
+    with get_conn() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM profiles WHERE id=%s",(profile_id,)); p=cur.fetchone()
+            if not p:return None
+            cur.execute("SELECT source FROM profile_sources WHERE profile_id=%s ORDER BY source",(profile_id,)); p['sources']=[r['source'] for r in cur.fetchall()]
+            cur.execute("SELECT region_code FROM profile_regions WHERE profile_id=%s ORDER BY region_code",(profile_id,)); p['regions']=[r['region_code'] for r in cur.fetchall()]
+            return p
 
-def upsert_listing(listing) -> tuple[int, bool]:
-    """listing: scrapers.models.Listing. Upsert über (source, external_id)."""
-    conn = get_conn(); cur = conn.cursor()
-    data = dict(listing.__dict__)
-    data["address"] = data.get("address")  # -> Spalte "location"
-    cur.execute("""
-        INSERT INTO listings (external_id, title, description, price, price_total, rooms, size,
-                               location, postal_code, region_code, url, source,
-                               contact_name, contact_phone, published_at)
-        VALUES (%(external_id)s,%(title)s,%(description)s,%(price)s,%(price_total)s,%(rooms)s,%(size)s,
-                %(address)s,%(postal_code)s,%(region_code)s,%(url)s,%(source)s,
-                %(contact_name)s,%(contact_phone)s,%(published_at)s)
-        ON CONFLICT (source, external_id) DO UPDATE SET last_seen = NOW()
-        RETURNING id, (xmax = 0) AS is_new;
-    """, data)
-    listing_id, is_new = cur.fetchone()
-    conn.commit(); cur.close(); conn.close()
-    return listing_id, is_new
+def add_profile(data):
+    with get_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("INSERT INTO profiles(name,min_price,max_price,min_rooms,max_rooms,min_size,districts,keywords_exclude) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",tuple(data.get(k) for k in ('name','min_price','max_price','min_rooms','max_rooms','min_size','districts','keywords_exclude'))); pid=cur.fetchone()[0]
+        c.commit(); return pid
 
+def update_profile(pid,data):
+    with get_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("UPDATE profiles SET name=%s,min_price=%s,max_price=%s,min_rooms=%s,max_rooms=%s,min_size=%s,districts=%s,keywords_exclude=%s,active=%s,updated_at=NOW() WHERE id=%s",tuple(data.get(k) for k in ('name','min_price','max_price','min_rooms','max_rooms','min_size','districts','keywords_exclude','active'))+(pid,)); c.commit()
 
-def save_match(listing_id, profile_id, score):
-    """Speichert/aktualisiert einen Match-Score. Gibt True zurück, wenn er noch nicht benachrichtigt wurde."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO matches (listing_id, profile_id, score)
-        VALUES (%s,%s,%s)
-        ON CONFLICT (listing_id, profile_id) DO UPDATE SET score = EXCLUDED.score
-        RETURNING notified;
-    """, (listing_id, profile_id, score))
-    notified = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return not notified
+def set_profile_sources(pid,sources):
+    with get_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("DELETE FROM profile_sources WHERE profile_id=%s",(pid,))
+            for s in set(sources or []): cur.execute("INSERT INTO profile_sources(profile_id,source) VALUES(%s,%s) ON CONFLICT DO NOTHING",(pid,s))
+        c.commit()
 
+def set_profile_regions(pid,regions):
+    with get_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("DELETE FROM profile_regions WHERE profile_id=%s",(pid,))
+            vals=set(regions or ['DE'])
+            for r in vals: cur.execute("INSERT INTO profile_regions(profile_id,region_code) VALUES(%s,%s) ON CONFLICT DO NOTHING",(pid,r))
+        c.commit()
 
-def mark_notified(listing_id, profile_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE matches SET notified = TRUE WHERE listing_id=%s AND profile_id=%s;",
-        (listing_id, profile_id),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+def delete_profile(pid):
+    with get_conn() as c:
+        with c.cursor() as cur: cur.execute("DELETE FROM profiles WHERE id=%s",(pid,))
+        c.commit()
 
+def upsert_listing(item):
+    with get_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""INSERT INTO listings(source,external_id,title,description,price,price_total,rooms,size,location,city,postal_code,region_code,url,contact_name,contact_phone,published_at,raw)
+              VALUES(%(source)s,%(external_id)s,%(title)s,%(description)s,%(price)s,%(price_total)s,%(rooms)s,%(size)s,%(address)s,%(city)s,%(postal_code)s,%(region_code)s,%(url)s,%(contact_name)s,%(contact_phone)s,%(published_at)s,%(raw)s)
+              ON CONFLICT(source,external_id) DO UPDATE SET title=EXCLUDED.title,description=EXCLUDED.description,price=EXCLUDED.price,price_total=EXCLUDED.price_total,rooms=EXCLUDED.rooms,size=EXCLUDED.size,location=EXCLUDED.location,url=EXCLUDED.url,last_seen=NOW(),raw=EXCLUDED.raw
+              RETURNING id,(xmax=0) AS is_new""",{**item.__dict__,'raw': psycopg2.extras.Json(item.raw or {})}); row=cur.fetchone(); c.commit(); return row[0],row[1]
 
-def get_dashboard_rows(min_score=0, profile_id=None):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    query = """
-        SELECT l.id, l.title, l.price, l.rooms, l.size, l.location, l.url, l.source,
-               m.score, p.name AS profile_name, l.first_seen
-        FROM matches m
-        JOIN listings l ON l.id = m.listing_id
-        JOIN profiles p ON p.id = m.profile_id
-        WHERE m.score >= %s
-    """
-    params = [min_score]
-    if profile_id:
-        query += " AND p.id = %s"
-        params.append(profile_id)
-    query += " ORDER BY l.first_seen DESC, m.score DESC LIMIT 200;"
-    cur.execute(query, params)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
+def save_match(listing_id,profile_id,score,components,reasons):
+    with get_conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""INSERT INTO matches(listing_id,profile_id,score,price_score,rooms_score,size_score,location_score,reasons)
+              VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(listing_id,profile_id) DO UPDATE SET score=EXCLUDED.score,price_score=EXCLUDED.price_score,rooms_score=EXCLUDED.rooms_score,size_score=EXCLUDED.size_score,location_score=EXCLUDED.location_score,reasons=EXCLUDED.reasons,updated_at=NOW() RETURNING notified""",(listing_id,profile_id,score,*components,psycopg2.extras.Json(reasons))); notified=cur.fetchone()[0]; c.commit(); return not notified
 
+def mark_notified(listing_id,profile_id):
+    with get_conn() as c:
+        with c.cursor() as cur: cur.execute("UPDATE matches SET notified=TRUE,updated_at=NOW() WHERE listing_id=%s AND profile_id=%s",(listing_id,profile_id)); c.commit()
 
-def add_profile(data) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO profiles (name, min_price, max_price, min_rooms, max_rooms, min_size, districts, keywords_exclude)
-        VALUES (%(name)s,%(min_price)s,%(max_price)s,%(min_rooms)s,%(max_rooms)s,%(min_size)s,%(districts)s,%(keywords_exclude)s)
-        RETURNING id;
-    """, data)
-    profile_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return profile_id
-
-
-def delete_profile(profile_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM profiles WHERE id=%s;", (profile_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+def get_dashboard_rows(min_score=0,profile_id=None,limit=300):
+    with get_conn() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            q="""SELECT m.*,l.title,l.price,l.price_total,l.rooms,l.size,l.location,l.url,l.source,l.first_seen,l.last_seen,p.name profile_name FROM matches m JOIN listings l ON l.id=m.listing_id JOIN profiles p ON p.id=m.profile_id WHERE m.score >= %s"""; args=[min_score]
+            if profile_id:q+=" AND p.id=%s"; args.append(profile_id)
+            q+=" ORDER BY m.score DESC,m.created_at DESC LIMIT %s"; args.append(limit); cur.execute(q,args); return cur.fetchall()
