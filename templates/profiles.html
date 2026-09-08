@@ -38,7 +38,63 @@
                     <dt>Ausschluss</dt>
                     <dd>{{ p.keywords_exclude or '—' }}</dd>
                 </div>
+                <div>
+                    <dt>Quellen</dt>
+                    <dd>
+                        {% if p.sources %}
+                            {% for s in available_sources %}{% if s.key in p.sources %}{{ s.label }}{{ ", " if not loop.last and s.key in p.sources }}{% endif %}{% endfor %}
+                        {% else %}—{% endif %}
+                    </dd>
+                </div>
+                <div>
+                    <dt>Region</dt>
+                    <dd>
+                        {% if not p.regions or 'DE' in p.regions %}
+                            Bundesweit
+                        {% else %}
+                            {% for code in p.regions %}{{ available_regions.get(code, code) }}{{ ", " if not loop.last }}{% endfor %}
+                        {% endif %}
+                    </dd>
+                </div>
             </dl>
+
+            <details class="edit-sources">
+                <summary>Quellen &amp; Region ändern</summary>
+                <form method="POST" action="{{ url_for('update_profile_sources', profile_id=p.id) }}" class="form-sheet">
+                    <div class="field-wide">
+                        <label>Quellen</label>
+                        <div class="checkbox-grid">
+                            {% for s in available_sources %}
+                            <label class="checkbox">
+                                <input type="checkbox" name="sources" value="{{ s.key }}" {% if s.key in p.sources %}checked{% endif %}>
+                                {{ s.label }}
+                            </label>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    <div class="field-wide">
+                        <label>Region</label>
+                        <div class="checkbox-grid">
+                            <label class="checkbox">
+                                <input type="checkbox" name="regions" value="DE" {% if not p.regions or 'DE' in p.regions %}checked{% endif %}
+                                       onchange="this.closest('.checkbox-grid').querySelectorAll('.region-bundesland').forEach(el => el.disabled = this.checked)">
+                                Bundesweit
+                            </label>
+                            {% for code, name in available_regions.items() %}
+                            <label class="checkbox">
+                                <input type="checkbox" class="region-bundesland" name="regions" value="{{ code }}"
+                                       {% if code in p.regions %}checked{% endif %}
+                                       {% if not p.regions or 'DE' in p.regions %}disabled{% endif %}>
+                                {{ name }}
+                            </label>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    <div class="field-wide">
+                        <button type="submit" class="btn-primary">Speichern</button>
+                    </div>
+                </form>
+            </details>
         </div>
         <form method="POST" action="{{ url_for('delete_profile', profile_id=p.id) }}">
             <button type="submit" class="btn-ghost">Löschen</button>
@@ -81,6 +137,36 @@
         <label for="keywords_exclude">Ausschlussbegriffe</label>
         <input id="keywords_exclude" name="keywords_exclude" placeholder="WG, Tausch, Zwischenmiete">
     </div>
+
+    <div class="field-wide">
+        <label>Quellen</label>
+        <div class="checkbox-grid">
+            {% for s in available_sources %}
+            <label class="checkbox">
+                <input type="checkbox" name="sources" value="{{ s.key }}">
+                {{ s.label }}
+            </label>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="field-wide">
+        <label>Region</label>
+        <div class="checkbox-grid">
+            <label class="checkbox">
+                <input type="checkbox" name="regions" value="DE" checked
+                       onchange="this.closest('.checkbox-grid').querySelectorAll('.region-bundesland').forEach(el => el.disabled = this.checked)">
+                Bundesweit
+            </label>
+            {% for code, name in available_regions.items() %}
+            <label class="checkbox">
+                <input type="checkbox" class="region-bundesland" name="regions" value="{{ code }}" disabled>
+                {{ name }}
+            </label>
+            {% endfor %}
+        </div>
+    </div>
+
     <div class="field-wide">
         <button type="submit" class="btn-primary">Profil anlegen</button>
     </div>

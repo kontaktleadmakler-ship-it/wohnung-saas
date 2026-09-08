@@ -244,6 +244,34 @@ main {
     display: block; margin-bottom: 0.25rem;
 }
 
+.checkbox-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.2rem;
+}
+.checkbox-grid .checkbox {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--ink);
+    cursor: pointer;
+}
+.checkbox-grid .checkbox input { width: auto; }
+
+.edit-sources {
+    margin-top: 0.9rem;
+}
+.edit-sources summary {
+    font-size: 0.78rem;
+    color: var(--ink-soft);
+    cursor: pointer;
+}
+.edit-sources summary:hover { color: var(--brass); }
+.edit-sources .form-sheet { margin-top: 0.9rem; max-width: 600px; }
+
 .btn-primary {
     font-family: var(--font-ui);
     font-weight: 500;

@@ -15,7 +15,7 @@ services:
   - type: worker
     name: wohnung-saas-worker
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
     startCommand: python scraper.py
     envVars:
       - key: DATABASE_URL
@@ -23,8 +23,6 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: SEARCH_URLS
         sync: false
       - key: POLL_INTERVAL_SECONDS
         value: "180"

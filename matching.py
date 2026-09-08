@@ -33,7 +33,7 @@ def score_listing(listing: dict, profile: dict):
     price = listing.get("price")
     rooms = listing.get("rooms")
     size = listing.get("size")
-    location = (listing.get("location") or "").lower()
+    location = (listing.get("location") or listing.get("address") or "").lower()
     title = (listing.get("title") or "").lower()
 
     max_price = profile.get("max_price")

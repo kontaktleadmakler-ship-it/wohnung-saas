@@ -4,6 +4,8 @@ from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, session
 
 import db
+from scrapers.registry import list_sources
+from scrapers.regions import BUNDESLAENDER
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
@@ -53,7 +55,7 @@ def home():
 @login_required
 def profiles():
     if request.method == "POST":
-        db.add_profile({
+        profile_id = db.add_profile({
             "name": request.form["name"],
             "min_price": request.form.get("min_price") or 0,
             "max_price": request.form["max_price"],
@@ -63,9 +65,25 @@ def profiles():
             "districts": request.form.get("districts", ""),
             "keywords_exclude": request.form.get("keywords_exclude", ""),
         })
+        db.set_profile_sources(profile_id, request.form.getlist("sources"))
+        db.set_profile_regions(profile_id, request.form.getlist("regions"))
         return redirect(url_for("profiles"))
 
-    return render_template("profiles.html", profiles=db.get_active_profiles())
+    return render_template(
+        "profiles.html",
+        profiles=db.get_active_profiles_with_sources(),
+        available_sources=list_sources(),
+        available_regions=BUNDESLAENDER,
+    )
+
+
+@app.route("/profiles/<int:profile_id>/sources", methods=["POST"])
+@login_required
+def update_profile_sources(profile_id):
+    """Nachträgliche Änderung der Quellen/Regionen, ohne das ganze Profil neu anzulegen."""
+    db.set_profile_sources(profile_id, request.form.getlist("sources"))
+    db.set_profile_regions(profile_id, request.form.getlist("regions"))
+    return redirect(url_for("profiles"))
 
 
 @app.route("/profiles/<int:profile_id>/delete", methods=["POST"])
