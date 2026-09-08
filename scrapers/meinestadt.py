@@ -13,6 +13,7 @@ class MeinestadtScraper(BaseScraper):
     SOURCE_LABEL = "meinestadt.de"
     SUPPORTS_NATIONWIDE = False
 
+    # fetch bleibt aus base (requests) – meinestadt ist nicht so JS-lastig
     def build_search_urls(self, params: SearchParams) -> list[str]:
         codes = list(CITY_SAMPLES) if params.nationwide else resolve_region_codes(params.region_codes)
         cities = {c for code in codes for c in CITY_SAMPLES.get(code, [])}
@@ -21,22 +22,27 @@ class MeinestadtScraper(BaseScraper):
     def parse_listing_cards(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "html.parser")
         cards = []
-        for card in soup.select("[data-testid='result-list-entry']"):
-            link_el = card.select_one("a")
-            if not link_el:
-                continue
-            title_el = card.select_one("h2, h3")
-            price_el = card.select_one("[data-testid='price']")
-            meta_el = card.select_one("[data-testid='meta']")
-            location_el = card.select_one("[data-testid='location']")
-            cards.append({
-                "href": link_el.get("href", ""),
-                "external_id": link_el.get("href", ""),
-                "title": title_el.get_text(strip=True) if title_el else "",
-                "price_text": price_el.get_text(strip=True) if price_el else None,
-                "meta_text": meta_el.get_text(strip=True) if meta_el else "",
-                "location": location_el.get_text(strip=True) if location_el else None,
-            })
+        # Mehrere Selektoren
+        selectors = ["[data-testid='result-list-entry']", "div.result-entry", "article"]
+        for selector in selectors:
+            for card in soup.select(selector):
+                link_el = card.select_one("a")
+                if not link_el:
+                    continue
+                title_el = card.select_one("h2, h3, h4")
+                price_el = card.select_one("[data-testid='price']")
+                meta_el = card.select_one("[data-testid='meta']") or card
+                location_el = card.select_one("[data-testid='location']")
+                cards.append({
+                    "href": link_el.get("href", ""),
+                    "external_id": link_el.get("href", ""),
+                    "title": title_el.get_text(strip=True) if title_el else "",
+                    "price_text": price_el.get_text(strip=True) if price_el else None,
+                    "meta_text": meta_el.get_text(strip=True),
+                    "location": location_el.get_text(strip=True) if location_el else None,
+                })
+            if cards:
+                break
         return cards
 
     def normalize(self, raw: dict) -> Listing | None:
