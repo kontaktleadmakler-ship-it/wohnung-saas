@@ -1,10 +1,7 @@
-# scrapers/immoscout24.py (Gerüst)
-#
-# Praktisches Problem: Aktive Bot-Erkennung (Datadome-artig), Ergebnisse teils
-# clientseitig nachgeladen. AGB verbieten Scraping explizit -- rechtliches Risiko
-# am höchsten dieser Liste. Vor Rollout: robots.txt/AGB prüfen, Fixture-HTML holen,
-# Selektoren gegen Fixture entwickeln, mit niedriger Frequenz testen.
+# scrapers/immoscout24.py
+import re
 from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 from .base import BaseScraper
 from .models import Listing, SearchParams
 
@@ -15,8 +12,6 @@ class ImmoScout24Scraper(BaseScraper):
     SUPPORTS_NATIONWIDE = True
 
     def fetch(self, url: str) -> str:
-        # Overridet BaseScraper.fetch(): echter Browser-Kontext statt requests,
-        # weil Ergebnisse clientseitig nachgeladen werden und Anti-Bot-Checks greifen.
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=self.session.headers["User-Agent"])
@@ -26,8 +21,6 @@ class ImmoScout24Scraper(BaseScraper):
             return html
 
     def build_search_urls(self, params: SearchParams) -> list[str]:
-        # geo="de" ist der ImmoScout24-Parameter fürs gesamte Bundesgebiet (Stand heute --
-        # Portal-Parameter ändern sich, vor Rollout gegen die Live-Seite verifizieren)
         if params.nationwide or not params.region_codes:
             return ["https://www.immobilienscout24.de/Suche/de/wohnung-mieten?geo=de"]
         return [
@@ -36,7 +29,52 @@ class ImmoScout24Scraper(BaseScraper):
         ]
 
     def parse_listing_cards(self, html: str) -> list[dict]:
-        raise NotImplementedError("Selektoren gegen aktuelles Live-DOM verifizieren")
+        soup = BeautifulSoup(html, "html.parser")
+        cards = []
+        for card in soup.select("div.result-list__listing"):
+            link_el = card.select_one("a[href*='/expose/']")
+            if not link_el:
+                continue
+            title_el = card.select_one("h5, h4")
+            price_el = card.select_one("div.result-list__listing--price")
+            rooms_el = card.select_one("dd[data-testid='rooms']")
+            size_el = card.select_one("dd[data-testid='area']")
+            location_el = card.select_one("div.result-list__listing--address")
+            cards.append({
+                "href": link_el.get("href", ""),
+                "external_id": re.search(r"expose/(\d+)", link_el.get("href", "")).group(1) if re.search(r"expose/(\d+)", link_el.get("href", "")) else "",
+                "title": title_el.get_text(strip=True) if title_el else "",
+                "price_text": price_el.get_text(strip=True) if price_el else None,
+                "rooms_text": rooms_el.get_text(strip=True) if rooms_el else None,
+                "size_text": size_el.get_text(strip=True) if size_el else None,
+                "location": location_el.get_text(strip=True) if location_el else None,
+            })
+        return cards
 
     def normalize(self, raw: dict) -> Listing | None:
-        raise NotImplementedError
+        if not raw.get("title") or not raw.get("external_id"):
+            return None
+        price = self._parse_number(raw.get("price_text"))
+        rooms = self._parse_number(raw.get("rooms_text"))
+        size = self._parse_number(raw.get("size_text"))
+        url = raw["href"] if raw["href"].startswith("http") else "https://www.immobilienscout24.de" + raw["href"]
+        return Listing(
+            source=self.SOURCE_KEY,
+            external_id=raw["external_id"],
+            url=url,
+            title=raw["title"],
+            price=price,
+            rooms=rooms,
+            size=size,
+            address=raw.get("location"),
+        )
+
+    @staticmethod
+    def _parse_number(text: str):
+        if not text:
+            return None
+        cleaned = re.sub(r"[^\d,\.]", "", text).replace(".", "").replace(",", ".")
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
