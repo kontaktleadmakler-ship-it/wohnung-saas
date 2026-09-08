@@ -11,6 +11,8 @@ services:
         sync: false
       - key: APP_PASSWORD
         sync: false
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
 
   - type: worker
     name: wohnung-saas-worker
@@ -28,3 +30,5 @@ services:
         value: "180"
       - key: MIN_NOTIFY_SCORE
         value: "60"
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
