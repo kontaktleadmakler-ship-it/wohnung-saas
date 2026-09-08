@@ -3,23 +3,27 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Anmelden — Wohnungsradar</title>
+    <title>{% block title %}Wohnungsradar{% endblock %}</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <div class="login-wrap">
-        <div class="login-card">
+    <div class="app">
+        <aside class="sidebar">
             <div class="brand">Wohnungsradar</div>
             <div class="brand-sub">Passende Wohnungen im Blick</div>
-            {% if error %}<div class="login-error">{{ error }}</div>{% endif %}
-            <form method="POST">
-                <label for="password" style="font-size:0.72rem;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.04em;">Passwort</label>
-                <input id="password" name="password" type="password" autofocus>
-                <button type="submit" class="btn-primary" style="width:100%;">Anmelden</button>
-            </form>
-        </div>
+            <nav class="nav">
+                <a href="{{ url_for('home') }}" class="{{ 'active' if active == 'dashboard' }}">Übersicht</a>
+                <a href="{{ url_for('profiles') }}" class="{{ 'active' if active == 'profiles' }}">Profile</a>
+            </nav>
+            <div class="nav-footer">
+                <a href="{{ url_for('logout') }}">Abmelden</a>
+            </div>
+        </aside>
+        <main>
+            {% block content %}{% endblock %}
+        </main>
     </div>
 </body>
 </html>

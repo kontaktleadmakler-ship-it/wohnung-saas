@@ -1,29 +1,48 @@
-<h1>Leads Dashboard</h1>
+{% extends "base.html" %}
+{% block title %}Übersicht — Wohnungsradar{% endblock %}
+{% block content %}
+{% set active = 'dashboard' %}
 
-<a href="/scrape">🔄 Scrape jetzt</a>
-<a href="/logout">Logout</a>
+<h1>Passende Wohnungen</h1>
 
-<table border="1">
-<tr>
-    <th>Title</th>
-    <th>Price</th>
-    <th>Rooms</th>
-    <th>Size</th>
-    <th>Source</th>
-    <th>Customer</th>
-    <th>Score</th>
-</tr>
+<form method="get" class="filters">
+    <div class="field">
+        <label for="profile_id">Profil</label>
+        <select id="profile_id" name="profile_id" onchange="this.form.submit()">
+            <option value="">Alle</option>
+            {% for p in profiles %}
+            <option value="{{ p.id }}" {% if selected_profile == p.id|string %}selected{% endif %}>{{ p.name }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div class="field">
+        <label for="min_score">Mindest-Score</label>
+        <input id="min_score" type="number" name="min_score" value="{{ min_score }}" min="0" max="100" onchange="this.form.submit()">
+    </div>
+</form>
 
-{% for l in leads %}
-<tr>
-    <td><a href="{{ l[5] }}" target="_blank">{{ l[1] }}</a></td>
-    <td>{{ l[2] }}</td>
-    <td>{{ l[3] }}</td>
-    <td>{{ l[4] }}</td>
-    <td>{{ l[6] }}</td>
-    <td>{{ l[7] }}</td>
-    <td>{{ l[8] }}</td>
-</tr>
-{% endfor %}
+<div class="sheet">
+    {% if not rows %}
+    <div class="empty">
+        <strong>Noch keine Treffer</strong>
+        Der Scraper meldet sich hier, sobald ein Inserat zu einem deiner Profile passt. Prüfe unter „Profile“, ob mindestens ein Profil aktiv ist.
+    </div>
+    {% endif %}
 
-</table>
+    {% for r in rows %}
+    {% set bucket = 'high' if r.score >= 75 else ('mid' if r.score >= 50 else 'low') %}
+    <div class="row">
+        <div class="bar {{ bucket }}"></div>
+        <div class="title">
+            <a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.title }}</a>
+            <div class="meta">{{ r.location }} · gefunden {{ r.first_seen.strftime('%d.%m., %H:%M') if r.first_seen else '' }}</div>
+        </div>
+        <div class="data">{{ r.price|int if r.price is not none else '–' }} <span class="unit">€</span></div>
+        <div class="data">{{ r.rooms if r.rooms is not none else '–' }} <span class="unit">Zi.</span></div>
+        <div class="data">{{ r.size|int if r.size is not none else '–' }} <span class="unit">m²</span></div>
+        <div class="tag">{{ r.profile_name }}</div>
+        <div class="score {{ bucket }}">{{ r.score }}</div>
+    </div>
+    {% endfor %}
+</div>
+{% endblock %}

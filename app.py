@@ -1,123 +1,81 @@
 import os
-import psycopg2
+from functools import wraps
+
 from flask import Flask, render_template, request, redirect, url_for, session
+
+import db
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
 
-
-# -----------------------------
-# DATABASE (SAFE FIX)
-# -----------------------------
-def get_db_url():
-    return os.environ.get("DATABASE_URL")
+APP_PASSWORD = os.environ.get("APP_PASSWORD")  # Login-Passwort für das Dashboard
 
 
-def db():
-    DATABASE_URL = get_db_url()
-
-    if not DATABASE_URL:
-        print("❌ DATABASE_URL fehlt!")
-        return None
-
-    try:
-        return psycopg2.connect(DATABASE_URL, sslmode="require")
-    except Exception as e:
-        print("❌ DB CONNECTION ERROR:", e)
-        return None
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if APP_PASSWORD and not session.get("logged_in"):
+            return redirect(url_for("login"))
+        return view(*args, **kwargs)
+    return wrapped
 
 
-# -----------------------------
-# INIT DB
-# -----------------------------
-def init_db():
-    conn = db()
-    if not conn:
-        return
-
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS listings (
-            id SERIAL PRIMARY KEY,
-            title TEXT,
-            price TEXT,
-            location TEXT,
-            url TEXT UNIQUE
-        );
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    print("✅ DB initialized")
-
-
-# -----------------------------
-# HOME / DASHBOARD
-# -----------------------------
-@app.route("/")
-def home():
-    conn = db()
-    if not conn:
-        return "❌ DB not connected"
-
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM listings ORDER BY id DESC LIMIT 50;")
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    return render_template("dashboard.html", listings=rows)
-
-
-# -----------------------------
-# SCRAPER TEST ROUTE
-# -----------------------------
-@app.route("/scraper/run")
-def run_scraper():
-    print("🚀 Scraper started")
-
-    conn = db()
-    if not conn:
-        return "❌ DB not connected"
-
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO listings (title, price, location, url)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (url) DO NOTHING;
-    """, ("Test Wohnung", "1200€", "Berlin", "https://example.com/test"))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return redirect(url_for("home"))
-
-
-# -----------------------------
-# AUTH PLACEHOLDER
-# -----------------------------
-@app.route("/login")
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    return "Login Page"
+    if request.method == "POST":
+        if not APP_PASSWORD or request.form.get("password") == APP_PASSWORD:
+            session["logged_in"] = True
+            return redirect(url_for("home"))
+        return render_template("login.html", error="Falsches Passwort")
+    return render_template("login.html", error=None)
 
 
 @app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for("home"))
+    return redirect(url_for("login"))
 
 
-# -----------------------------
-# START
-# -----------------------------
+@app.route("/")
+@login_required
+def home():
+    min_score = int(request.args.get("min_score", 0))
+    profile_id = request.args.get("profile_id") or None
+    rows = db.get_dashboard_rows(min_score=min_score, profile_id=profile_id)
+    profiles = db.get_active_profiles()
+    return render_template(
+        "dashboard.html", rows=rows, profiles=profiles,
+        min_score=min_score, selected_profile=profile_id,
+    )
+
+
+@app.route("/profiles", methods=["GET", "POST"])
+@login_required
+def profiles():
+    if request.method == "POST":
+        db.add_profile({
+            "name": request.form["name"],
+            "min_price": request.form.get("min_price") or 0,
+            "max_price": request.form["max_price"],
+            "min_rooms": request.form.get("min_rooms") or 0,
+            "max_rooms": request.form.get("max_rooms") or None,
+            "min_size": request.form.get("min_size") or 0,
+            "districts": request.form.get("districts", ""),
+            "keywords_exclude": request.form.get("keywords_exclude", ""),
+        })
+        return redirect(url_for("profiles"))
+
+    return render_template("profiles.html", profiles=db.get_active_profiles())
+
+
+@app.route("/profiles/<int:profile_id>/delete", methods=["POST"])
+@login_required
+def delete_profile(profile_id):
+    db.delete_profile(profile_id)
+    return redirect(url_for("profiles"))
+
+
 if __name__ == "__main__":
-    init_db()
-
+    db.init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
