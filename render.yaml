@@ -2,7 +2,7 @@ services:
   - type: web
     name: wohnung-saas-web
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
     startCommand: python app.py
     envVars:
       - key: DATABASE_URL

@@ -3,7 +3,14 @@
 {% block content %}
 {% set active = 'dashboard' %}
 
-<h1>Passende Wohnungen</h1>
+<div class="page-head">
+    <h1>Passende Wohnungen</h1>
+    <form method="POST" action="{{ url_for('run_scan') }}">
+        <button type="submit" class="btn-primary" {% if scan_running %}disabled{% endif %}>
+            {% if scan_running %}Scan läuft …{% else %}Scan starten{% endif %}
+        </button>
+    </form>
+</div>
 
 <form method="get" class="filters">
     <div class="field">

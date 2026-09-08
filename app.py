@@ -1,9 +1,12 @@
 import os
+import logging
+import threading
 from functools import wraps
 
-from flask import Flask, render_template, request, redirect, url_for, session
+from flask import Flask, render_template, request, redirect, url_for, session, flash
 
 import db
+import scraper as scraper_module
 from scrapers.registry import list_sources
 from scrapers.regions import BUNDESLAENDER
 
@@ -11,6 +14,14 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD")  # Login-Passwort für das Dashboard
+
+log = logging.getLogger("app")
+
+# Manueller Scan läuft im Hintergrund-Thread des Web-Prozesses (kein separater
+# Trigger für den Worker-Service nötig). _scan_running verhindert, dass ein
+# Klick auf den Button einen zweiten Lauf parallel startet, während einer läuft.
+_scan_running = False
+_scan_lock = threading.Lock()
 
 
 def login_required(view):
@@ -48,7 +59,35 @@ def home():
     return render_template(
         "dashboard.html", rows=rows, profiles=profiles,
         min_score=min_score, selected_profile=profile_id,
+        scan_running=_scan_running,
     )
+
+
+@app.route("/scan/run", methods=["POST"])
+@login_required
+def run_scan():
+    global _scan_running
+
+    with _scan_lock:
+        if _scan_running:
+            flash("Scan läuft bereits — bitte kurz warten.")
+            return redirect(url_for("home"))
+        _scan_running = True
+
+    def _run():
+        global _scan_running
+        try:
+            log.info("Manueller Scan gestartet")
+            scraper_module.run_once()
+            log.info("Manueller Scan abgeschlossen")
+        except Exception:
+            log.exception("Manueller Scan fehlgeschlagen")
+        finally:
+            _scan_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    flash("Scan gestartet — Treffer erscheinen hier, sobald der Lauf durch ist. Fortschritt steht im Render-Log.")
+    return redirect(url_for("home"))
 
 
 @app.route("/profiles", methods=["GET", "POST"])
