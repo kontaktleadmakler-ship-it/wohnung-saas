@@ -16,7 +16,15 @@ class WgGesuchtScraper(BaseScraper):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=self.session.headers["User-Agent"])
-            page.goto(url, wait_until="networkidle", timeout=20000)
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            try:
+                page.click("button[data-testid='accept-cookies'], button#cookie-accept", timeout=2000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_selector("div.wgg-card, article.wgg-card", timeout=10000)
+            except Exception:
+                pass
             html = page.content()
             browser.close()
             return html
@@ -29,24 +37,31 @@ class WgGesuchtScraper(BaseScraper):
     def parse_listing_cards(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "html.parser")
         cards = []
-        for card in soup.select("div.wgg-card"):
-            link_el = card.select_one("a[href*='/wohnungen/']")
-            if not link_el:
-                continue
-            title_el = card.select_one("h3, h2")
-            price_el = card.select_one("div.wgg-card__price")
-            rooms_el = card.select_one("div.wgg-card__rooms")
-            size_el = card.select_one("div.wgg-card__area")
-            location_el = card.select_one("div.wgg-card__location")
-            cards.append({
-                "href": link_el.get("href", ""),
-                "external_id": re.search(r"(\d+)", link_el.get("href", "")).group(1) if re.search(r"(\d+)", link_el.get("href", "")) else "",
-                "title": title_el.get_text(strip=True) if title_el else "",
-                "price_text": price_el.get_text(strip=True) if price_el else None,
-                "rooms_text": rooms_el.get_text(strip=True) if rooms_el else None,
-                "size_text": size_el.get_text(strip=True) if size_el else None,
-                "location": location_el.get_text(strip=True) if location_el else None,
-            })
+        selectors = ["div.wgg-card", "article.wgg-card", "div.card"]
+        for selector in selectors:
+            for card in soup.select(selector):
+                link_el = card.select_one("a[href*='/wohnungen/']") or card.select_one("a[href*='wohnung']")
+                if not link_el:
+                    continue
+                title_el = card.select_one("h3, h2, h4")
+                price_el = card.select_one("div.wgg-card__price, div[data-testid='price']")
+                rooms_el = card.select_one("div.wgg-card__rooms, span[data-testid='rooms']")
+                size_el = card.select_one("div.wgg-card__area, span[data-testid='area']")
+                location_el = card.select_one("div.wgg-card__location, div[data-testid='location']")
+                href = link_el.get("href", "")
+                m = re.search(r"(\d+)", href)
+                external_id = m.group(1) if m else href
+                cards.append({
+                    "href": href,
+                    "external_id": external_id,
+                    "title": title_el.get_text(strip=True) if title_el else "",
+                    "price_text": price_el.get_text(strip=True) if price_el else None,
+                    "rooms_text": rooms_el.get_text(strip=True) if rooms_el else None,
+                    "size_text": size_el.get_text(strip=True) if size_el else None,
+                    "location": location_el.get_text(strip=True) if location_el else None,
+                })
+            if cards:
+                break
         return cards
 
     def normalize(self, raw: dict) -> Listing | None:
