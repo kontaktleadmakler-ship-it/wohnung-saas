@@ -2,7 +2,7 @@ services:
   - type: web
     name: wohnung-saas-web
     env: python
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
+    buildCommand: pip install -r requirements.txt && playwright install chromium
     startCommand: python app.py
     healthCheckPath: /healthz
     envVars:
@@ -18,7 +18,7 @@ services:
   - type: worker
     name: wohnung-saas-worker
     env: python
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
+    buildCommand: pip install -r requirements.txt && playwright install chromium
     startCommand: python scraper.py
     envVars:
       - key: DATABASE_URL
