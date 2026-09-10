@@ -449,4 +449,5 @@ def _profile_form():
 
 if __name__ == "__main__":
     _ensure_db_initialized()
+    _start_background_scanner()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
