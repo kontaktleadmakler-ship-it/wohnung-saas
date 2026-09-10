@@ -78,6 +78,7 @@ def build_jobs(profiles):
 
 def _run_job(job):
     source, regions, locations, profile_ids = job
+    log.info("[%s] Scan startet: Profile=%s, Regionen=%s, Orte=%s", source, sorted(profile_ids), sorted(regions), sorted(locations))
     scraper = get_scraper(source)
     params = SearchParams(
         nationwide=("DE" in regions and not locations),

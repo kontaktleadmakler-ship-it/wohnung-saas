@@ -127,9 +127,19 @@ class BaseScraper(ABC):
                 browser = playwright.chromium.launch(
                     headless=True,
                     args=[
-                        "--no-sandbox",
+                            "--no-sandbox",
                         "--disable-dev-shm-usage",
                         "--disable-gpu",
+                        "--disable-extensions",
+                        "--disable-background-networking",
+                        "--disable-default-apps",
+                        "--disable-sync",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-features=Translate,MediaRouter,OptimizationHints,BackForwardCache",
+                        "--disable-site-isolation-trials",
+                        "--renderer-process-limit=1",
+                        "--disable-software-rasterizer",
                     ],
                 )
                 context = browser.new_context(
@@ -152,6 +162,7 @@ class BaseScraper(ABC):
                 # commonly client-rendered.
                 context.route("**/*", self._route_lightweight_resources)
 
+                page = None
                 for base_url in base_urls:
                     seen_hrefs: set[str] = set()
 
@@ -167,7 +178,8 @@ class BaseScraper(ABC):
                                 self._polite_delay()
                             first_request = False
 
-                            page = context.new_page()
+                            if page is None or page.is_closed():
+                                page = context.new_page()
                             try:
                                 self._load_with_retry(page, url)
                                 html = page.content()
@@ -229,7 +241,9 @@ class BaseScraper(ABC):
                                         self.MAX_CANDIDATES_PER_SOURCE,
                                     )
                             finally:
-                                page.close()
+                                # Reuse one Playwright page for all pagination URLs.
+                                # This avoids creating a new renderer process for every page.
+                                pass
 
                             # Stop paginating this base URL once a page adds
                             # nothing new: either we reached the end of the
@@ -245,6 +259,11 @@ class BaseScraper(ABC):
                             )
                             break
             finally:
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
                 if context:
                     context.close()
                 if browser:
