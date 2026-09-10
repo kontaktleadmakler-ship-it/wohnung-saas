@@ -47,8 +47,10 @@ from scrapers.sites import (  # noqa: E402
     KalaydoScraper,
     KleinanzeigenScraper,
     MeinestadtScraper,
+    ImmoweltScraper,
 )
 from scrapers.models import SearchParams  # noqa: E402
+from scraper import _locations  # noqa: E402
 
 FAILURES = []
 
@@ -92,6 +94,12 @@ iss = ImmoScout24Scraper()
 adaptive_cards = iss.parse_listing_cards(HTML_NO_CARDS)
 check("adaptive fallback extracts a card without known selectors", bool(adaptive_cards))
 
+JSONLD_GRAPH = """<html><head><script type="application/ld+json">
+{"@context":"https://schema.org","@graph":[{"@type":"Apartment","name":"Helle 3 Zimmer Wohnung","url":"https://www.immobilienscout24.de/expose/44556677","description":"75 m² in Köln","offers":{"price":"1450"}}]}
+</script></head><body></body></html>"""
+graph_cards = iss.parse_listing_cards(JSONLD_GRAPH)
+check("JSON-LD @graph extracts a listing card", bool(graph_cards) and graph_cards[0].get("href", "").endswith("/44556677"))
+
 # ---------------------------------------------------------------------------
 # Room / size / price normalization edge cases
 # ---------------------------------------------------------------------------
@@ -101,6 +109,7 @@ check("rooms: '2 Zi.'", scraper.extract_rooms(None, "2 Zi.") == 2.0)
 check("rooms: '2,5 Zimmer'", scraper.extract_rooms(None, "2,5 Zimmer") == 2.5)
 check("rooms: '2.5 Zimmer'", scraper.extract_rooms(None, "2.5 Zimmer") == 2.5)
 check("rooms: '2 1/2 Zimmer'", scraper.extract_rooms(None, "2 1/2 Zimmer") == 2.5)
+check("rooms: '1/2 Zimmer'", scraper.extract_rooms(None, "1/2 Zimmer") == 0.5)
 
 check("size: '55 m²'", scraper.extract_size(None, "55 m²") == 55.0)
 check("size: '55,5 qm'", scraper.extract_size(None, "55,5 qm") == 55.5)
@@ -186,9 +195,11 @@ u1 = canonical_url("https://x.de/expose/123?utm_source=a&ref=b")
 u2 = canonical_url("https://x.de/expose/123?utm_source=z")
 check("tracking params are stripped before canonicalizing", u1 == u2)
 
-canon_a = canonical_url("HTTPS://X.DE/EXPOSE/123/?Foo=Bar&foo=bar#details")
+canon_a = canonical_url("HTTPS://X.DE/expose/123/?Foo=Bar&foo=bar#details")
 canon_b = canonical_url("https://x.de/expose/123?foo=bar")
 check("canonical_url ignores fragments and normalizes case/duplicate query params", canon_a == canon_b)
+canon_path = canonical_url("https://X.DE/Expose/AbC123/")
+check("canonical_url casefoldet den Pfad nicht", canon_path == "https://x.de/Expose/AbC123")
 
 fp_a = listing_fingerprint({"source": "immoscout24", "external_id": "123", "url": u1})
 fp_b = listing_fingerprint({"source": "immoscout24", "external_id": "123", "url": "https://x.de/expose/123"})
@@ -206,7 +217,12 @@ for cls in (KleinanzeigenScraper, MeinestadtScraper, ImmoScout24Scraper):
 nationwide = SearchParams(nationwide=True, locations=[])
 check("Kleinanzeigen nationwide does not fall back to Berlin", "c203" in KleinanzeigenScraper().build_search_urls(nationwide)[0] and "/berlin/" not in KleinanzeigenScraper().build_search_urls(nationwide)[0])
 check("ImmoScout24 nationwide uses geo=de", "geo=de" in ImmoScout24Scraper().build_search_urls(nationwide)[0])
-check("Immowelt nationwide does not fall back to Berlin", "/deutschland" in __import__("scrapers.sites", fromlist=["ImmoweltScraper"]).ImmoweltScraper().build_search_urls(nationwide)[0])
+check("Immowelt nationwide does not fall back to Berlin", "/deutschland" in ImmoweltScraper().build_search_urls(nationwide)[0])
+by_locations = _locations({"regions": ["BY"], "districts": ""})
+by_urls = KleinanzeigenScraper().build_search_urls(SearchParams(nationwide=False, region_codes=["BY"], locations=by_locations))
+check("BY profile resolves sample cities", bool(by_locations))
+check("BY region produces search URLs", bool(by_urls))
+check("BY region search URLs do not contain Berlin", all("berlin" not in url.lower() for url in by_urls))
 
 base_url = "https://x.de/suche/berlin?foo=bar"
 generic = KleinanzeigenScraper()
@@ -223,6 +239,18 @@ check("ImmoScout24 uses its documented pagenumber= param", iss_page2 and "pagenu
 
 check("Kalaydo pagination disabled (no real residential search to page through)", KalaydoScraper.MAX_PAGES == 1)
 
+# ---------------------------------------------------------------------------
+# Flask profile-form validation (no database/network)
+# ---------------------------------------------------------------------------
+from app import app as flask_app  # noqa: E402
+
+with flask_app.test_request_context("/profiles", method="POST", data={
+    "name": "Ungültiges Profil", "min_price": "1500", "max_price": "1200",
+    "min_rooms": "1", "max_rooms": "3", "min_size": "30",
+}):
+    from app import _profile_form  # noqa: E402
+    response = _profile_form()
+    check("profile form rejects max_price below min_price", response.status_code == 302 and response.location.endswith("/profiles"))
 
 if FAILURES:
     print(f"\n{len(FAILURES)} FAILED: " + ", ".join(FAILURES))

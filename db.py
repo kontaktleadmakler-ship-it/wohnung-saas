@@ -63,12 +63,21 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
             """)
             cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS raw JSONB NOT NULL DEFAULT '{}'::jsonb")
-            # Alte Scan-Läufe werden nicht mehr benötigt und würden die Tabelle
-            # sonst unbegrenzt wachsen lassen.
+        c.commit()
+
+def cleanup_scan_runs(days=30):
+    """Entfernt alte Scan-Läufe separat von der Schema-Initialisierung."""
+    # Die Retention bleibt aus init_db herausgelöst, damit Web und Worker
+    # beim Prozessstart nicht denselben DELETE-Lauf doppelt anstoßen.
+    days = max(0, int(days))
+    with get_connection() as c:
+        with c.cursor() as cur:
             cur.execute(
-                "DELETE FROM scan_runs WHERE started_at < NOW() - INTERVAL '30 days'"
+                "DELETE FROM scan_runs WHERE started_at < NOW() - (%s * INTERVAL '1 day')",
+                (days,),
             )
         c.commit()
+
 
 def try_scan_lock():
     # Der Advisory-Lock muss auf genau dieser Verbindung gehalten werden,

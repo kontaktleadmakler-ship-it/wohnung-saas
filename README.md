@@ -125,6 +125,7 @@ Nur öffentlich zugängliche Inhalte abrufen, Nutzungsbedingungen und Robots-/Zu
 
 - `DASHBOARD_LIMIT` steuert die maximale Anzahl der Treffer im Dashboard (Standard 300).
 - `MAX_CONCURRENT_SCRAPERS=1` ist der speichersichere Standard für kleine Render-Instanzen. Höhere Werte sind bewusst eine Betriebsentscheidung.
-- Ein `DE`-Profil wird bei den Scrapers als `SearchParams.nationwide=True` behandelt und nicht auf Berlin zurückgefallen.
+- Ein `DE`-Profil wird bei den Scrapers als `SearchParams.nationwide=True` behandelt und nicht auf Berlin zurückgefallen. Regionale Profile ohne Districts werden über 2–3 große Städte je Bundesland als Suchanker aufgebaut; explizite Districts haben Vorrang.
+- Cookie-Consent wird zusätzlich in gängigen Consent-iframes versucht, damit eingebettete Banner die Extraktion nicht blockieren.
 - Der Scan-Thread läuft im Web-Prozess. Bei mehreren Gunicorn-Workern ist der Laufstatus deshalb nicht global; der PostgreSQL-Advisory-Lock verhindert jedoch parallele Scans. Für den integrierten Thread `python app.py` bzw. einen einzelnen Web-Worker verwenden.
-- Kalaydo und Immonet wurden nicht aus `SOURCE_CLASSES` entfernt, weil in dieser Umgebung kein Live-Portaltest möglich war. Beide bleiben fehlertolerant; die Entfernung aus der Default-Liste sollte nach einem echten Produktionsscan entschieden werden.
+- **Entscheidung offen: Kalaydo/Immonet.** Beide bleiben vorerst in `SOURCE_CLASSES` und fehlertolerant. Kalaydo ist aktuell primär Jobbörse; Immonet ist weitgehend in Immowelt konsolidiert. Sie wurden bewusst nicht entfernt, damit eine spätere Reaktivierung per Konfiguration möglich bleibt. Die endgültige Entfernung sollte erst nach einem echten Produktionsscan bzw. einer bewussten Konfigurationsentscheidung erfolgen.

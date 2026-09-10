@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from urllib.parse import quote_plus, urlsplit
 
 from .base import BaseScraper
@@ -11,7 +12,7 @@ def locs(params):
     # wird ausschließlich über SearchParams.nationwide gesteuert.
     if params.nationwide:
         return []
-    return params.locations or (["Berlin"] if "BE" in params.region_codes else [])
+    return params.locations
 
 
 class KleinanzeigenScraper(BaseScraper):
@@ -39,7 +40,7 @@ class KleinanzeigenScraper(BaseScraper):
         if page <= self.PAGE_START:
             return base_url
         path = parts.path
-        path = __import__("re").sub(r"/seite:\d+(?=/|$)", "", path, flags=__import__("re").I)
+        path = re.sub(r"/seite:\d+(?=/|$)", "", path, flags=re.I)
         marker = "/c203"
         idx = path.lower().rfind(marker.lower())
         if idx < 0:

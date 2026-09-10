@@ -14,6 +14,10 @@ services:
         sync: false
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: "0"
+      - key: DASHBOARD_LIMIT
+        value: "300"
+      - key: LOG_LEVEL
+        value: "INFO"
 
   - type: worker
     name: wohnung-saas-worker
@@ -37,3 +41,9 @@ services:
         value: "75"
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: "0"
+      - key: MAX_CONCURRENT_SCRAPERS
+        value: "1"
+      - key: SCRAPE_MAX_PAGES
+        value: "3"
+      - key: LOG_LEVEL
+        value: "INFO"

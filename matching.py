@@ -42,7 +42,7 @@ def canonical_url(url: str) -> str:
         (
             parts.scheme.lower(),
             parts.netloc.lower(),
-            parts.path.rstrip("/").casefold(),
+            parts.path.rstrip("/"),
             urlencode(normalized_query),
             "",
         )

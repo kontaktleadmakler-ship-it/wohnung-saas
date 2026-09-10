@@ -89,9 +89,17 @@ def logout():
 @app.route("/")
 @auth
 def home():
-    min_score = int(request.args.get("min_score", 0))
     try:
-        rows = db.get_dashboard_rows(min_score, request.args.get("profile_id") or None)
+        min_score = int(request.args.get("min_score", 0))
+    except (TypeError, ValueError):
+        min_score = 0
+    try:
+        raw_profile_id = request.args.get("profile_id")
+        profile_id = int(raw_profile_id) if raw_profile_id else None
+    except (TypeError, ValueError):
+        profile_id = None
+    try:
+        rows = db.get_dashboard_rows(min_score, profile_id)
     except Exception:
         rows = []
         flash("Datenbank konnte nicht gelesen werden.")
@@ -109,7 +117,7 @@ def home():
         rows=rows,
         profiles=profiles,
         min_score=min_score,
-        selected_profile=request.args.get("profile_id") or "",
+        selected_profile=str(profile_id) if profile_id is not None else "",
         scan_running=bool(scan_thread and scan_thread.is_alive()),
         last_scan=last_scan,
     )
@@ -141,6 +149,8 @@ def _manual_scan():
 def profiles():
     if request.method == "POST":
         data = _profile_form()
+        if not isinstance(data, dict):
+            return data
         pid = db.add_profile(data)
         db.set_profile_sources(pid, request.form.getlist("sources"))
         db.set_profile_regions(pid, request.form.getlist("regions"))
@@ -158,6 +168,8 @@ def profiles():
 @auth
 def edit_profile(pid):
     data = _profile_form()
+    if not isinstance(data, dict):
+        return data
     data["active"] = request.form.get("active") == "1"
     db.update_profile(pid, data)
     db.set_profile_sources(pid, request.form.getlist("sources"))
@@ -185,15 +197,47 @@ def healthz():
 def _profile_form():
     def num(name, default=0):
         v = request.form.get(name, "").strip()
-        return float(v) if v else default
+        if not v:
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"Ungültiger Zahlenwert für {name}.")
+
+    try:
+        name = request.form.get("name", "").strip()
+        min_price = num("min_price")
+        max_price = num("max_price")
+        min_rooms = num("min_rooms")
+        max_rooms = num("max_rooms", None) if request.form.get("max_rooms") else None
+        min_size = num("min_size")
+    except ValueError as exc:
+        flash(str(exc))
+        return redirect(url_for("profiles"))
+
+    if not name:
+        flash("Bitte einen Profilnamen eingeben.")
+        return redirect(url_for("profiles"))
+    if max_price <= 0:
+        flash("Der Maximalpreis muss größer als 0 sein.")
+        return redirect(url_for("profiles"))
+    if max_price < min_price:
+        flash("Der Maximalpreis darf nicht kleiner als der Mindestpreis sein.")
+        return redirect(url_for("profiles"))
+    if min_size < 0:
+        flash("Die Mindestfläche darf nicht negativ sein.")
+        return redirect(url_for("profiles"))
+    if max_rooms is not None and max_rooms < min_rooms:
+        flash("Die maximale Zimmerzahl darf nicht kleiner als die minimale Zimmerzahl sein.")
+        return redirect(url_for("profiles"))
 
     return {
-        "name": request.form.get("name", "").strip(),
-        "min_price": num("min_price"),
-        "max_price": num("max_price"),
-        "min_rooms": num("min_rooms"),
-        "max_rooms": (float(request.form["max_rooms"]) if request.form.get("max_rooms") else None),
-        "min_size": num("min_size"),
+        "name": name,
+        "min_price": min_price,
+        "max_price": max_price,
+        "min_rooms": min_rooms,
+        "max_rooms": max_rooms,
+        "min_size": min_size,
         "districts": request.form.get("districts", ""),
         "keywords_exclude": request.form.get("keywords_exclude", ""),
         "active": True,

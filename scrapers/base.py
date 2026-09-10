@@ -302,14 +302,24 @@ class BaseScraper(ABC):
         ) from last_exc
 
     def _accept_cookies(self, page) -> None:
-        for selector in self.COOKIE_SELECTORS:
+        # Consent-Anbieter rendern den Dialog teils in einem iframe; deshalb
+        # werden dieselben robusten Selektoren zusätzlich dort versucht.
+        locators = [page.locator(selector).first for selector in self.COOKIE_SELECTORS]
+        try:
+            consent_frame = page.frame_locator(
+                "iframe[id*='sp_message_iframe'], iframe[title*='Consent' i], iframe[src*='consent' i]"
+            )
+            locators.extend(
+                consent_frame.locator(selector).first for selector in self.COOKIE_SELECTORS
+            )
+        except Exception:
+            pass
+
+        for loc in locators:
             try:
-                loc = page.locator(selector).first
                 if loc.count() and loc.is_visible(timeout=500):
                     loc.click(timeout=1500)
-                    self.log.info(
-                        "Cookie-Banner akzeptiert (%s)", selector
-                    )
+                    self.log.info("Cookie-Banner akzeptiert")
                     return
             except Exception:
                 continue
@@ -434,7 +444,10 @@ class BaseScraper(ABC):
             except Exception:
                 continue
 
-            objs = data if isinstance(data, list) else [data]
+            if isinstance(data, dict) and isinstance(data.get("@graph"), list):
+                objs = data["@graph"]
+            else:
+                objs = data if isinstance(data, list) else [data]
             for obj in objs:
                 if not isinstance(obj, dict):
                     continue
@@ -603,6 +616,12 @@ class BaseScraper(ABC):
         )
         if m:
             return float(m.group(1)) + 0.5
+        m = re.search(r"(?<![0-9])(?:½|1/2)\s*(?:-|bis)?\s*Zi(?:mmer)?\.?\b", s, re.I)
+        if m:
+            return 0.5
+        m = re.search(r"(?<![A-Za-z])einhalb\s*Zi(?:mmer)?\.?\b", s, re.I)
+        if m:
+            return 0.5
         m = re.search(
             r"([0-9]+(?:[,.][0-9]+)?)\s*(?:-|bis)?\s*Zi(?:mmer)?\.?\b",
             s,

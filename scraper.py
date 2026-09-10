@@ -11,6 +11,7 @@ from matching import listing_fingerprint, score_listing
 from telegram import send_telegram, format_match_message
 from scrapers.registry import get_scraper
 from scrapers.models import SearchParams
+from scrapers.regions import STATE_CITY_SAMPLES
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -38,11 +39,20 @@ def _locations(profile):
     vals = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
     if vals:
         return vals
-    if "BE" in (profile.get("regions") or []):
-        return ["Berlin"]
-    # Bei DE bleibt der Standort leer; _run_job setzt nationwide=True und die
-    # jeweiligen Scraper wählen dafür ihre deutschlandweiten Portal-URLs.
-    return []
+    regions = [str(code).strip().upper() for code in (profile.get("regions") or []) if str(code).strip()]
+    if not regions or "DE" in regions:
+        # Bei DE bleibt der Standort leer; _run_job setzt nationwide=True und die
+        # jeweiligen Scraper wählen dafür ihre deutschlandweiten Portal-URLs.
+        return []
+
+    locations = []
+    seen = set()
+    for code in regions:
+        for city in STATE_CITY_SAMPLES.get(code, []):
+            if city not in seen:
+                seen.add(city)
+                locations.append(city)
+    return locations
 
 
 def build_jobs(profiles):
@@ -100,6 +110,8 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
                 item.source,
             )
             if send_telegram(msg):
+                # Erst nach erfolgreichem Telegram-Versand markieren, damit ein
+                # temporär nicht erreichbarer Bot beim nächsten Scan erneut benachrichtigt wird (Retry).
                 db.mark_notified(listing_id, pid)
 
 
@@ -224,6 +236,7 @@ def run_once():
 
 def worker_loop():
     db.init_db()
+    db.cleanup_scan_runs()
     while True:
         started = time.monotonic()
         try:
