@@ -56,11 +56,3 @@ services:
       # Health-Check-Timeout) keine Log-Zeilen im Puffer verloren gehen.
       - key: PYTHONUNBUFFERED
         value: "1"
-      # OOM-Test: 512-MB-Free-Instanz + Chromium kann mit allen 7 Quellen
-      # knapp werden (Subprozess endet mit exit=-9/Killed). Testweise auf
-      # nur kleinanzeigen reduziert; nach Bestätigung, dass es ohne -9
-      # durchläuft, schrittweise Quellen wieder hinzufügen oder ganz
-      # entfernen (dann laufen wieder alle Profil-Quellen) bzw. auf den
-      # Starter-Plan wechseln, wenn alle 7 Quellen gebraucht werden.
-      - key: EMBEDDED_WORKER_SOURCES
-        value: "kleinanzeigen"

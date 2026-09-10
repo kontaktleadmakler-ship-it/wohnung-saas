@@ -28,6 +28,7 @@ MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "1")))
 # Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
 # aus einem Portal auf einmal in Playwright/Python weiterreichen.
 MAX_CANDIDATES_PER_SOURCE = max(1, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "10")))
+# This limits results per selected portal, not the number of selected portals.\n# Every source selected in the dashboard is still scanned.
 # TODO: Ein geteilter Browser mit ausgeliehenen Contexts könnte später mehr Parallelität
 # erlauben; auf kleinen Render-Instanzen ist ein Browser pro Job sonst zu speicherintensiv.
 
@@ -61,42 +62,32 @@ def _locations(profile):
     return locations
 
 
-def _embedded_worker_sources():
-    """Optionale Quellen-Allowlist (EMBEDDED_WORKER_SOURCES, kommagetrennt).
-
-    Auf der 512-MB-Free-Instanz kann Chromium mit allen 7 Quellen im
-    Speicher der eingebetteten Scan-Subprozesse zu OOM (exit=-9) führen.
-    Statt auf den Starter-Plan zu wechseln, lässt sich der Scan hiermit
-    testweise auf z. B. nur 'kleinanzeigen' reduzieren (siehe render.yaml).
-    Leer/nicht gesetzt = keine Einschränkung, alle Profil-Quellen laufen.
-    """
-    raw = os.getenv("EMBEDDED_WORKER_SOURCES", "").strip()
-    # Auf der kleinen eingebetteten Render-Instanz niemals ungefiltert alle
-    # Quellen starten. Eine explizite Env-Variable kann später wieder mehrere
-    # Quellen aktivieren.
-    if not raw:
-        raw = "kleinanzeigen"
-        log.info(
-            "EMBEDDED_WORKER_SOURCES nicht gesetzt - sicherer Standard: ['kleinanzeigen']"
-        )
-    return {s.strip() for s in raw.split(",") if s.strip()}
-
-
 def build_jobs(profiles):
-    allowlist = _embedded_worker_sources()
-    if allowlist is not None:
-        log.info("EMBEDDED_WORKER_SOURCES aktiv - eingeschränkt auf: %s", sorted(allowlist))
+    """Build scan jobs strictly from the sources selected on each dashboard profile.
+
+    The dashboard/profile_sources table is the single source of truth.  There is
+    deliberately no hidden portal allowlist or fallback to Kleinanzeigen here.
+    If a user selects 4 portals, all 4 are scheduled.  MAX_CONCURRENT_SCRAPERS
+    controls concurrency separately so selected portals are processed safely.
+    """
     jobs = {}
     for p in profiles:
         regions = tuple(sorted(p.get("regions") or ["DE"]))
         locations = tuple(sorted(_locations(p)))
-        for source in p.get("sources") or []:
-            if allowlist is not None and source not in allowlist:
-                continue
+        selected_sources = {
+            str(source).strip().lower()
+            for source in (p.get("sources") or [])
+            if str(source).strip()
+        }
+        log.info(
+            "Profil %s: Dashboard-Quellen=%s",
+            p.get("id"),
+            sorted(selected_sources),
+        )
+        for source in selected_sources:
             key = (source, regions, locations)
             jobs.setdefault(key, set()).add(p["id"])
     return jobs
-
 
 def _run_job(job):
     source, regions, locations, profile_ids = job
