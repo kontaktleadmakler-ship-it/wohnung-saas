@@ -65,11 +65,12 @@ def _embedded_worker_sources():
     Speicher der eingebetteten Scan-Subprozesse zu OOM (exit=-9) führen.
     Statt auf den Starter-Plan zu wechseln, lässt sich der Scan hiermit
     testweise auf z. B. nur 'kleinanzeigen' reduzieren (siehe render.yaml).
-    Leer/nicht gesetzt = keine Einschränkung, alle Profil-Quellen laufen.
+    Standard = nur kleinanzeigen. Mehrere Quellen können explizit per
+    EMBEDDED_WORKER_SOURCES=quelle1,quelle2 aktiviert werden.
     """
-    raw = os.getenv("EMBEDDED_WORKER_SOURCES", "").strip()
+    raw = os.getenv("EMBEDDED_WORKER_SOURCES", "kleinanzeigen").strip()
     if not raw:
-        return None
+        return {"kleinanzeigen"}
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 

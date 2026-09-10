@@ -16,6 +16,12 @@ from logging_setup import configure_logging
 
 configure_logging()
 
+# Sicherheitsstandard für die eingebettete Render-Instanz: nie versehentlich
+# alle Chromium-Scraper gleichzeitig starten. Render kann Environment-Werte
+# aus einer alten Service-Konfiguration übernehmen; setdefault stellt sicher,
+# dass der Child-Prozess trotzdem mit einer speichersicheren Allowlist startet.
+os.environ.setdefault("EMBEDDED_WORKER_SOURCES", "kleinanzeigen")
+
 import db
 import scraper as worker
 from scrapers.registry import list_sources, get_scraper
