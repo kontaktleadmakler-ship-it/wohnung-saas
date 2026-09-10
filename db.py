@@ -53,6 +53,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS scan_runs(
               id BIGSERIAL PRIMARY KEY, started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), duration_seconds NUMERIC, summary JSONB NOT NULL DEFAULT '{}'::jsonb
             );
+            CREATE TABLE IF NOT EXISTS worker_heartbeat(
+              id INT PRIMARY KEY DEFAULT 1,
+              last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              last_cycle_duration_seconds NUMERIC,
+              pid INT,
+              poll_interval_seconds INT,
+              CONSTRAINT worker_heartbeat_singleton CHECK (id = 1)
+            );
             CREATE INDEX IF NOT EXISTS idx_listings_last_seen ON listings(last_seen DESC);
             CREATE INDEX IF NOT EXISTS idx_listings_source ON listings(source);
             CREATE INDEX IF NOT EXISTS idx_matches_score ON matches(score DESC);
@@ -213,6 +221,27 @@ def get_last_scan_run():
     with get_connection() as c:
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 1")
+            return cur.fetchone()
+
+def record_worker_heartbeat(duration_seconds=None, pid=None, poll_interval_seconds=None):
+    """Vom Worker nach JEDEM Zyklus aufzurufen (auch bei Exceptions, auch ohne
+    aktive Profile) – VOR dem sleep. Einzige Zeile (id=1), daher UPSERT."""
+    with get_connection() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                """INSERT INTO worker_heartbeat(id,last_seen_at,last_cycle_duration_seconds,pid,poll_interval_seconds)
+                   VALUES(1,NOW(),%s,%s,%s)
+                   ON CONFLICT(id) DO UPDATE SET last_seen_at=NOW(),
+                     last_cycle_duration_seconds=EXCLUDED.last_cycle_duration_seconds,
+                     pid=EXCLUDED.pid, poll_interval_seconds=EXCLUDED.poll_interval_seconds""",
+                (duration_seconds, pid, poll_interval_seconds),
+            )
+        c.commit()
+
+def get_worker_heartbeat():
+    with get_connection() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM worker_heartbeat WHERE id=1")
             return cur.fetchone()
 
 DASHBOARD_LIMIT = max(1, int(os.getenv("DASHBOARD_LIMIT", "300")))

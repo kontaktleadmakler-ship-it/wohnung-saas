@@ -15,8 +15,9 @@ configure_logging()
 
 import db
 import scraper as worker
-from scrapers.registry import list_sources
+from scrapers.registry import list_sources, get_scraper
 from scrapers.regions import BUNDESLAENDER
+from scrapers.models import SearchParams
 
 app = Flask(__name__)
 APP_PASSWORD = os.getenv("APP_PASSWORD")
@@ -65,6 +66,36 @@ def _ensure_db_initialized():
         except Exception:
             log.exception("DB-Initialisierung fehlgeschlagen")
             return False
+
+
+def _heartbeat_status():
+    """Liefert (heartbeat_row, status, message) für Dashboard-Banner und /diagnose.
+    status ist eine von 'ok', 'delayed', 'down'."""
+    try:
+        hb = db.get_worker_heartbeat()
+    except Exception:
+        log.exception("Heartbeat konnte nicht gelesen werden")
+        hb = None
+
+    if not hb or not hb.get("last_seen_at"):
+        return hb, "down", (
+            "Worker nicht erreichbar. Prüfe in Render, ob wohnung-saas-worker "
+            "deployed ist und dieselbe DATABASE_URL hat."
+        )
+
+    import datetime
+
+    age = (datetime.datetime.now(datetime.timezone.utc) - hb["last_seen_at"]).total_seconds()
+    interval = hb.get("poll_interval_seconds") or worker.POLL_INTERVAL_SECONDS
+
+    if age < 1.5 * interval:
+        return hb, "ok", f"Worker aktiv. Letzter Heartbeat vor {int(age)}s."
+    if age < 4 * interval:
+        return hb, "delayed", f"Worker verzögert. Letzter Heartbeat vor {int(age)}s."
+    return hb, "down", (
+        "Worker nicht erreichbar. Prüfe in Render, ob wohnung-saas-worker "
+        "deployed ist und dieselbe DATABASE_URL hat."
+    )
 
 
 def auth(view):
@@ -129,6 +160,7 @@ def home():
         setup_stats = db.get_setup_stats()
     except Exception:
         setup_stats = None
+    heartbeat, heartbeat_status, heartbeat_message = _heartbeat_status()
     return render_template(
         "dashboard.html",
         rows=rows,
@@ -138,6 +170,66 @@ def home():
         scan_running=bool(scan_thread and scan_thread.is_alive()),
         last_scan=last_scan,
         setup_stats=setup_stats,
+        heartbeat=heartbeat,
+        heartbeat_status=heartbeat_status,
+        heartbeat_message=heartbeat_message,
+    )
+
+
+@app.route("/diagnose")
+@auth
+def diagnose():
+    try:
+        setup_stats = db.get_setup_stats()
+    except Exception:
+        log.exception("Setup-Stats für /diagnose fehlgeschlagen")
+        setup_stats = None
+
+    heartbeat, heartbeat_status, heartbeat_message = _heartbeat_status()
+
+    try:
+        profiles = db.get_active_profiles_with_sources()
+    except Exception:
+        log.exception("Profile für /diagnose konnten nicht geladen werden")
+        profiles = []
+
+    warnings = []
+    if setup_stats and setup_stats.get("profiles_with_sources", 0) == 0:
+        warnings.append("Keinem Profil sind Quellen zugewiesen.")
+    if heartbeat_status == "down":
+        warnings.append("Worker-Service läuft nicht oder teilt die DB nicht.")
+
+    profile_urls = []
+    jobs = worker.build_jobs(profiles) if profiles else {}
+    for (source, regions, locations), profile_ids in jobs.items():
+        try:
+            scraper = get_scraper(source)
+            params = SearchParams(
+                nationwide="DE" in regions,
+                region_codes=[] if "DE" in regions else list(regions),
+                locations=list(locations),
+            )
+            urls = scraper.build_search_urls(params)
+        except Exception:
+            log.exception("Such-URLs für Quelle %s konnten nicht gebaut werden", source)
+            urls = []
+        profile_urls.append({
+            "source": source,
+            "regions": list(regions),
+            "locations": list(locations),
+            "profile_ids": sorted(profile_ids),
+            "urls": urls,
+        })
+
+    return render_template(
+        "diagnose.html",
+        setup_stats=setup_stats,
+        heartbeat=heartbeat,
+        heartbeat_status=heartbeat_status,
+        heartbeat_message=heartbeat_message,
+        profiles=profiles,
+        warnings=warnings,
+        profile_urls=profile_urls,
     )
 
 
@@ -214,6 +306,20 @@ def healthz():
             stats = db.get_setup_stats()
         except Exception:
             stats = {}
+        try:
+            hb = db.get_worker_heartbeat()
+        except Exception:
+            hb = None
+        if hb and hb.get("last_seen_at"):
+            import datetime
+            age = (datetime.datetime.now(datetime.timezone.utc) - hb["last_seen_at"]).total_seconds()
+            stats["worker_last_seen_seconds_ago"] = round(age, 1)
+            stats["worker_poll_interval_seconds"] = hb.get("poll_interval_seconds")
+            stats["worker_pid"] = hb.get("pid")
+        else:
+            stats["worker_last_seen_seconds_ago"] = None
+            stats["worker_poll_interval_seconds"] = None
+            stats["worker_pid"] = None
         return {"ok": True, **stats}, 200
     return {"ok": False, "error": "DB-Initialisierung fehlgeschlagen"}, 503
 

@@ -130,9 +130,15 @@ class BaseScraper(ABC):
                 context = browser.new_context(
                     locale="de-DE",
                     timezone_id="Europe/Berlin",
-                    viewport={"width": 1365, "height": 900},
+                    viewport=random.choice([
+                        {"width": 1920, "height": 1080},
+                        {"width": 1536, "height": 864},
+                        {"width": 1440, "height": 900},
+                        {"width": 1366, "height": 768},
+                    ]),
                     user_agent=random.choice(self.USER_AGENTS),
                     service_workers="block",
+                    extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.8"},
                 )
                 context.set_default_timeout(self.PAGE_TIMEOUT_MS)
 

@@ -306,6 +306,15 @@ def worker_loop():
             "Scan-Zyklus beendet in %.1fs, schlafe %.0fs bis zum nächsten Lauf",
             elapsed, max(0, POLL_INTERVAL_SECONDS - elapsed),
         )
+        try:
+            db.record_worker_heartbeat(
+                duration_seconds=elapsed,
+                pid=os.getpid(),
+                poll_interval_seconds=POLL_INTERVAL_SECONDS,
+            )
+        except Exception:
+            log.exception("Heartbeat konnte nicht gespeichert werden")
+
         time.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
 
 

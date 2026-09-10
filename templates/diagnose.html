@@ -1,0 +1,63 @@
+{% extends 'base.html' %}{% block title %}Diagnose — Wohnungsradar{% endblock %}{% block content %}
+<div class="head"><div><div class="eyebrow">SYSTEMSTATUS</div><h1>Diagnose</h1></div></div>
+
+{% for w in warnings %}
+<div class="warning-box">{{w}}</div>
+{% endfor %}
+
+<div class="diagnose-block">
+  <h2>Setup-Stats</h2>
+  {% if setup_stats %}
+  <table class="diagnose-table">
+    <tr><td>Aktive Profile</td><td>{{setup_stats.active_profiles}}</td></tr>
+    <tr><td>Profile mit zugewiesenen Quellen</td><td>{{setup_stats.profiles_with_sources}}</td></tr>
+    <tr><td>Scan-Läufe insgesamt</td><td>{{setup_stats.scan_runs}}</td></tr>
+  </table>
+  {% else %}<p class="source-error">Setup-Stats konnten nicht geladen werden.</p>{% endif %}
+</div>
+
+<div class="diagnose-block heartbeat-{{heartbeat_status}}">
+  <h2>Worker-Heartbeat</h2>
+  <p>{{heartbeat_message}}</p>
+  {% if heartbeat %}
+  <table class="diagnose-table">
+    <tr><td>Letzter Heartbeat</td><td>{{heartbeat.last_seen_at.strftime('%d.%m.%Y %H:%M:%S')}} Uhr</td></tr>
+    <tr><td>PID</td><td>{{heartbeat.pid or '–'}}</td></tr>
+    <tr><td>Poll-Intervall</td><td>{{heartbeat.poll_interval_seconds or '–'}}s</td></tr>
+    <tr><td>Letzte Zyklusdauer</td><td>{{heartbeat.last_cycle_duration_seconds and '%.1fs'|format(heartbeat.last_cycle_duration_seconds) or '–'}}</td></tr>
+  </table>
+  {% endif %}
+</div>
+
+<div class="diagnose-block">
+  <h2>Aktive Profile</h2>
+  {% if profiles %}
+  <table class="diagnose-table">
+    <tr><th>Name</th><th>Quellen</th><th>Regionen</th></tr>
+    {% for p in profiles %}
+    <tr>
+      <td>{{p.name}}</td>
+      <td>{{p.sources|join(', ') if p.sources else '– keine Quelle zugewiesen –'}}</td>
+      <td>{{p.regions|join(', ') if p.regions else '–'}}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>Keine aktiven Profile.</p>{% endif %}
+</div>
+
+<div class="diagnose-block">
+  <h2>Gebaute Such-URLs (Dry-Run, kein Playwright)</h2>
+  {% if profile_urls %}
+  {% for job in profile_urls %}
+  <div style="margin-bottom:14px">
+    <b>{{job.source}}</b> · Profile {{job.profile_ids|join(', ')}}
+    · Regionen {{job.regions|join(', ') or '–'}}
+    · Orte {{job.locations|join(', ') or '–'}}
+    {% if job.urls %}
+    <ul class="url-list">{% for url in job.urls %}<li>{{url}}</li>{% endfor %}</ul>
+    {% else %}<p class="source-error">Keine Such-URLs gebaut.</p>{% endif %}
+  </div>
+  {% endfor %}
+  {% else %}<p>Keine Jobs – keinem aktiven Profil ist eine Quelle zugewiesen.</p>{% endif %}
+</div>
+{% endblock %}

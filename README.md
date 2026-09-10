@@ -70,13 +70,21 @@ Beide installieren Chromium über `playwright install --with-deps chromium`. Die
 
 `DATABASE_URL`, `SECRET_KEY`, `APP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL_SECONDS`, `MIN_NOTIFY_SCORE`, `PLAYWRIGHT_BROWSERS_PATH`.
 
-### Wenn im Dashboard keine Treffer erscheinen
+### Warum keine Treffer?
+
+Empfohlene Reihenfolge zum Eingrenzen:
+
+1. **`/diagnose` im Dashboard aufrufen.** Zeigt Setup-Stats, Worker-Heartbeat, alle aktiven Profile mit ihren Quellen/Regionen und die daraus tatsächlich gebauten Such-URLs (ohne Playwright, ohne Portal-Request).
+2. **`curl https://<web-service>/healthz` aufrufen.** Enthält neben `active_profiles`/`profiles_with_sources`/`scan_runs` jetzt auch `worker_last_seen_seconds_ago`, `worker_poll_interval_seconds` und `worker_pid`. Ist `worker_last_seen_seconds_ago` groß oder `null`, läuft der Worker-Service nicht oder schreibt nicht in dieselbe Datenbank.
+3. Erst danach die Render-Logs prüfen.
+
+Häufige Ursachen im Detail:
 
 - Der `wohnung-saas-worker`-Service **muss** deployed und auf „running" sein - ein separater Render-Service, kein Bestandteil des Web-Prozesses. In den Worker-Logs muss beim Start eine Zeile `Worker gestartet (pid=...)` erscheinen. Fehlt sie, läuft der Worker nicht (Deploy fehlgeschlagen, falscher Start Command, oder der Service wurde nie erstellt).
-- Web- und Worker-Service müssen dieselbe `DATABASE_URL` haben. Sonst legt der Web-Service die Tabellen in einer anderen Datenbank an als der Worker liest bzw. beschreibt, und das Dashboard bleibt dauerhaft leer.
+- Web- und Worker-Service müssen dieselbe `DATABASE_URL` haben. Sonst legt der Web-Service die Tabellen in einer anderen Datenbank an als der Worker liest bzw. beschreibt, und sowohl das Dashboard als auch der Heartbeat bleiben dauerhaft leer.
 - `LOG_LEVEL=INFO` muss in beiden Services gesetzt sein. `DEBUG` ist deutlich lauter; `WARNING` oder `ERROR` schneidet die Scraper- und Funnel-Logs komplett ab, die zeigen, warum ein Scan 0 Treffer liefert.
-- `curl https://<web-service>/healthz` zeigt `{"ok": true, "active_profiles": N, "profiles_with_sources": N, "scan_runs": N}`. Ist `profiles_with_sources` 0, wurde im Dashboard noch keinem Profil eine Quelle zugewiesen - dann kann der Worker laufen, ohne je einen Job zu bauen.
-- Für eine Diagnose ohne echten Scan siehe `--dry-run` unter „Test" unten.
+- Ist `profiles_with_sources` 0, wurde im Dashboard noch keinem Profil eine Quelle zugewiesen - dann kann der Worker laufen, ohne je einen Job zu bauen.
+- Manche Portale liefern gegenüber Rechenzentrums-IPs (wie sie Render vergibt) andere Ergebnisse oder blockieren gelegentlich Anfragen. Das äußert sich in den Logs als leere Kandidatenlisten oder HTTP-Fehler für genau eine Quelle, während andere Quellen weiter Treffer liefern. Das Projekt implementiert bewusst keine Umgehung dafür (siehe „Rechtliches / Betrieb" unten) - bei dauerhaften Problemen mit einer einzelnen Quelle die Abruffrequenz über `SCRAPE_DELAY_MIN`/`SCRAPE_DELAY_MAX` senken oder die Quelle vorübergehend aus den Profilen entfernen.
 
 ## Matching
 
