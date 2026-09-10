@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import subprocess
+import sys
 import threading
+import time
 from functools import wraps
 
 from flask import Flask, render_template, request, redirect, url_for, session, flash
@@ -41,6 +44,20 @@ scan_lock = threading.Lock()
 _db_init_lock = threading.Lock()
 _db_initialized = False
 
+# Es gibt keinen separaten Worker-Service mehr (siehe render.yaml) - der
+# Scan läuft als periodischer Subprozess innerhalb des Web-Prozesses, damit
+# Playwright den Event-Loop von Flask nicht blockiert und /healthz auch
+# während eines laufenden Scans antwortet.
+_NO_HEARTBEAT_MESSAGE = (
+    "Worker nicht erreichbar. Es gibt keinen separaten Worker-Service mehr - "
+    "prüfe stattdessen die Render-Logs des Web-Service (wohnung-saas-web) auf "
+    "die Zeilen 'Eingebetteter Scan-Thread gestartet' und "
+    "'Scan-Subprozess fertig'. Fehlen diese, startet der Subprozess nicht "
+    "oder wird vor Abschluss gekillt (z. B. OOM)."
+)
+_background_scanner_lock = threading.Lock()
+_background_scanner_started = False
+
 
 def _ensure_db_initialized():
     global _db_initialized
@@ -68,6 +85,85 @@ def _ensure_db_initialized():
             return False
 
 
+def _run_scan_subprocess_once():
+    """Startet `python scraper.py --once` als eigenen Prozess, leitet dessen
+    Log-Zeilen live in das Web-Log weiter und liefert den Exit-Code zurück
+    (oder None, wenn der Subprozess selbst nicht gestartet werden konnte).
+
+    Ein eigener Prozess statt eines Threads, damit Playwright/Chromium den
+    GIL bzw. den Flask-Event-Loop nicht blockieren kann - genau das hatte
+    vorher dazu geführt, dass /healthz während eines Scans nicht mehr
+    antwortete und Render den Web-Prozess deshalb neu startete.
+    """
+    cmd = [sys.executable, "scraper.py", "--once"]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            universal_newlines=True,
+        )
+    except Exception:
+        log.exception("Scan-Subprozess konnte nicht gestartet werden")
+        return None
+
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line:
+                log.info("[scan] %s", line)
+    finally:
+        proc.stdout.close()
+
+    returncode = proc.wait()
+    return returncode
+
+
+def _background_scanner():
+    """Läuft als Daemon-Thread im Web-Prozess und stößt periodisch einen
+    Scan-Subprozess an. Ersetzt den früheren separaten Worker-Service."""
+    poll_interval = worker.POLL_INTERVAL_SECONDS
+    log.info(
+        "Eingebetteter Scan-Thread gestartet (pid=%s): poll_interval=%ss",
+        os.getpid(), poll_interval,
+    )
+    while True:
+        started = time.monotonic()
+        with scan_lock:
+            already_running = bool(scan_thread and scan_thread.is_alive())
+        if already_running:
+            log.info("Eingebetteter Scan übersprungen: manueller Scan läuft bereits")
+        else:
+            returncode = _run_scan_subprocess_once()
+            log.info("Scan-Subprozess fertig (exit=%s)", returncode)
+
+        # Fallback-Heartbeat: unabhängig vom Exit-Code des Subprozesses,
+        # damit /healthz auch dann aktuell bleibt, wenn scraper.py --once
+        # schon beim Import stirbt oder per SIGKILL (OOM) endet, bevor sein
+        # eigener finally-Block (siehe scraper.py) greifen konnte.
+        try:
+            db.record_worker_heartbeat(
+                duration_seconds=time.monotonic() - started,
+                pid=os.getpid(),
+                poll_interval_seconds=poll_interval,
+            )
+        except Exception:
+            log.exception("Fallback-Heartbeat konnte nicht gespeichert werden")
+
+        elapsed = time.monotonic() - started
+        time.sleep(max(0, poll_interval - elapsed))
+
+
+def _start_background_scanner_once():
+    global _background_scanner_started
+    with _background_scanner_lock:
+        if _background_scanner_started:
+            return
+        _background_scanner_started = True
+        threading.Thread(target=_background_scanner, daemon=True, name="bg-scanner").start()
+
+
 def _heartbeat_status():
     """Liefert (heartbeat_row, status, message) für Dashboard-Banner und /diagnose.
     status ist eine von 'ok', 'delayed', 'down'."""
@@ -78,10 +174,7 @@ def _heartbeat_status():
         hb = None
 
     if not hb or not hb.get("last_seen_at"):
-        return hb, "down", (
-            "Worker nicht erreichbar. Prüfe in Render, ob wohnung-saas-worker "
-            "deployed ist und dieselbe DATABASE_URL hat."
-        )
+        return hb, "down", _NO_HEARTBEAT_MESSAGE
 
     import datetime
 
@@ -92,10 +185,7 @@ def _heartbeat_status():
         return hb, "ok", f"Worker aktiv. Letzter Heartbeat vor {int(age)}s."
     if age < 4 * interval:
         return hb, "delayed", f"Worker verzögert. Letzter Heartbeat vor {int(age)}s."
-    return hb, "down", (
-        "Worker nicht erreichbar. Prüfe in Render, ob wohnung-saas-worker "
-        "deployed ist und dieselbe DATABASE_URL hat."
-    )
+    return hb, "down", _NO_HEARTBEAT_MESSAGE
 
 
 def auth(view):
@@ -248,82 +338,15 @@ def run_scan():
 
 
 def _manual_scan():
+    # Läuft ebenfalls als Subprozess (nicht worker.run_once() direkt im
+    # Thread) - sonst würde ein manuell ausgelöster Scan wieder Playwright
+    # im Web-Prozess blockieren und genau das ursprüngliche
+    # /healthz-Timeout-Problem für die Dauer des Scans reproduzieren.
     try:
-        worker.run_once()
+        returncode = _run_scan_subprocess_once()
+        log.info("Manueller Scan-Subprozess fertig (exit=%s)", returncode)
     except Exception:
         log.exception("Manueller Scan fehlgeschlagen")
-
-
-def _background_scanner():
-    """Läuft im Web-Prozess. Notwendig auf Render Free, weil ein separater
-    Worker-Service dort nach ~15 Min Inaktivität eingeschläfert wird und
-    UptimeRobot keinen Worker-HTTP-Port wecken kann. Der PostgreSQL-
-    Advisory-Lock in db.try_scan_lock() verhindert, dass dieser Thread und
-    ein evtl. doch laufender Worker-Service parallel scannen."""
-    import time
-
-    # DB muss initialisiert sein, sonst crasht der erste run_once().
-    for _ in range(30):
-        if _ensure_db_initialized():
-            break
-        time.sleep(2)
-
-    # Erster Scan etwas verzögert, damit der Web-Service zuerst ready wird.
-    time.sleep(10)
-
-    while True:
-        started = time.monotonic()
-        try:
-            log.info("Eingebetteter Scan-Zyklus startet")
-            worker.run_once()
-        except Exception:
-            log.exception("Eingebetteter Scan-Zyklus fehlgeschlagen")
-
-        elapsed = time.monotonic() - started
-        try:
-            db.record_worker_heartbeat(
-                duration_seconds=elapsed,
-                pid=os.getpid(),
-                poll_interval_seconds=worker.POLL_INTERVAL_SECONDS,
-            )
-        except Exception:
-            log.exception("Heartbeat konnte nicht gespeichert werden")
-
-        sleep_for = max(30, worker.POLL_INTERVAL_SECONDS - elapsed)
-        log.info("Eingebetteter Scan-Zyklus fertig in %.1fs, schlafe %.0fs", elapsed, sleep_for)
-        time.sleep(sleep_for)
-
-
-def _start_background_scanner():
-    if os.getenv("EMBEDDED_WORKER", "1") != "1":
-        log.info("EMBEDDED_WORKER=0 - kein eingebetteter Scanner gestartet")
-        return
-    # Werkzeug-Reloader: nur im echten Server-Prozess starten, nicht im Reloader.
-    if os.environ.get("WERKZEUG_RUN_MAIN") == "false":
-        return
-    t = threading.Thread(target=_background_scanner, daemon=True, name="embedded-scanner")
-    t.start()
-    log.info("Eingebetteter Scan-Thread gestartet (pid=%s)", os.getpid())
-
-
-@app.route("/tasks/scan", methods=["POST", "GET"])
-def tasks_scan():
-    """Von außen triggbar (z. B. UptimeRobot, cron-job.org) mit Token.
-    Kein Login nötig, weil sonst kein externer Trigger möglich wäre."""
-    token = os.getenv("SCAN_TRIGGER_TOKEN")
-    if not token:
-        return {"error": "SCAN_TRIGGER_TOKEN nicht konfiguriert"}, 503
-    supplied = request.args.get("token") or request.headers.get("X-Scan-Token")
-    if supplied != token:
-        return {"error": "unauthorized"}, 401
-
-    global scan_thread
-    with scan_lock:
-        if scan_thread and scan_thread.is_alive():
-            return {"status": "already_running"}, 200
-        scan_thread = threading.Thread(target=_manual_scan, daemon=True)
-        scan_thread.start()
-    return {"status": "started"}, 202
 
 
 @app.route("/profiles", methods=["GET", "POST"])
@@ -449,5 +472,5 @@ def _profile_form():
 
 if __name__ == "__main__":
     _ensure_db_initialized()
-    _start_background_scanner()
+    _start_background_scanner_once()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

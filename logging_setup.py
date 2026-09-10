@@ -11,6 +11,27 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+
+
+class _FlushingStreamHandler(logging.StreamHandler):
+    """StreamHandler, der nach jeder Zeile explizit flusht.
+
+    Ohne das puffert Python stdout beim Schreiben in eine Nicht-Terminal-
+    Pipe (also genau der Fall bei Render) blockweise. Wird der Container
+    dann hart gekillt (OOM, Health-Check-Timeout), gehen die letzten Zeilen
+    verloren - inklusive der Zeile, die den Absturz erklärt hätte. Zusammen
+    mit PYTHONUNBUFFERED=1 (siehe render.yaml) ist das die zweite Hälfte:
+    PYTHONUNBUFFERED wirkt auf den Python-Interpreter/stdout selbst, dieser
+    Handler stellt sicher, dass auch der Logging-Layer pro Record flusht.
+    """
+
+    def emit(self, record):
+        super().emit(record)
+        try:
+            self.flush()
+        except Exception:
+            pass
 
 
 def configure_logging(default_level: str = "INFO") -> str:
@@ -21,9 +42,13 @@ def configure_logging(default_level: str = "INFO") -> str:
     mehreren Stellen erneut aus os.environ zu lesen.
     """
     level = os.getenv("LOG_LEVEL", default_level).upper()
+    handler = _FlushingStreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    )
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        handlers=[handler],
         force=True,
     )
     return level

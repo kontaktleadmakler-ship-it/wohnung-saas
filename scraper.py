@@ -58,12 +58,32 @@ def _locations(profile):
     return locations
 
 
+def _embedded_worker_sources():
+    """Optionale Quellen-Allowlist (EMBEDDED_WORKER_SOURCES, kommagetrennt).
+
+    Auf der 512-MB-Free-Instanz kann Chromium mit allen 7 Quellen im
+    Speicher der eingebetteten Scan-Subprozesse zu OOM (exit=-9) führen.
+    Statt auf den Starter-Plan zu wechseln, lässt sich der Scan hiermit
+    testweise auf z. B. nur 'kleinanzeigen' reduzieren (siehe render.yaml).
+    Leer/nicht gesetzt = keine Einschränkung, alle Profil-Quellen laufen.
+    """
+    raw = os.getenv("EMBEDDED_WORKER_SOURCES", "").strip()
+    if not raw:
+        return None
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
 def build_jobs(profiles):
+    allowlist = _embedded_worker_sources()
+    if allowlist is not None:
+        log.info("EMBEDDED_WORKER_SOURCES aktiv - eingeschränkt auf: %s", sorted(allowlist))
     jobs = {}
     for p in profiles:
         regions = tuple(sorted(p.get("regions") or ["DE"]))
         locations = tuple(sorted(_locations(p)))
         for source in p.get("sources") or []:
+            if allowlist is not None and source not in allowlist:
+                continue
             key = (source, regions, locations)
             jobs.setdefault(key, set()).add(p["id"])
     return jobs
@@ -318,6 +338,38 @@ def worker_loop():
         time.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
 
 
+def run_once_and_heartbeat():
+    """Ein einzelner Scan-Zyklus für den `--once`-Modus (Subprozess, der vom
+    Web-Prozess periodisch gestartet wird).
+
+    Der Heartbeat wird bewusst in einem `finally`-Block geschrieben: läuft
+    `run_once()` sauber durch, läuft in einen Fehler oder wird der Prozess
+    mitten im Scan gekillt (OOM etc.) und die Exception läuft bis hierhin
+    hoch, soll `worker_last_seen_seconds_ago` in /healthz trotzdem aktuell
+    bleiben - andernfalls bleibt es dauerhaft `null`, obwohl der Subprozess
+    ja tatsächlich lief. Ein harter SIGKILL (exit=-9) kann diesen
+    finally-Block selbst nicht mehr erreichen; dafür gibt es den
+    Fallback-Heartbeat in app.py::_background_scanner().
+    """
+    started = time.monotonic()
+    log.info("Einzelscan (--once) gestartet (pid=%s)", os.getpid())
+    try:
+        db.init_db()
+        result = run_once()
+        return result
+    finally:
+        elapsed = time.monotonic() - started
+        try:
+            db.record_worker_heartbeat(
+                duration_seconds=elapsed,
+                pid=os.getpid(),
+                poll_interval_seconds=POLL_INTERVAL_SECONDS,
+            )
+            log.info("Heartbeat geschrieben (Einzelscan, %.1fs)", elapsed)
+        except Exception:
+            log.exception("Heartbeat konnte nicht gespeichert werden (Einzelscan)")
+
+
 def _dry_run():
     """Loggt aktive Profile und die daraus gebauten Jobs + Such-URLs, ohne
     Playwright oder Portal-Requests zu starten. Schnellster Weg zu prüfen:
@@ -352,5 +404,7 @@ if __name__ == "__main__":
 
     if "--dry-run" in sys.argv:
         _dry_run()
+    elif "--once" in sys.argv:
+        run_once_and_heartbeat()
     else:
         worker_loop()

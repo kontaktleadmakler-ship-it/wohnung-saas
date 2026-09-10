@@ -1,8 +1,15 @@
+# Nur noch EIN Service: der Scan läuft als periodischer Subprozess
+# (`python scraper.py --once`) innerhalb des Web-Prozesses (siehe
+# app.py::_background_scanner). Der frühere separate `wohnung-saas-worker`
+# Service ist entfallen - falls er in Render noch existiert, kann er
+# gelöscht werden, sonst läuft der Scan doppelt (zwei Prozesse teilen sich
+# zwar denselben Advisory-Lock, verbrauchen aber unnötig einen zweiten
+# Free-Tier-Slot).
 services:
   - type: web
     name: wohnung-saas-web
     env: python
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
+    buildCommand: pip install -r requirements.txt && playwright install chromium
     startCommand: python app.py
     healthCheckPath: /healthz
     envVars:
@@ -16,16 +23,14 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: SCAN_TRIGGER_TOKEN
-        generateValue: true
-      - key: EMBEDDED_WORKER
-        value: "1"
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
+      - key: DASHBOARD_LIMIT
+        value: "300"
       - key: POLL_INTERVAL_SECONDS
         value: "300"
       - key: MIN_NOTIFY_SCORE
         value: "75"
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
       - key: MAX_CONCURRENT_SCRAPERS
         value: "1"
       - key: SCRAPE_MAX_PAGES
@@ -42,7 +47,18 @@ services:
         value: "3"
       - key: SCRAPE_BACKOFF_BASE
         value: "1.5"
-      - key: DASHBOARD_LIMIT
-        value: "300"
       - key: LOG_LEVEL
         value: "INFO"
+      # PYTHONUNBUFFERED=1 zusammen mit dem Flushing-Handler in
+      # logging_setup.py, damit bei einem harten Kill (OOM,
+      # Health-Check-Timeout) keine Log-Zeilen im Puffer verloren gehen.
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # OOM-Test: 512-MB-Free-Instanz + Chromium kann mit allen 7 Quellen
+      # knapp werden (Subprozess endet mit exit=-9/Killed). Testweise auf
+      # nur kleinanzeigen reduziert; nach Bestätigung, dass es ohne -9
+      # durchläuft, schrittweise Quellen wieder hinzufügen oder ganz
+      # entfernen (dann laufen wieder alle Profil-Quellen) bzw. auf den
+      # Starter-Plan wechseln, wenn alle 7 Quellen gebraucht werden.
+      - key: EMBEDDED_WORKER_SOURCES
+        value: "kleinanzeigen"
