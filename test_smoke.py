@@ -48,9 +48,11 @@ from scrapers.sites import (  # noqa: E402
     KleinanzeigenScraper,
     MeinestadtScraper,
     ImmoweltScraper,
+    WgGesuchtScraper,
+    slugify_city,
 )
 from scrapers.models import SearchParams  # noqa: E402
-from scraper import _locations  # noqa: E402
+from scraper import _locations, _log_and_build_funnel, build_jobs  # noqa: E402
 
 FAILURES = []
 
@@ -224,6 +226,40 @@ check("BY profile resolves sample cities", bool(by_locations))
 check("BY region produces search URLs", bool(by_urls))
 check("BY region search URLs do not contain Berlin", all("berlin" not in url.lower() for url in by_urls))
 
+# ---------------------------------------------------------------------------
+# Umlaut-/Slug-Handling (slugify_city) - Portale erwarten ASCII-Slugs
+# ---------------------------------------------------------------------------
+check("slugify_city: München", slugify_city("München") == "muenchen")
+check("slugify_city: Düsseldorf", slugify_city("Düsseldorf") == "duesseldorf")
+check("slugify_city: Köln", slugify_city("Köln") == "koeln")
+check(
+    "slugify_city: Frankfurt am Main",
+    slugify_city("Frankfurt am Main") == "frankfurt-am-main",
+)
+
+ka_muenchen = KleinanzeigenScraper().build_search_urls(
+    SearchParams(nationwide=False, locations=["München"])
+)[0]
+check("Kleinanzeigen München URL uses ASCII slug", "/muenchen/" in ka_muenchen)
+check("Kleinanzeigen München URL has no percent-encoding", "%C3%BC" not in ka_muenchen)
+
+ka_duesseldorf = KleinanzeigenScraper().build_search_urls(
+    SearchParams(nationwide=False, locations=["Düsseldorf"])
+)[0]
+check("Kleinanzeigen Düsseldorf URL uses ASCII slug", "/duesseldorf/" in ka_duesseldorf)
+
+wgg_muenchen = WgGesuchtScraper().build_search_urls(
+    SearchParams(nationwide=False, locations=["München"])
+)
+check(
+    "WG-Gesucht München URL uses ASCII slug",
+    any("wohnungen-in-muenchen" in url for url in wgg_muenchen),
+)
+check(
+    "WG-Gesucht nationwide returns no Berlin fallback",
+    WgGesuchtScraper().build_search_urls(SearchParams(nationwide=True, locations=[])) == [],
+)
+
 base_url = "https://x.de/suche/berlin?foo=bar"
 generic = KleinanzeigenScraper()
 check("page 1 returns the base URL unchanged", generic.build_page_url(base_url, 1) == base_url)
@@ -249,8 +285,42 @@ with flask_app.test_request_context("/profiles", method="POST", data={
     "min_rooms": "1", "max_rooms": "3", "min_size": "30",
 }):
     from app import _profile_form  # noqa: E402
-    response = _profile_form()
-    check("profile form rejects max_price below min_price", response.status_code == 302 and response.location.endswith("/profiles"))
+    data, error = _profile_form()
+    check(
+        "profile form rejects max_price below min_price",
+        data is None and error == "Der Maximalpreis darf nicht kleiner als der Mindestpreis sein.",
+    )
+
+with flask_app.test_request_context("/profiles", method="POST", data={
+    "name": "Gültiges Profil", "min_price": "800", "max_price": "1500",
+    "min_rooms": "1", "max_rooms": "3", "min_size": "30",
+}):
+    data, error = _profile_form()
+    check("profile form accepts valid data", isinstance(data, dict) and error is None)
+
+# ---------------------------------------------------------------------------
+# Scan-Zusammenfassung: Funnel/Quellen-Felder auch im Nullfall korrekt
+# (das ist der Fall, der im Web-Service bislang unbemerkt blieb, weil er
+# nirgends geloggt wurde - siehe FIX 1c/2b).
+# ---------------------------------------------------------------------------
+empty_funnel = _log_and_build_funnel({}, {}, {})
+check(
+    "_log_and_build_funnel gibt bei leeren profile_stats ein leeres per_profile zurück",
+    empty_funnel == {"per_source": {}, "per_profile": {}},
+)
+
+profiles_no_sources = [{"id": 1, "regions": ["DE"], "sources": []}]
+check(
+    "build_jobs liefert keine Jobs für ein Profil ohne Quellen",
+    build_jobs(profiles_no_sources) == {},
+)
+
+profiles_with_source = [{"id": 1, "regions": ["DE"], "sources": ["immoscout24"]}]
+jobs_with_source = build_jobs(profiles_with_source)
+check(
+    "build_jobs liefert genau einen Job, wenn eine Quelle zugewiesen ist",
+    len(jobs_with_source) == 1 and {1} in jobs_with_source.values(),
+)
 
 if FAILURES:
     print(f"\n{len(FAILURES)} FAILED: " + ", ".join(FAILURES))

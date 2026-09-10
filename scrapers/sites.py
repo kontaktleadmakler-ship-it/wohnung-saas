@@ -6,10 +6,35 @@ from urllib.parse import quote_plus, urlsplit
 from .base import BaseScraper
 from .models import SearchParams
 
+_UMLAUT_MAP = {
+    "ä": "ae", "ö": "oe", "ü": "ue",
+    "Ä": "Ae", "Ö": "Oe", "Ü": "Ue",
+    "ß": "ss",
+}
+
+
+def slugify_city(name: str) -> str:
+    # Portale erwarten ASCII-Slugs; Umlaute werden transliteriert, nicht
+    # prozent-encodiert.
+    text = name.strip()
+    for src, repl in _UMLAUT_MAP.items():
+        text = text.replace(src, repl)
+    text = text.casefold()
+    text = re.sub(r"[\s.]+", "-", text)
+    text = re.sub(r"-+", "-", text)
+    return text.strip("-")
+
 
 def locs(params):
     # Nationwide wird absichtlich nicht zu Berlin zurückgestuft. Das Suchgebiet
     # wird ausschließlich über SearchParams.nationwide gesteuert.
+    #
+    # region_codes ist in SearchParams reine Buchführung (z. B. für Logging/
+    # Debugging) und wird hier bewusst NICHT ausgewertet: die tatsächlichen
+    # Suchorte stehen bereits in params.locations, weil scraper.py::_locations()
+    # die Bundesland-Codes bzw. Districts schon vorher in konkrete Städte/Orte
+    # aufgelöst hat. Also bitte locs() nicht "reparieren", indem zusätzlich
+    # region_codes ausgewertet wird - das würde zu doppelten/falschen Orten führen.
     if params.nationwide:
         return []
     return params.locations
@@ -27,7 +52,7 @@ class KleinanzeigenScraper(BaseScraper):
             return [f"{self.BASE_URL}/s-wohnung-mieten/c203"]
         out = []
         for location in locs(p):
-            slug = quote_plus(location.lower()).replace("+", "-")
+            slug = slugify_city(location)
             out.append(f"{self.BASE_URL}/s-wohnung-mieten/{slug}/c203")
         return out[:8]
 
@@ -65,7 +90,7 @@ class ImmoScout24Scraper(BaseScraper):
             return [f"{self.BASE_URL}/Suche/de/wohnung-mieten?geo=de"]
         out = []
         for location in locs(p):
-            out.append(f"{self.BASE_URL}/Suche/de/{quote_plus(location.lower())}/wohnung-mieten")
+            out.append(f"{self.BASE_URL}/Suche/de/{slugify_city(location)}/wohnung-mieten")
         return out[:8]
 
     def is_listing_href(self, href):
@@ -84,7 +109,7 @@ class ImmoweltScraper(BaseScraper):
             return [f"{self.BASE_URL}/suche/mieten/wohnung/deutschland"]
         out = []
         for location in locs(p):
-            slug = quote_plus(location.lower()).replace("+", "-")
+            slug = slugify_city(location)
             out.append(f"{self.BASE_URL}/suche/mieten/wohnung/{slug}")
         return out[:8]
 
@@ -125,9 +150,9 @@ class WgGesuchtScraper(BaseScraper):
             return []
         out = []
         for location in locs(p):
-            slug = location.replace(" ", "-")
+            slug = slugify_city(location)
             out.append(f"{self.BASE_URL}/wohnungen-in-{slug}.html")
-            out.append(f"{self.BASE_URL}/1-zimmer-wohnungen/{quote_plus(location.lower())}")
+            out.append(f"{self.BASE_URL}/1-zimmer-wohnungen/{slug}")
         return out[:8]
 
     def is_listing_href(self, href):
@@ -146,7 +171,7 @@ class MeinestadtScraper(BaseScraper):
             return [f"{self.BASE_URL}/deutschland/immobilien/wohnungen"]
         out = []
         for location in locs(p):
-            slug = quote_plus(location.lower()).replace("+", "-")
+            slug = slugify_city(location)
             out.append(f"{self.BASE_URL}/{slug}/immobilien/wohnungen")
         return out[:8]
 

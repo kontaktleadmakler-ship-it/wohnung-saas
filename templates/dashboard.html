@@ -1,12 +1,20 @@
 {% extends 'base.html' %}{% block title %}Treffer — Wohnungsradar{% endblock %}{% block content %}
 <div class="head"><div><div class="eyebrow">LIVE LISTINGS</div><h1>Wohnungstreffer</h1></div><form method="post" action="{{url_for('run_scan')}}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button {% if scan_running %}disabled{% endif %}>{{'SCAN LÄUFT…' if scan_running else 'SCAN STARTEN'}}</button></form></div>
+{% if setup_stats and setup_stats.profiles_with_sources == 0 and setup_stats.scan_runs == 0 %}
+<div class="scan-summary source-error">
+  Noch kein Scan möglich: Lege mindestens ein Profil an und weise ihm Quellen zu
+  (<a href="{{ url_for('profiles') }}">Profil → Quellen</a>).
+</div>
+{% endif %}
 {% if last_scan %}
 <div class="scan-summary">
   <b>Letzter Scan:</b> {{last_scan.started_at.strftime('%d.%m.%Y %H:%M')}} Uhr
   · {{last_scan.summary.scraped_total or 0}} Inserate gefunden
   · {{last_scan.summary.unique_total or 0}} eindeutig
+  {% if last_scan.summary.jobs_count is not none %}· {{last_scan.summary.jobs_count}} Jobs{% endif %}
   {% if last_scan.duration_seconds %}· {{'%.0f'|format(last_scan.duration_seconds)}}s Laufzeit{% endif %}
   {% if last_scan.summary.source_errors %}<div class="source-error">Fehlgeschlagene Quellen (andere liefen weiter): {{last_scan.summary.source_errors|join(', ')}}</div>{% endif %}
+  {% if last_scan.summary.source_empty %}<div class="source-error">Quellen ohne Treffer: {{last_scan.summary.source_empty|join(', ')}}</div>{% endif %}
   <details><summary>Warum wenige/keine Treffer? Trichter pro Profil anzeigen</summary>
     {% for pid, f in (last_scan.summary.per_profile or {}).items() %}
     <div><b>{{f.profile_name}}</b>

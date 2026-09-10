@@ -16,7 +16,7 @@ Die aktiven Scraper liegen ausschließlich in `scrapers/sites.py`; alte, nicht v
 
 Die Scraper benutzen eine plattformspezifische URL-/Link-Strategie, mehrere Selektoren und danach einen generischen DOM-Fallback. Pro URL wird ein Fehler isoliert. Playwright wartet mindestens 10 Sekunden auf clientseitig gerenderte Inhalte und versucht übliche Cookie-Dialoge zu akzeptieren.
 
-**Pagination:** Jede Such-URL wird bis zu `SCRAPE_MAX_PAGES` (Standard 3) Seiten weit verfolgt und stoppt automatisch, sobald eine Seite keine neuen Inserate mehr liefert – das war der Hauptgrund, warum Profile bisher oft nur eine Handvoll Wohnungen sahen (die meisten Portale zeigen ca. 20 Treffer pro Seite). Der Seitenparameter ist pro Scraper in `scrapers/sites.py` konfigurierbar (`PAGE_PARAM`); für ImmoScout24 ist `pagenumber` hinterlegt, alle anderen nutzen aktuell den generischen `?page=N`-Fallback. **Wichtig:** Diese Parameter konnten in dieser Umgebung nicht gegen die echten Portale verifiziert werden (kein Netzwerkzugriff auf Immobilienportale). Ein falscher Parameter führt nicht zu Fehlern – das Portal liefert dann einfach wiederholt Seite 1, die per Deduplizierung verworfen wird –, sollte aber nach dem Deployment anhand der Logs (`Seite N - X Kandidaten (Y neu)`) geprüft und bei Bedarf angepasst werden.
+**Pagination:** Jede Such-URL wird bis zu `SCRAPE_MAX_PAGES` (Standard 3) Seiten weit verfolgt und stoppt automatisch, sobald eine Seite keine neuen Inserate mehr liefert – das war der Hauptgrund, warum Profile bisher oft nur eine Handvoll Wohnungen sahen (die meisten Portale zeigen ca. 20 Treffer pro Seite). Der Seitenparameter ist pro Scraper in `scrapers/sites.py` konfigurierbar (`PAGE_PARAM`); für ImmoScout24 ist `pagenumber` hinterlegt, eBay Kleinanzeigen überschreibt `build_page_url` und nutzt stattdessen `seite:N` im Pfad, alle anderen nutzen aktuell den generischen `?page=N`-Fallback. **Wichtig:** Diese Parameter konnten in dieser Umgebung nicht gegen die echten Portale verifiziert werden (kein Netzwerkzugriff auf Immobilienportale). Ein falscher Parameter führt nicht zu Fehlern – das Portal liefert dann einfach wiederholt Seite 1, die per Deduplizierung verworfen wird –, sollte aber nach dem Deployment anhand der Logs (`Seite N - X Kandidaten (Y neu)`) geprüft und bei Bedarf angepasst werden.
 
 **Wichtiger aktueller Hinweis:** Die öffentlich erreichbare Kalaydo-Präsenz ist inzwischen primär eine Jobbörse. Der Kalaydo-Adapter ist deshalb absichtlich fehlertolerant und erzeugt keine erfundenen Immobilienangebote. Wenn Kalaydo wieder eine öffentliche Wohnimmobilien-Suche anbietet, muss nur die URL-Konfiguration in `scrapers/sites.py` angepasst werden.
 
@@ -70,6 +70,14 @@ Beide installieren Chromium über `playwright install --with-deps chromium`. Die
 
 `DATABASE_URL`, `SECRET_KEY`, `APP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL_SECONDS`, `MIN_NOTIFY_SCORE`, `PLAYWRIGHT_BROWSERS_PATH`.
 
+### Wenn im Dashboard keine Treffer erscheinen
+
+- Der `wohnung-saas-worker`-Service **muss** deployed und auf „running" sein - ein separater Render-Service, kein Bestandteil des Web-Prozesses. In den Worker-Logs muss beim Start eine Zeile `Worker gestartet (pid=...)` erscheinen. Fehlt sie, läuft der Worker nicht (Deploy fehlgeschlagen, falscher Start Command, oder der Service wurde nie erstellt).
+- Web- und Worker-Service müssen dieselbe `DATABASE_URL` haben. Sonst legt der Web-Service die Tabellen in einer anderen Datenbank an als der Worker liest bzw. beschreibt, und das Dashboard bleibt dauerhaft leer.
+- `LOG_LEVEL=INFO` muss in beiden Services gesetzt sein. `DEBUG` ist deutlich lauter; `WARNING` oder `ERROR` schneidet die Scraper- und Funnel-Logs komplett ab, die zeigen, warum ein Scan 0 Treffer liefert.
+- `curl https://<web-service>/healthz` zeigt `{"ok": true, "active_profiles": N, "profiles_with_sources": N, "scan_runs": N}`. Ist `profiles_with_sources` 0, wurde im Dashboard noch keinem Profil eine Quelle zugewiesen - dann kann der Worker laufen, ohne je einen Job zu bauen.
+- Für eine Diagnose ohne echten Scan siehe `--dry-run` unter „Test" unten.
+
 ## Matching
 
 Der Score ist 0–100:
@@ -115,6 +123,14 @@ python test_smoke.py
 ```
 
 Ein echter Live-Scan muss in der Zielumgebung ausgeführt werden, weil einige Portale Bot-Schutz, Geobeschränkungen oder dynamische Inhalte verwenden. Der Code beendet bei einem Portalfehler niemals den gesamten Lauf.
+
+Zum Prüfen, welche aktiven Profile es gibt und welche Such-URLs daraus gebaut würden - ganz ohne Playwright oder Portal-Requests:
+
+```bash
+python scraper.py --dry-run
+```
+
+Das ist der schnellste Weg zu sehen, ob ein Profil überhaupt zu Jobs führt, bevor man einen vollen Scan abwartet.
 
 ## Rechtliches / Betrieb
 

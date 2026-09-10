@@ -45,5 +45,17 @@ services:
         value: "1"
       - key: SCRAPE_MAX_PAGES
         value: "3"
+      - key: SCRAPE_DELAY_MIN
+        value: "0.8"
+      - key: SCRAPE_DELAY_MAX
+        value: "1.8"
+      - key: SCRAPE_WAIT_MS
+        value: "1800"
+      - key: SCRAPE_PAGE_TIMEOUT_MS
+        value: "30000"
+      - key: SCRAPE_RETRIES
+        value: "3"
+      - key: SCRAPE_BACKOFF_BASE
+        value: "1.5"
       - key: LOG_LEVEL
         value: "INFO"

@@ -9,6 +9,10 @@ from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_wtf.csrf import CSRFProtect
 
+from logging_setup import configure_logging
+
+configure_logging()
+
 import db
 import scraper as worker
 from scrapers.registry import list_sources
@@ -48,6 +52,15 @@ def _ensure_db_initialized():
             db.init_db()
             _db_initialized = True
             log.info("DB-Initialisierung einmalig abgeschlossen")
+            try:
+                stats = db.get_setup_stats()
+                log.info(
+                    "DB initialisiert: %d aktive Profile, %d Profile mit Quellen, "
+                    "%d Einträge in scan_runs",
+                    stats["active_profiles"], stats["profiles_with_sources"], stats["scan_runs"],
+                )
+            except Exception:
+                log.exception("Setup-Statistik konnte nicht gelesen werden")
             return True
         except Exception:
             log.exception("DB-Initialisierung fehlgeschlagen")
@@ -112,6 +125,10 @@ def home():
     except Exception:
         profiles = []
         flash("Profile konnten nicht geladen werden.")
+    try:
+        setup_stats = db.get_setup_stats()
+    except Exception:
+        setup_stats = None
     return render_template(
         "dashboard.html",
         rows=rows,
@@ -120,6 +137,7 @@ def home():
         selected_profile=str(profile_id) if profile_id is not None else "",
         scan_running=bool(scan_thread and scan_thread.is_alive()),
         last_scan=last_scan,
+        setup_stats=setup_stats,
     )
 
 
@@ -148,9 +166,10 @@ def _manual_scan():
 @auth
 def profiles():
     if request.method == "POST":
-        data = _profile_form()
-        if not isinstance(data, dict):
-            return data
+        data, error = _profile_form()
+        if error:
+            flash(error)
+            return redirect(url_for("profiles"))
         pid = db.add_profile(data)
         db.set_profile_sources(pid, request.form.getlist("sources"))
         db.set_profile_regions(pid, request.form.getlist("regions"))
@@ -167,9 +186,10 @@ def profiles():
 @app.route("/profiles/<int:pid>/edit", methods=["POST"])
 @auth
 def edit_profile(pid):
-    data = _profile_form()
-    if not isinstance(data, dict):
-        return data
+    data, error = _profile_form()
+    if error:
+        flash(error)
+        return redirect(url_for("profiles"))
     data["active"] = request.form.get("active") == "1"
     db.update_profile(pid, data)
     db.set_profile_sources(pid, request.form.getlist("sources"))
@@ -190,11 +210,22 @@ def delete_profile(pid):
 def healthz():
     # Auch Healthchecks verwenden die gecachte Initialisierung statt DDL bei jedem Probe.
     if _ensure_db_initialized():
-        return {"ok": True}, 200
+        try:
+            stats = db.get_setup_stats()
+        except Exception:
+            stats = {}
+        return {"ok": True, **stats}, 200
     return {"ok": False, "error": "DB-Initialisierung fehlgeschlagen"}, 503
 
 
 def _profile_form():
+    """Liest und validiert das Profilformular.
+
+    Rückgabe ist immer ein (data, error)-Tupel: bei Erfolg (dict, None),
+    bei einem Validierungsfehler (None, "Fehlermeldung"). Aufrufer sind
+    dadurch nicht mehr auf isinstance(data, dict) angewiesen.
+    """
+
     def num(name, default=0):
         v = request.form.get(name, "").strip()
         if not v:
@@ -212,24 +243,18 @@ def _profile_form():
         max_rooms = num("max_rooms", None) if request.form.get("max_rooms") else None
         min_size = num("min_size")
     except ValueError as exc:
-        flash(str(exc))
-        return redirect(url_for("profiles"))
+        return None, str(exc)
 
     if not name:
-        flash("Bitte einen Profilnamen eingeben.")
-        return redirect(url_for("profiles"))
+        return None, "Bitte einen Profilnamen eingeben."
     if max_price <= 0:
-        flash("Der Maximalpreis muss größer als 0 sein.")
-        return redirect(url_for("profiles"))
+        return None, "Der Maximalpreis muss größer als 0 sein."
     if max_price < min_price:
-        flash("Der Maximalpreis darf nicht kleiner als der Mindestpreis sein.")
-        return redirect(url_for("profiles"))
+        return None, "Der Maximalpreis darf nicht kleiner als der Mindestpreis sein."
     if min_size < 0:
-        flash("Die Mindestfläche darf nicht negativ sein.")
-        return redirect(url_for("profiles"))
+        return None, "Die Mindestfläche darf nicht negativ sein."
     if max_rooms is not None and max_rooms < min_rooms:
-        flash("Die maximale Zimmerzahl darf nicht kleiner als die minimale Zimmerzahl sein.")
-        return redirect(url_for("profiles"))
+        return None, "Die maximale Zimmerzahl darf nicht kleiner als die minimale Zimmerzahl sein."
 
     return {
         "name": name,
@@ -241,7 +266,7 @@ def _profile_form():
         "districts": request.form.get("districts", ""),
         "keywords_exclude": request.form.get("keywords_exclude", ""),
         "active": True,
-    }
+    }, None
 
 
 if __name__ == "__main__":

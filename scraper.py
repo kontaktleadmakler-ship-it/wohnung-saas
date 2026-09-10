@@ -7,19 +7,22 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import db
+from logging_setup import configure_logging
 from matching import listing_fingerprint, score_listing
 from telegram import send_telegram, format_match_message
 from scrapers.registry import get_scraper
 from scrapers.models import SearchParams
 from scrapers.regions import STATE_CITY_SAMPLES
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
+configure_logging()
 log = logging.getLogger("worker")
 
 POLL_INTERVAL_SECONDS = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
+# Beeinflusst nur, ob eine Telegram-Benachrichtigung verschickt wird - nicht,
+# ob ein Match in der DB gespeichert wird. Ein Match mit Score < MIN_NOTIFY_SCORE
+# landet trotzdem in `matches` und erscheint im Dashboard (Default min_score=0
+# dort zeigt alle). "Keine Treffer" im Dashboard trotz gesetzter MIN_NOTIFY_SCORE
+# deutet daher eher auf einen leeren Scan als auf diese Schwelle hin.
 MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
 MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "1")))
 # TODO: Ein geteilter Browser mit ausgeliehenen Contexts könnte später mehr Parallelität
@@ -149,13 +152,22 @@ def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
 
 def run_once():
     profiles = db.get_active_profiles_with_sources()
+    log.info("run_once: %d aktive Profile geladen", len(profiles))
     if not profiles:
+        log.warning(
+            "Keine aktiven Profile - nichts zu tun. Bitte im Dashboard "
+            "mindestens ein Profil anlegen und ihm Quellen zuweisen."
+        )
         return {"jobs": 0, "listings": 0}
 
     lock = db.try_scan_lock()
     if not lock:
-        log.warning("Scan bereits durch einen anderen Prozess gesperrt")
+        log.warning(
+            "Scan bereits durch einen anderen Prozess gesperrt (Web- und "
+            "Worker-Service teilen sich denselben Advisory-Lock)"
+        )
         return {"jobs": 0, "listings": 0, "locked": True}
+    log.info("Advisory-Lock erworben")
 
     started = time.monotonic()
     total = 0
@@ -171,9 +183,22 @@ def run_once():
             for (source, regions, locations), profile_ids in jobs.items()
         ]
 
+        log.info(
+            "Geplante Jobs: %d (%s)",
+            len(work),
+            ", ".join(sorted({job[0] for job in work})) or "keine",
+        )
+        if not work:
+            log.warning(
+                "Keine Scraper-Jobs: Profile existieren, aber ihnen sind keine "
+                "Quellen zugewiesen (profile_sources leer)."
+            )
+            return {"jobs": 0, "listings": 0}
+
         all_results = []
         source_counts = defaultdict(int)
         source_errors = []
+        source_empty = []
         with ThreadPoolExecutor(
             max_workers=min(MAX_CONCURRENT_SCRAPERS, max(1, len(work))),
             thread_name_prefix="scrape",
@@ -184,7 +209,14 @@ def run_once():
                 source = job[0]
                 try:
                     source, profile_ids, listings = future.result()
-                    log.info("[%s] %d Inserate", source, len(listings))
+                    log.info(
+                        "[%s] Portal OK: %d Listings, Profile: %s",
+                        source, len(listings), sorted(profile_ids),
+                    )
+                    if not listings:
+                        # Kein Fehler, aber 0 Treffer - oft der wichtigere
+                        # Hinweis als ein Portalfehler (z. B. kaputte Selektoren).
+                        source_empty.append(source)
                     total += len(listings)
                     source_counts[source] += len(listings)
                     all_results.append((profile_ids, listings))
@@ -216,13 +248,24 @@ def run_once():
 
         funnel = _log_and_build_funnel(profiles_by_id, profile_stats, dict(source_counts))
         funnel["source_errors"] = source_errors
+        funnel["source_empty"] = source_empty
         funnel["scraped_total"] = total
         funnel["unique_total"] = processed
+        funnel["profiles_count"] = len(profiles)
+        funnel["jobs_count"] = len(work)
+
+        log.info(
+            "Quellen-Ergebnis: %s",
+            ", ".join(f"{src}={cnt}" for src, cnt in sorted(source_counts.items()))
+            or "keine Quellen haben Daten geliefert",
+        )
 
         elapsed = time.monotonic() - started
         log.info(
-            "Scan beendet: jobs=%d, scraped=%d, unique=%d, duration=%.1fs, fehlerhafte_quellen=%s",
-            len(work), total, processed, elapsed, source_errors or "-",
+            "Scan beendet: jobs=%d, scraped=%d, unique=%d, duration=%.1fs, "
+            "fehlerhafte_quellen=%s, leere_quellen=%s",
+            len(work), total, processed, elapsed,
+            source_errors or "-", source_empty or "-",
         )
         try:
             db.save_scan_run(funnel, elapsed)
@@ -235,18 +278,70 @@ def run_once():
 
 
 def worker_loop():
+    log.info(
+        "Konfiguration: DATABASE_URL=%s, TELEGRAM=%s, POLL=%ss, MIN_NOTIFY_SCORE=%s",
+        "gesetzt" if os.getenv("DATABASE_URL") else "FEHLT",
+        "gesetzt" if os.getenv("TELEGRAM_BOT_TOKEN") else "nicht gesetzt",
+        POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
+    )
+    log.info(
+        "Worker gestartet (pid=%s): poll_interval=%ss, min_notify_score=%s, "
+        "max_concurrent_scrapers=%s, log_level=%s",
+        os.getpid(), POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
+        MAX_CONCURRENT_SCRAPERS, os.getenv("LOG_LEVEL", "INFO"),
+    )
     db.init_db()
     db.cleanup_scan_runs()
+    log.info("DB initialisiert, Retention aufgeräumt - erster Scan startet in Kürze")
     while True:
         started = time.monotonic()
+        log.info("Scan-Zyklus startet")
         try:
             run_once()
         except Exception:
             log.exception("Gesamtlauf fehlgeschlagen")
 
         elapsed = time.monotonic() - started
+        log.info(
+            "Scan-Zyklus beendet in %.1fs, schlafe %.0fs bis zum nächsten Lauf",
+            elapsed, max(0, POLL_INTERVAL_SECONDS - elapsed),
+        )
         time.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
 
 
+def _dry_run():
+    """Loggt aktive Profile und die daraus gebauten Jobs + Such-URLs, ohne
+    Playwright oder Portal-Requests zu starten. Schnellster Weg zu prüfen:
+    "Welche Such-URLs würden überhaupt gebaut?" (python scraper.py --dry-run)."""
+    profiles = db.get_active_profiles_with_sources()
+    log.info("Dry-Run: %d aktive Profile geladen", len(profiles))
+    if not profiles:
+        log.warning("Dry-Run: keine aktiven Profile - nichts zu tun.")
+        return
+    jobs = build_jobs(profiles)
+    if not jobs:
+        log.warning("Dry-Run: Profile existieren, aber ohne zugewiesene Quellen.")
+        return
+    for (source, regions, locations), profile_ids in jobs.items():
+        scraper = get_scraper(source)
+        params = SearchParams(
+            nationwide="DE" in regions,
+            region_codes=[] if "DE" in regions else list(regions),
+            locations=list(locations),
+        )
+        urls = scraper.build_search_urls(params)
+        log.info(
+            "[%s] Profile=%s Regionen=%s Orte=%s -> %d Such-URL(s)",
+            source, sorted(profile_ids), regions, locations, len(urls),
+        )
+        for url in urls:
+            log.info("  URL: %s", url)
+
+
 if __name__ == "__main__":
-    worker_loop()
+    import sys
+
+    if "--dry-run" in sys.argv:
+        _dry_run()
+    else:
+        worker_loop()

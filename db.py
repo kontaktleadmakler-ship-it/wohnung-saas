@@ -103,6 +103,28 @@ def release_scan_lock(conn):
         with conn.cursor() as cur: cur.execute("SELECT pg_advisory_unlock(%s)",(LOCK_KEY,)); conn.commit()
     finally: conn.close()
 
+def get_setup_stats():
+    """Kleine COUNT-Abfrage für Startup-Log, /healthz und das Dashboard-Banner:
+    verrät auf einen Blick, ob überhaupt ein Scan möglich ist."""
+    with get_connection() as c:
+        with c.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM profiles WHERE active")
+            active = cur.fetchone()[0]
+            cur.execute("""
+                SELECT COUNT(DISTINCT p.id) FROM profiles p
+                JOIN profile_sources ps ON ps.profile_id = p.id
+                WHERE p.active
+            """)
+            with_sources = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM scan_runs")
+            runs = cur.fetchone()[0]
+            return {
+                "active_profiles": active,
+                "profiles_with_sources": with_sources,
+                "scan_runs": runs,
+            }
+
+
 def get_active_profiles():
     with get_connection() as c:
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
