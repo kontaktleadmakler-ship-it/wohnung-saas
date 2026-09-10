@@ -447,7 +447,11 @@ class BaseScraper(ABC):
                 ):
                     continue
 
-                offers = obj.get("offers") or {}
+                offers = obj.get("offers")
+                if isinstance(offers, list) and offers:
+                    offers = offers[0]
+                offers = offers if isinstance(offers, dict) else {}
+
                 url = obj.get("url") or offers.get("url")
                 if not url or url in existing or not self.is_listing_href(url):
                     continue
@@ -540,7 +544,7 @@ class BaseScraper(ABC):
         return [
             float(x.replace(".", "").replace(",", "."))
             for x in re.findall(
-                r"\d{1,3}(?:\.\d{3})*(?:,\d+)?", text or ""
+                r"\d+(?:\.\d{3})*(?:,\d+)?", text or ""
             )
         ]
 

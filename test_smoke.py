@@ -113,6 +113,10 @@ check(
     "price: unlabeled amount is cold-rent estimate, no fabricated warm rent",
     cold2 == 1150.0 and warm2 is None,
 )
+cold3, warm3 = scraper.extract_prices(None, "1000")
+check("price: four-digit unlabeled number parses as 1000", cold3 == 1000.0 and warm3 is None)
+cold4, warm4 = scraper.extract_prices(None, "1500")
+check("price: four-digit unlabeled number parses as 1500", cold4 == 1500.0 and warm4 is None)
 
 # ---------------------------------------------------------------------------
 # Matching: hard filters, unknown-value handling, warm/cold-rent confidence
@@ -182,6 +186,10 @@ u1 = canonical_url("https://x.de/expose/123?utm_source=a&ref=b")
 u2 = canonical_url("https://x.de/expose/123?utm_source=z")
 check("tracking params are stripped before canonicalizing", u1 == u2)
 
+canon_a = canonical_url("HTTPS://X.DE/EXPOSE/123/?Foo=Bar&foo=bar#details")
+canon_b = canonical_url("https://x.de/expose/123?foo=bar")
+check("canonical_url ignores fragments and normalizes case/duplicate query params", canon_a == canon_b)
+
 fp_a = listing_fingerprint({"source": "immoscout24", "external_id": "123", "url": u1})
 fp_b = listing_fingerprint({"source": "immoscout24", "external_id": "123", "url": "https://x.de/expose/123"})
 check("same source+external_id fingerprints identically", fp_a == fp_b)
@@ -195,11 +203,18 @@ for cls in (KleinanzeigenScraper, MeinestadtScraper, ImmoScout24Scraper):
     urls = cls().build_search_urls(SearchParams(locations=["Berlin"]))
     check(f"{cls.SOURCE_KEY}: build_search_urls returns at least one URL", bool(urls))
 
+nationwide = SearchParams(nationwide=True, locations=[])
+check("Kleinanzeigen nationwide does not fall back to Berlin", "c203" in KleinanzeigenScraper().build_search_urls(nationwide)[0] and "/berlin/" not in KleinanzeigenScraper().build_search_urls(nationwide)[0])
+check("ImmoScout24 nationwide uses geo=de", "geo=de" in ImmoScout24Scraper().build_search_urls(nationwide)[0])
+check("Immowelt nationwide does not fall back to Berlin", "/deutschland" in __import__("scrapers.sites", fromlist=["ImmoweltScraper"]).ImmoweltScraper().build_search_urls(nationwide)[0])
+
 base_url = "https://x.de/suche/berlin?foo=bar"
 generic = KleinanzeigenScraper()
 check("page 1 returns the base URL unchanged", generic.build_page_url(base_url, 1) == base_url)
 page2 = generic.build_page_url(base_url, 2)
 check("generic pager appends ?page=2 without losing existing params", page2 and "page=2" in page2 and "foo=bar" in page2)
+ka_page2 = KleinanzeigenScraper().build_page_url("https://www.kleinanzeigen.de/s-wohnung-mieten/berlin/c203", 2)
+check("Kleinanzeigen page 2 uses seite:2 in the path", ka_page2 and "/berlin/seite:2/c203" in ka_page2)
 
 iss_page2 = ImmoScout24Scraper().build_page_url(
     "https://www.immobilienscout24.de/Suche/de/berlin/wohnung-mieten", 2

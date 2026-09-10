@@ -20,7 +20,9 @@ log = logging.getLogger("worker")
 
 POLL_INTERVAL_SECONDS = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
 MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
-MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "4")))
+MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "1")))
+# TODO: Ein geteilter Browser mit ausgeliehenen Contexts könnte später mehr Parallelität
+# erlauben; auf kleinen Render-Instanzen ist ein Browser pro Job sonst zu speicherintensiv.
 
 REASON_LABELS = {
     "excluded_keyword": "Ausschlussbegriff im Text",
@@ -38,6 +40,8 @@ def _locations(profile):
         return vals
     if "BE" in (profile.get("regions") or []):
         return ["Berlin"]
+    # Bei DE bleibt der Standort leer; _run_job setzt nationwide=True und die
+    # jeweiligen Scraper wählen dafür ihre deutschlandweiten Portal-URLs.
     return []
 
 

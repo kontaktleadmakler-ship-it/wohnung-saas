@@ -14,9 +14,16 @@ def connection():
     try: yield conn
     finally: conn.close()
 
-def get_conn():
-    if not DATABASE_URL: raise RuntimeError("DATABASE_URL fehlt")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+@contextmanager
+def get_connection():
+    """Öffnet eine DB-Verbindung und schließt sie garantiert auch bei Exceptions."""
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL fehlt")
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 def init_db():
     with connection() as c:
@@ -50,17 +57,36 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_listings_source ON listings(source);
             CREATE INDEX IF NOT EXISTS idx_matches_score ON matches(score DESC);
             CREATE INDEX IF NOT EXISTS idx_matches_profile_created ON matches(profile_id,created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_matches_notified ON matches(notified);
             CREATE INDEX IF NOT EXISTS idx_profile_sources_source ON profile_sources(source);
             CREATE INDEX IF NOT EXISTS idx_profile_regions_region ON profile_regions(region_code);
             CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
             """)
             cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS raw JSONB NOT NULL DEFAULT '{}'::jsonb")
+            # Alte Scan-Läufe werden nicht mehr benötigt und würden die Tabelle
+            # sonst unbegrenzt wachsen lassen.
+            cur.execute(
+                "DELETE FROM scan_runs WHERE started_at < NOW() - INTERVAL '30 days'"
+            )
         c.commit()
 
 def try_scan_lock():
-    conn=get_conn(); cur=conn.cursor(); cur.execute("SELECT pg_try_advisory_lock(%s)",(LOCK_KEY,)); ok=cur.fetchone()[0]
-    if ok: return conn
-    conn.close(); return None
+    # Der Advisory-Lock muss auf genau dieser Verbindung gehalten werden,
+    # deshalb darf diese Verbindung erst in release_scan_lock() geschlossen werden.
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL fehlt")
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,))
+            ok = cur.fetchone()[0]
+        if ok:
+            return conn
+    except Exception:
+        conn.close()
+        raise
+    conn.close()
+    return None
 
 def release_scan_lock(conn):
     if not conn: return
@@ -69,13 +95,13 @@ def release_scan_lock(conn):
     finally: conn.close()
 
 def get_active_profiles():
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM profiles WHERE active ORDER BY id")
             return cur.fetchall()
 
 def get_active_profiles_with_sources():
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
               SELECT p.*, COALESCE(array_agg(DISTINCT ps.source) FILTER(WHERE ps.source IS NOT NULL),'{}') sources,
@@ -86,7 +112,7 @@ def get_active_profiles_with_sources():
             return cur.fetchall()
 
 def get_profile(profile_id):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM profiles WHERE id=%s",(profile_id,)); p=cur.fetchone()
             if not p:return None
@@ -95,25 +121,25 @@ def get_profile(profile_id):
             return p
 
 def add_profile(data):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur:
             cur.execute("INSERT INTO profiles(name,min_price,max_price,min_rooms,max_rooms,min_size,districts,keywords_exclude) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",tuple(data.get(k) for k in ('name','min_price','max_price','min_rooms','max_rooms','min_size','districts','keywords_exclude'))); pid=cur.fetchone()[0]
         c.commit(); return pid
 
 def update_profile(pid,data):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur:
             cur.execute("UPDATE profiles SET name=%s,min_price=%s,max_price=%s,min_rooms=%s,max_rooms=%s,min_size=%s,districts=%s,keywords_exclude=%s,active=%s,updated_at=NOW() WHERE id=%s",tuple(data.get(k) for k in ('name','min_price','max_price','min_rooms','max_rooms','min_size','districts','keywords_exclude','active'))+(pid,)); c.commit()
 
 def set_profile_sources(pid,sources):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur:
             cur.execute("DELETE FROM profile_sources WHERE profile_id=%s",(pid,))
             for s in set(sources or []): cur.execute("INSERT INTO profile_sources(profile_id,source) VALUES(%s,%s) ON CONFLICT DO NOTHING",(pid,s))
         c.commit()
 
 def set_profile_regions(pid,regions):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur:
             cur.execute("DELETE FROM profile_regions WHERE profile_id=%s",(pid,))
             vals=set(regions or ['DE'])
@@ -121,12 +147,12 @@ def set_profile_regions(pid,regions):
         c.commit()
 
 def delete_profile(pid):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur: cur.execute("DELETE FROM profiles WHERE id=%s",(pid,))
         c.commit()
 
 def upsert_listing(item):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur:
             cur.execute("""INSERT INTO listings(source,external_id,title,description,price,price_total,rooms,size,location,city,postal_code,region_code,url,contact_name,contact_phone,published_at,raw)
               VALUES(%(source)s,%(external_id)s,%(title)s,%(description)s,%(price)s,%(price_total)s,%(rooms)s,%(size)s,%(address)s,%(city)s,%(postal_code)s,%(region_code)s,%(url)s,%(contact_name)s,%(contact_phone)s,%(published_at)s,%(raw)s)
@@ -134,17 +160,17 @@ def upsert_listing(item):
               RETURNING id,(xmax=0) AS is_new""",{**item.__dict__,'raw': psycopg2.extras.Json(item.raw or {})}); row=cur.fetchone(); c.commit(); return row[0],row[1]
 
 def save_match(listing_id,profile_id,score,components,reasons):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur:
             cur.execute("""INSERT INTO matches(listing_id,profile_id,score,price_score,rooms_score,size_score,location_score,reasons)
               VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(listing_id,profile_id) DO UPDATE SET score=EXCLUDED.score,price_score=EXCLUDED.price_score,rooms_score=EXCLUDED.rooms_score,size_score=EXCLUDED.size_score,location_score=EXCLUDED.location_score,reasons=EXCLUDED.reasons,updated_at=NOW() RETURNING notified""",(listing_id,profile_id,score,*components,psycopg2.extras.Json(reasons))); notified=cur.fetchone()[0]; c.commit(); return not notified
 
 def mark_notified(listing_id,profile_id):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur: cur.execute("UPDATE matches SET notified=TRUE,updated_at=NOW() WHERE listing_id=%s AND profile_id=%s",(listing_id,profile_id)); c.commit()
 
 def save_scan_run(summary, duration_seconds=None):
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor() as cur:
             cur.execute(
                 "INSERT INTO scan_runs(duration_seconds,summary) VALUES(%s,%s)",
@@ -153,13 +179,16 @@ def save_scan_run(summary, duration_seconds=None):
         c.commit()
 
 def get_last_scan_run():
-    with get_conn() as c:
+    with get_connection() as c:
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 1")
             return cur.fetchone()
 
-def get_dashboard_rows(min_score=0,profile_id=None,limit=300):
-    with get_conn() as c:
+DASHBOARD_LIMIT = max(1, int(os.getenv("DASHBOARD_LIMIT", "300")))
+
+def get_dashboard_rows(min_score=0,profile_id=None,limit=None):
+    limit = DASHBOARD_LIMIT if limit is None else max(1, int(limit))
+    with get_connection() as c:
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             q="""SELECT m.*,l.title,l.price,l.price_total,l.rooms,l.size,l.location,l.url,l.source,l.first_seen,l.last_seen,p.name profile_name FROM matches m JOIN listings l ON l.id=m.listing_id JOIN profiles p ON p.id=m.profile_id WHERE m.score >= %s"""; args=[min_score]
             if profile_id:q+=" AND p.id=%s"; args.append(profile_id)

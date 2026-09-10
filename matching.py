@@ -30,16 +30,20 @@ def canonical_url(url: str) -> str:
         return ""
     parts = urlsplit(url.strip())
     query = [
-        (k, v)
+        (k.casefold(), v.casefold())
         for k, v in parse_qsl(parts.query, keep_blank_values=True)
         if not k.lower().startswith(("utm_", "ref", "source", "campaign"))
     ]
+    # Fragmente gehören nicht zur Identität des Inserats. Query-Parameter
+    # werden sortiert und case-insensitive normalisiert, damit Tracking-/URL-
+    # Varianten mit doppelten Parametern denselben Fingerprint erhalten.
+    normalized_query = list(dict.fromkeys(sorted(query)))
     return urlunsplit(
         (
             parts.scheme.lower(),
             parts.netloc.lower(),
-            parts.path.rstrip("/"),
-            urlencode(sorted(query)),
+            parts.path.rstrip("/").casefold(),
+            urlencode(normalized_query),
             "",
         )
     )

@@ -3,3 +3,4 @@ psycopg2-binary>=2.9,<3
 requests>=2.32,<3
 beautifulsoup4>=4.13,<5
 playwright>=1.55,<2
+flask-wtf>=1.2,<2

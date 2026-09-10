@@ -12,6 +12,8 @@ Flask-Dashboard + PostgreSQL + Playwright/BeautifulSoup + periodischer Worker + 
 - meinestadt.de
 - Kalaydo
 
+Die aktiven Scraper liegen ausschließlich in `scrapers/sites.py`; alte, nicht von `registry.py` geladene Adapter-Dateien wurden entfernt.
+
 Die Scraper benutzen eine plattformspezifische URL-/Link-Strategie, mehrere Selektoren und danach einen generischen DOM-Fallback. Pro URL wird ein Fehler isoliert. Playwright wartet mindestens 10 Sekunden auf clientseitig gerenderte Inhalte und versucht übliche Cookie-Dialoge zu akzeptieren.
 
 **Pagination:** Jede Such-URL wird bis zu `SCRAPE_MAX_PAGES` (Standard 3) Seiten weit verfolgt und stoppt automatisch, sobald eine Seite keine neuen Inserate mehr liefert – das war der Hauptgrund, warum Profile bisher oft nur eine Handvoll Wohnungen sahen (die meisten Portale zeigen ca. 20 Treffer pro Seite). Der Seitenparameter ist pro Scraper in `scrapers/sites.py` konfigurierbar (`PAGE_PARAM`); für ImmoScout24 ist `pagenumber` hinterlegt, alle anderen nutzen aktuell den generischen `?page=N`-Fallback. **Wichtig:** Diese Parameter konnten in dieser Umgebung nicht gegen die echten Portale verifiziert werden (kein Netzwerkzugriff auf Immobilienportale). Ein falscher Parameter führt nicht zu Fehlern – das Portal liefert dann einfach wiederholt Seite 1, die per Deduplizierung verworfen wird –, sollte aber nach dem Deployment anhand der Logs (`Seite N - X Kandidaten (Y neu)`) geprüft und bei Bedarf angepasst werden.
@@ -39,6 +41,8 @@ TELEGRAM_CHAT_ID=...
 POLL_INTERVAL_SECONDS=300
 MIN_NOTIFY_SCORE=75
 PLAYWRIGHT_BROWSERS_PATH=0
+MAX_CONCURRENT_SCRAPERS=1
+DASHBOARD_LIMIT=300
 ```
 
 Web:
@@ -60,7 +64,7 @@ Das Repository enthält `render.yaml` mit zwei Services:
 1. `wohnung-saas-web` – Flask-Dashboard
 2. `wohnung-saas-worker` – periodischer Scraper
 
-Beide installieren Chromium über `playwright install --with-deps chromium`. Die Datenbanktabellen werden beim Start automatisch angelegt.
+Beide installieren Chromium über `playwright install --with-deps chromium`. Die Datenbanktabellen werden einmalig beim Prozessstart initialisiert; Healthchecks verwenden denselben Cache. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` Pflicht. Für den eingebetteten Flask-Scan-Thread sollte ein einzelner Web-Worker verwendet werden.
 
 ### Render-Variablen
 
@@ -115,3 +119,12 @@ Ein echter Live-Scan muss in der Zielumgebung ausgeführt werden, weil einige Po
 ## Rechtliches / Betrieb
 
 Nur öffentlich zugängliche Inhalte abrufen, Nutzungsbedingungen und Robots-/Zugriffsregeln der jeweiligen Plattform beachten und die Abruffrequenz niedrig halten. Dieses Projekt enthält keine CAPTCHA-, Login- oder Anti-Bot-Umgehung.
+
+
+## Betriebshinweise
+
+- `DASHBOARD_LIMIT` steuert die maximale Anzahl der Treffer im Dashboard (Standard 300).
+- `MAX_CONCURRENT_SCRAPERS=1` ist der speichersichere Standard für kleine Render-Instanzen. Höhere Werte sind bewusst eine Betriebsentscheidung.
+- Ein `DE`-Profil wird bei den Scrapers als `SearchParams.nationwide=True` behandelt und nicht auf Berlin zurückgefallen.
+- Der Scan-Thread läuft im Web-Prozess. Bei mehreren Gunicorn-Workern ist der Laufstatus deshalb nicht global; der PostgreSQL-Advisory-Lock verhindert jedoch parallele Scans. Für den integrierten Thread `python app.py` bzw. einen einzelnen Web-Worker verwenden.
+- Kalaydo und Immonet wurden nicht aus `SOURCE_CLASSES` entfernt, weil in dieser Umgebung kein Live-Portaltest möglich war. Beide bleiben fehlertolerant; die Entfernung aus der Default-Liste sollte nach einem echten Produktionsscan entschieden werden.
