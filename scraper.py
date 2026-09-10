@@ -207,32 +207,25 @@ def run_once():
         source_counts = defaultdict(int)
         source_errors = []
         source_empty = []
-        with ThreadPoolExecutor(
-            max_workers=min(MAX_CONCURRENT_SCRAPERS, max(1, len(work))),
-            thread_name_prefix="scrape",
-        ) as executor:
-            futures = {executor.submit(_run_job, job): job for job in work}
-            for future in as_completed(futures):
-                job = futures[future]
-                source = job[0]
-                try:
-                    source, profile_ids, listings = future.result()
-                    log.info(
-                        "[%s] Portal OK: %d Listings, Profile: %s",
-                        source, len(listings), sorted(profile_ids),
-                    )
-                    if not listings:
-                        # Kein Fehler, aber 0 Treffer - oft der wichtigere
-                        # Hinweis als ein Portalfehler (z. B. kaputte Selektoren).
-                        source_empty.append(source)
-                    total += len(listings)
-                    source_counts[source] += len(listings)
-                    all_results.append((profile_ids, listings))
-                except Exception:
-                    # A failing portal must never take the whole scan down -
-                    # the other sources keep going and still produce results.
-                    log.exception("[%s] Portal fehlgeschlagen", source)
-                    source_errors.append(source)
+
+        # Absichtlich strikt sequenziell: Auf kleinen Render-Instanzen darf
+        # nie mehr als ein Portal gleichzeitig einen Browser starten.
+        for job in work:
+            source = job[0]
+            try:
+                source, profile_ids, listings = _run_job(job)
+                log.info(
+                    "[%s] Portal OK: %d Listings, Profile: %s",
+                    source, len(listings), sorted(profile_ids),
+                )
+                if not listings:
+                    source_empty.append(source)
+                total += len(listings)
+                source_counts[source] += len(listings)
+                all_results.append((profile_ids, listings))
+            except Exception:
+                log.exception("[%s] Portal fehlgeschlagen", source)
+                source_errors.append(source)
 
         # Cross-source in-memory dedupe. DB uniqueness remains the final guard.
         seen = set()

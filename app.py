@@ -43,10 +43,10 @@ scan_lock = threading.Lock()
 _db_init_lock = threading.Lock()
 _db_initialized = False
 
-# Es gibt keinen separaten Worker-Service mehr (siehe render.yaml) - der
-# Scan läuft als periodischer Subprozess innerhalb des Web-Prozesses, damit
-# Playwright den Event-Loop von Flask nicht blockiert und /healthz auch
-# während eines laufenden Scans antwortet.
+# Der Web-Service startet standardmäßig KEINEN automatischen Scan beim Boot.
+# Das verhindert, dass Playwright/Chromium die kleine Render-Instanz direkt
+# nach dem Start aus dem Speicher drängt. Scans werden über das Dashboard
+# manuell gestartet. Optional kann ENABLE_AUTO_SCAN=true gesetzt werden.
 _NO_HEARTBEAT_MESSAGE = (
     "Worker nicht erreichbar. Es gibt keinen separaten Worker-Service mehr - "
     "prüfe stattdessen die Render-Logs des Web-Service (wohnung-saas-web) auf "
@@ -450,5 +450,10 @@ def _profile_form():
 
 if __name__ == "__main__":
     _ensure_db_initialized()
-    _start_background_scanner_once()
+    # Bewusst standardmäßig aus: Render muss zuerst stabil erreichbar sein.
+    # Für einen periodischen Auto-Scan kann ENABLE_AUTO_SCAN=true gesetzt werden.
+    if os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        _start_background_scanner_once()
+    else:
+        log.info("Automatischer Scan beim Boot deaktiviert (ENABLE_AUTO_SCAN=false)")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

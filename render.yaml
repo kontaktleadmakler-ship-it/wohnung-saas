@@ -58,3 +58,5 @@ services:
       # Health-Check-Timeout) keine Log-Zeilen im Puffer verloren gehen.
       - key: PYTHONUNBUFFERED
         value: "1"
+
+# Auto-Scan bleibt beim Boot bewusst deaktiviert; Scans über das Dashboard starten.
