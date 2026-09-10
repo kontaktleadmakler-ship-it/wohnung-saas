@@ -254,6 +254,78 @@ def _manual_scan():
         log.exception("Manueller Scan fehlgeschlagen")
 
 
+def _background_scanner():
+    """Läuft im Web-Prozess. Notwendig auf Render Free, weil ein separater
+    Worker-Service dort nach ~15 Min Inaktivität eingeschläfert wird und
+    UptimeRobot keinen Worker-HTTP-Port wecken kann. Der PostgreSQL-
+    Advisory-Lock in db.try_scan_lock() verhindert, dass dieser Thread und
+    ein evtl. doch laufender Worker-Service parallel scannen."""
+    import time
+
+    # DB muss initialisiert sein, sonst crasht der erste run_once().
+    for _ in range(30):
+        if _ensure_db_initialized():
+            break
+        time.sleep(2)
+
+    # Erster Scan etwas verzögert, damit der Web-Service zuerst ready wird.
+    time.sleep(10)
+
+    while True:
+        started = time.monotonic()
+        try:
+            log.info("Eingebetteter Scan-Zyklus startet")
+            worker.run_once()
+        except Exception:
+            log.exception("Eingebetteter Scan-Zyklus fehlgeschlagen")
+
+        elapsed = time.monotonic() - started
+        try:
+            db.record_worker_heartbeat(
+                duration_seconds=elapsed,
+                pid=os.getpid(),
+                poll_interval_seconds=worker.POLL_INTERVAL_SECONDS,
+            )
+        except Exception:
+            log.exception("Heartbeat konnte nicht gespeichert werden")
+
+        sleep_for = max(30, worker.POLL_INTERVAL_SECONDS - elapsed)
+        log.info("Eingebetteter Scan-Zyklus fertig in %.1fs, schlafe %.0fs", elapsed, sleep_for)
+        time.sleep(sleep_for)
+
+
+def _start_background_scanner():
+    if os.getenv("EMBEDDED_WORKER", "1") != "1":
+        log.info("EMBEDDED_WORKER=0 - kein eingebetteter Scanner gestartet")
+        return
+    # Werkzeug-Reloader: nur im echten Server-Prozess starten, nicht im Reloader.
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "false":
+        return
+    t = threading.Thread(target=_background_scanner, daemon=True, name="embedded-scanner")
+    t.start()
+    log.info("Eingebetteter Scan-Thread gestartet (pid=%s)", os.getpid())
+
+
+@app.route("/tasks/scan", methods=["POST", "GET"])
+def tasks_scan():
+    """Von außen triggbar (z. B. UptimeRobot, cron-job.org) mit Token.
+    Kein Login nötig, weil sonst kein externer Trigger möglich wäre."""
+    token = os.getenv("SCAN_TRIGGER_TOKEN")
+    if not token:
+        return {"error": "SCAN_TRIGGER_TOKEN nicht konfiguriert"}, 503
+    supplied = request.args.get("token") or request.headers.get("X-Scan-Token")
+    if supplied != token:
+        return {"error": "unauthorized"}, 401
+
+    global scan_thread
+    with scan_lock:
+        if scan_thread and scan_thread.is_alive():
+            return {"status": "already_running"}, 200
+        scan_thread = threading.Thread(target=_manual_scan, daemon=True)
+        scan_thread.start()
+    return {"status": "started"}, 202
+
+
 @app.route("/profiles", methods=["GET", "POST"])
 @auth
 def profiles():
