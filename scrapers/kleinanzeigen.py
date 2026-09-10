@@ -32,6 +32,14 @@ class KleinanzeigenScraper(BaseScraper):
     SUPPORTS_NATIONWIDE = True
 
     def build_search_urls(self, params: SearchParams) -> list[str]:
+        if params.locations:
+            urls = []
+            for location in params.locations:
+                slug = re.sub(r"[^a-z0-9äöüß-]+", "-", location.lower()).strip("-")
+                if slug:
+                    urls.append(f"{BASE_URL}/s-wohnung-mieten/{slug}/c203")
+            if urls:
+                return urls
         if params.nationwide or not params.region_codes:
             return [BASE_URL + NATIONWIDE_PATH]
         return [
@@ -59,7 +67,7 @@ class KleinanzeigenScraper(BaseScraper):
             })
         return cards
 
-    def normalize(self, raw: dict) -> Listing | None:
+    def normalize(self, raw: dict, page_url: str = "") -> Listing | None:
         if not raw.get("title"):
             return None
         href = raw["href"]

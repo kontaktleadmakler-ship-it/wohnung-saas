@@ -1,4 +1,4 @@
-# Nur noch EIN Service: der Scan läuft als periodischer Subprozess
+# Nur EIN Web-Service; der Scan läuft eingebettet und seriell
 # (`python scraper.py --once`) innerhalb des Web-Prozesses (siehe
 # app.py::_background_scanner). Der frühere separate `wohnung-saas-worker`
 # Service ist entfallen - falls er in Render noch existiert, kann er
@@ -34,9 +34,9 @@ services:
       - key: MAX_CONCURRENT_SCRAPERS
         value: "1"
       - key: SCRAPE_MAX_PAGES
-        value: "1"
+        value: "3"
       - key: MAX_CANDIDATES_PER_SOURCE
-        value: "10"
+        value: "0"
       - key: SCRAPE_DELAY_MIN
         value: "0.8"
       - key: SCRAPE_DELAY_MAX

@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-import subprocess
 import sys
 import threading
 import time
@@ -85,40 +84,19 @@ def _ensure_db_initialized():
             return False
 
 
-def _run_scan_subprocess_once():
-    """Startet `python scraper.py --once` als eigenen Prozess, leitet dessen
-    Log-Zeilen live in das Web-Log weiter und liefert den Exit-Code zurück
-    (oder None, wenn der Subprozess selbst nicht gestartet werden konnte).
+def _run_scan_once_embedded():
+    """Run the scanner in-process.
 
-    Ein eigener Prozess statt eines Threads, damit Playwright/Chromium den
-    GIL bzw. den Flask-Event-Loop nicht blockieren kann - genau das hatte
-    vorher dazu geführt, dass /healthz während eines Scans nicht mehr
-    antwortete und Render den Web-Prozess deshalb neu startete.
+    Keeping one Python process avoids duplicating the web process just to
+    launch Playwright/Chromium. Jobs themselves are still executed sequentially
+    (MAX_CONCURRENT_SCRAPERS=1), so only one browser is active at a time.
     """
-    cmd = [sys.executable, "scraper.py", "--once"]
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            universal_newlines=True,
-        )
+        result = worker.run_once()
+        return 0 if not isinstance(result, dict) or not result.get("error") else 1
     except Exception:
-        log.exception("Scan-Subprozess konnte nicht gestartet werden")
-        return None
-
-    try:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if line:
-                log.info("[scan] %s", line)
-    finally:
-        proc.stdout.close()
-
-    returncode = proc.wait()
-    return returncode
-
+        log.exception("Eingebetteter Scan fehlgeschlagen")
+        return 1
 
 def _background_scanner():
     """Läuft als Daemon-Thread im Web-Prozess und stößt periodisch einen
@@ -135,8 +113,8 @@ def _background_scanner():
         if already_running:
             log.info("Eingebetteter Scan übersprungen: manueller Scan läuft bereits")
         else:
-            returncode = _run_scan_subprocess_once()
-            log.info("Scan-Subprozess fertig (exit=%s)", returncode)
+            returncode = _run_scan_once_embedded()
+            log.info("Eingebetteter Scan fertig (exit=%s)", returncode)
 
         # Fallback-Heartbeat: unabhängig vom Exit-Code des Subprozesses,
         # damit /healthz auch dann aktuell bleibt, wenn scraper.py --once
@@ -343,7 +321,7 @@ def _manual_scan():
     # im Web-Prozess blockieren und genau das ursprüngliche
     # /healthz-Timeout-Problem für die Dauer des Scans reproduzieren.
     try:
-        returncode = _run_scan_subprocess_once()
+        returncode = _run_scan_once_embedded()
         log.info("Manueller Scan-Subprozess fertig (exit=%s)", returncode)
     except Exception:
         log.exception("Manueller Scan fehlgeschlagen")

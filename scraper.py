@@ -28,7 +28,6 @@ MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "1")))
 # Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
 # aus einem Portal auf einmal in Playwright/Python weiterreichen.
 MAX_CANDIDATES_PER_SOURCE = max(1, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "10")))
-# This limits results per selected portal, not the number of selected portals.\n# Every source selected in the dashboard is still scanned.
 # TODO: Ein geteilter Browser mit ausgeliehenen Contexts könnte später mehr Parallelität
 # erlauben; auf kleinen Render-Instanzen ist ein Browser pro Job sonst zu speicherintensiv.
 
@@ -63,28 +62,16 @@ def _locations(profile):
 
 
 def build_jobs(profiles):
-    """Build scan jobs strictly from the sources selected on each dashboard profile.
+    """Build exactly the jobs selected in the dashboard.
 
-    The dashboard/profile_sources table is the single source of truth.  There is
-    deliberately no hidden portal allowlist or fallback to Kleinanzeigen here.
-    If a user selects 4 portals, all 4 are scheduled.  MAX_CONCURRENT_SCRAPERS
-    controls concurrency separately so selected portals are processed safely.
+    profile_sources is the source of truth. No hard-coded portal allowlist is
+    applied here, so every source selected by the user is scanned.
     """
     jobs = {}
     for p in profiles:
         regions = tuple(sorted(p.get("regions") or ["DE"]))
         locations = tuple(sorted(_locations(p)))
-        selected_sources = {
-            str(source).strip().lower()
-            for source in (p.get("sources") or [])
-            if str(source).strip()
-        }
-        log.info(
-            "Profil %s: Dashboard-Quellen=%s",
-            p.get("id"),
-            sorted(selected_sources),
-        )
-        for source in selected_sources:
+        for source in p.get("sources") or []:
             key = (source, regions, locations)
             jobs.setdefault(key, set()).add(p["id"])
     return jobs
@@ -93,7 +80,7 @@ def _run_job(job):
     source, regions, locations, profile_ids = job
     scraper = get_scraper(source)
     params = SearchParams(
-        nationwide="DE" in regions,
+        nationwide=("DE" in regions and not locations),
         region_codes=[] if "DE" in regions else list(regions),
         locations=list(locations),
     )
@@ -386,7 +373,7 @@ def _dry_run():
     for (source, regions, locations), profile_ids in jobs.items():
         scraper = get_scraper(source)
         params = SearchParams(
-            nationwide="DE" in regions,
+            nationwide=("DE" in regions and not locations),
             region_codes=[] if "DE" in regions else list(regions),
             locations=list(locations),
         )

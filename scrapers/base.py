@@ -42,9 +42,8 @@ class BaseScraper(ABC):
     # Hard memory guard for low-memory Render instances. The search page may
     # contain many cards, but processing all of them through normalization,
     # matching and DB writes can keep a large object graph alive.
-    MAX_CANDIDATES_PER_SOURCE = max(
-        1, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "10"))
-    )
+    _candidate_limit_raw = int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "0"))
+    MAX_CANDIDATES_PER_SOURCE = max(0, _candidate_limit_raw)
 
     # Pagination. A single page-1 fetch per search URL was the single
     # biggest reason profiles only ever saw a handful of listings: most
@@ -190,16 +189,23 @@ class BaseScraper(ABC):
                                 # deterministic batch from each source. This
                                 # prevents a page with 80+ cards from causing
                                 # a large Playwright/Python object spike.
-                                remaining = self.MAX_CANDIDATES_PER_SOURCE - len(results)
-                                if remaining <= 0:
-                                    self.log.info(
-                                        "%s: Kandidatenlimit %d erreicht - weitere Seiten werden übersprungen",
-                                        self.SOURCE_KEY,
-                                        self.MAX_CANDIDATES_PER_SOURCE,
-                                    )
-                                    break
-
-                                cards_to_process = cards[:remaining]
+                                if self.MAX_CANDIDATES_PER_SOURCE > 0:
+                                    remaining = self.MAX_CANDIDATES_PER_SOURCE - len(results)
+                                    if remaining <= 0:
+                                        self.log.info(
+                                            "%s: Kandidatenlimit %d erreicht - weitere Seiten werden übersprungen",
+                                            self.SOURCE_KEY,
+                                            self.MAX_CANDIDATES_PER_SOURCE,
+                                        )
+                                        break
+                                    cards_to_process = cards[:remaining]
+                                else:
+                                    # 0 means unlimited. Process all new cards
+                                    # while still deduplicating URLs across pages.
+                                    cards_to_process = [
+                                        c for c in cards
+                                        if c.get("href") and c.get("href") not in seen_hrefs
+                                    ]
                                 for raw in cards_to_process:
                                     href = raw.get("href")
                                     if href:
@@ -213,7 +219,10 @@ class BaseScraper(ABC):
                                             "Normalisierung fehlgeschlagen: %s",
                                             href,
                                         )
-                                if len(results) >= self.MAX_CANDIDATES_PER_SOURCE:
+                                if (
+                                    self.MAX_CANDIDATES_PER_SOURCE > 0
+                                    and len(results) >= self.MAX_CANDIDATES_PER_SOURCE
+                                ):
                                     self.log.info(
                                         "%s: Kandidatenlimit erreicht (%d)",
                                         self.SOURCE_KEY,
