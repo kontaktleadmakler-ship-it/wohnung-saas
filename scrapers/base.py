@@ -39,6 +39,12 @@ class BaseScraper(ABC):
     PAGE_TIMEOUT_MS = int(os.getenv("SCRAPE_PAGE_TIMEOUT_MS", "30000"))
     RETRIES = max(1, int(os.getenv("SCRAPE_RETRIES", "3")))
     BACKOFF_BASE = float(os.getenv("SCRAPE_BACKOFF_BASE", "1.5"))
+    # Hard memory guard for low-memory Render instances. The search page may
+    # contain many cards, but processing all of them through normalization,
+    # matching and DB writes can keep a large object graph alive.
+    MAX_CANDIDATES_PER_SOURCE = max(
+        1, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "10"))
+    )
 
     # Pagination. A single page-1 fetch per search URL was the single
     # biggest reason profiles only ever saw a handful of listings: most
@@ -180,7 +186,21 @@ class BaseScraper(ABC):
                                     len(new_hrefs),
                                     url,
                                 )
-                                for raw in cards:
+                                # Memory guard: only normalize a small,
+                                # deterministic batch from each source. This
+                                # prevents a page with 80+ cards from causing
+                                # a large Playwright/Python object spike.
+                                remaining = self.MAX_CANDIDATES_PER_SOURCE - len(results)
+                                if remaining <= 0:
+                                    self.log.info(
+                                        "%s: Kandidatenlimit %d erreicht - weitere Seiten werden übersprungen",
+                                        self.SOURCE_KEY,
+                                        self.MAX_CANDIDATES_PER_SOURCE,
+                                    )
+                                    break
+
+                                cards_to_process = cards[:remaining]
+                                for raw in cards_to_process:
                                     href = raw.get("href")
                                     if href:
                                         seen_hrefs.add(href)
@@ -193,6 +213,12 @@ class BaseScraper(ABC):
                                             "Normalisierung fehlgeschlagen: %s",
                                             href,
                                         )
+                                if len(results) >= self.MAX_CANDIDATES_PER_SOURCE:
+                                    self.log.info(
+                                        "%s: Kandidatenlimit erreicht (%d)",
+                                        self.SOURCE_KEY,
+                                        self.MAX_CANDIDATES_PER_SOURCE,
+                                    )
                             finally:
                                 page.close()
 

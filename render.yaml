@@ -34,7 +34,9 @@ services:
       - key: MAX_CONCURRENT_SCRAPERS
         value: "1"
       - key: SCRAPE_MAX_PAGES
-        value: "3"
+        value: "1"
+      - key: MAX_CANDIDATES_PER_SOURCE
+        value: "10"
       - key: SCRAPE_DELAY_MIN
         value: "0.8"
       - key: SCRAPE_DELAY_MAX

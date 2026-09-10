@@ -25,6 +25,9 @@ POLL_INTERVAL_SECONDS = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
 # deutet daher eher auf einen leeren Scan als auf diese Schwelle hin.
 MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
 MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "1")))
+# Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
+# aus einem Portal auf einmal in Playwright/Python weiterreichen.
+MAX_CANDIDATES_PER_SOURCE = max(1, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "10")))
 # TODO: Ein geteilter Browser mit ausgeliehenen Contexts könnte später mehr Parallelität
 # erlauben; auf kleinen Render-Instanzen ist ein Browser pro Job sonst zu speicherintensiv.
 
@@ -65,12 +68,17 @@ def _embedded_worker_sources():
     Speicher der eingebetteten Scan-Subprozesse zu OOM (exit=-9) führen.
     Statt auf den Starter-Plan zu wechseln, lässt sich der Scan hiermit
     testweise auf z. B. nur 'kleinanzeigen' reduzieren (siehe render.yaml).
-    Standard = nur kleinanzeigen. Mehrere Quellen können explizit per
-    EMBEDDED_WORKER_SOURCES=quelle1,quelle2 aktiviert werden.
+    Leer/nicht gesetzt = keine Einschränkung, alle Profil-Quellen laufen.
     """
-    raw = os.getenv("EMBEDDED_WORKER_SOURCES", "kleinanzeigen").strip()
+    raw = os.getenv("EMBEDDED_WORKER_SOURCES", "").strip()
+    # Auf der kleinen eingebetteten Render-Instanz niemals ungefiltert alle
+    # Quellen starten. Eine explizite Env-Variable kann später wieder mehrere
+    # Quellen aktivieren.
     if not raw:
-        return {"kleinanzeigen"}
+        raw = "kleinanzeigen"
+        log.info(
+            "EMBEDDED_WORKER_SOURCES nicht gesetzt - sicherer Standard: ['kleinanzeigen']"
+        )
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 
