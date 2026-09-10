@@ -14,6 +14,12 @@ class KleinanzeigenScraper(BaseScraper):
     SOURCE_KEY = "kleinanzeigen"; SOURCE_LABEL = "eBay Kleinanzeigen"; BASE_URL = "https://www.kleinanzeigen.de"
     CARD_SELECTORS = ("article.aditem", ".aditem", "li.ad-listitem", "article[data-testid*='ad' i]")
     LINK_SELECTORS = ("a.ellipsis", "a[href*='/s-anzeige/']", "a[href*='/s-wohnung']", "a[href]")
+    # Kleinanzeigen historically paginates via a `seite:N` path segment
+    # rather than a query parameter (e.g. .../berlin/seite:2/c203), which
+    # this generic query-param pager can't reproduce exactly. Left on the
+    # base-class default (?page=N) as a harmless no-op fallback - verify the
+    # real pattern against the live site and override build_page_url() here
+    # if it still doesn't pick up further pages in production logs.
     def build_search_urls(self, p):
         out=[]
         for location in locs(p) or ["Deutschland"]:
@@ -27,6 +33,7 @@ class ImmoScout24Scraper(BaseScraper):
     SOURCE_KEY = "immoscout24"; SOURCE_LABEL = "ImmoScout24"; BASE_URL = "https://www.immobilienscout24.de"
     CARD_SELECTORS = ("article.result-list__listing", "div.result-list__listing", "li.result-list__listing", "article[data-testid*='result' i]")
     LINK_SELECTORS = ("a[href*='/expose/']", "a[href*='/expose']", "a[href]")
+    PAGE_PARAM = "pagenumber"
     def build_search_urls(self, p):
         out=[]
         for location in locs(p) or ["Deutschland"]:
@@ -53,6 +60,13 @@ class ImmoweltScraper(BaseScraper):
 
 
 class ImmonetScraper(BaseScraper):
+    # Immonet's listing inventory has largely been consolidated into its
+    # sister portal Immowelt in recent years; this adapter is kept
+    # registered and error-tolerant (same pattern as Kalaydo below) so it
+    # never fabricates results if the public search no longer serves
+    # residential rentals under this domain - verify against the live site
+    # and drop it from the default source list if it consistently returns
+    # nothing.
     SOURCE_KEY = "immonet"; SOURCE_LABEL = "Immonet"; BASE_URL = "https://www.immonet.de"
     CARD_SELECTORS = ("div.list-entry", "article.list-entry", "div[data-testid*='result' i]", "article")
     LINK_SELECTORS = ("a[href*='/angebot/']", "a[href*='/expose/']", "a[href]")
@@ -96,6 +110,7 @@ class KalaydoScraper(BaseScraper):
     SOURCE_KEY = "kalaydo"; SOURCE_LABEL = "Kalaydo"; BASE_URL = "https://www.kalaydo.de"
     CARD_SELECTORS = ("article", "div[data-testid*='result' i]")
     LINK_SELECTORS = ("a[href]",)
+    MAX_PAGES = 1  # no real residential search to paginate through (see run() override below)
     def build_search_urls(self, p):
         # Kalaydo's current public site is a jobs marketplace; no current residential
         # rental category is exposed. Keep the source registered and health-checked,

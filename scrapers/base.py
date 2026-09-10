@@ -7,7 +7,7 @@ import random
 import re
 import time
 from abc import ABC, abstractmethod
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import (
@@ -40,6 +40,24 @@ class BaseScraper(ABC):
     RETRIES = max(1, int(os.getenv("SCRAPE_RETRIES", "3")))
     BACKOFF_BASE = float(os.getenv("SCRAPE_BACKOFF_BASE", "1.5"))
 
+    # Pagination. A single page-1 fetch per search URL was the single
+    # biggest reason profiles only ever saw a handful of listings: most
+    # portals cap a result page at ~20 cards, so anything beyond that was
+    # silently invisible. MAX_PAGES follows every base search URL forward
+    # as long as each new page still yields *new* candidate cards; it stops
+    # the moment a page adds nothing new (end of results, or a portal that
+    # doesn't understand PAGE_PARAM and just serves page 1 again - in which
+    # case dedupe absorbs the repeat at no real cost besides one extra
+    # request). Subclasses override PAGE_PARAM/MAX_PAGES if their portal
+    # uses a different convention; the exact query-parameter name for each
+    # portal could not be verified against the live site from this
+    # environment (no network access to real-estate portals here), so treat
+    # the per-class defaults in sites.py as a best-effort starting point to
+    # confirm/adjust once deployed.
+    MAX_PAGES = max(1, int(os.getenv("SCRAPE_MAX_PAGES", "3")))
+    PAGE_PARAM: str | None = "page"
+    PAGE_START = 1
+
     USER_AGENTS = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
@@ -69,13 +87,33 @@ class BaseScraper(ABC):
     def build_search_urls(self, params: SearchParams) -> list[str]:
         raise NotImplementedError
 
+    def build_page_url(self, base_url: str, page: int) -> str | None:
+        """Return the URL for `page` (1-indexed) of `base_url`, or None if
+        this scraper has no pagination configured. Default implementation
+        appends/overwrites a query parameter named PAGE_PARAM; portals whose
+        pagination works differently (path segments, POST forms, etc.)
+        should override this."""
+        if not self.PAGE_PARAM or page <= self.PAGE_START:
+            return base_url if page == self.PAGE_START else None
+        parts = urlsplit(base_url)
+        query = [
+            (k, v)
+            for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if k != self.PAGE_PARAM
+        ]
+        query.append((self.PAGE_PARAM, str(page)))
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
+
     def run(self, params: SearchParams) -> list[Listing]:
-        urls = list(dict.fromkeys(self.build_search_urls(params)))
-        if not urls:
+        base_urls = list(dict.fromkeys(self.build_search_urls(params)))
+        if not base_urls:
             self.log.warning("Keine Such-URLs für %s", self.SOURCE_KEY)
             return []
 
         results: list[Listing] = []
+        first_request = True
 
         with sync_playwright() as playwright:
             browser = None
@@ -103,38 +141,68 @@ class BaseScraper(ABC):
                 # commonly client-rendered.
                 context.route("**/*", self._route_lightweight_resources)
 
-                for index, url in enumerate(urls):
-                    try:
-                        if index:
-                            self._polite_delay()
+                for base_url in base_urls:
+                    seen_hrefs: set[str] = set()
 
-                        page = context.new_page()
+                    for page_num in range(
+                        self.PAGE_START, self.PAGE_START + self.MAX_PAGES
+                    ):
+                        url = self.build_page_url(base_url, page_num)
+                        if not url:
+                            break
+
                         try:
-                            self._load_with_retry(page, url)
-                            html = page.content()
-                            cards = self.parse_listing_cards(html, page)
-                            self.log.info(
-                                "%s: %d Kandidaten auf %s",
-                                self.SOURCE_KEY,
-                                len(cards),
-                                url,
+                            if not first_request:
+                                self._polite_delay()
+                            first_request = False
+
+                            page = context.new_page()
+                            try:
+                                self._load_with_retry(page, url)
+                                html = page.content()
+                                cards = self.parse_listing_cards(html, page)
+                                new_hrefs = {
+                                    c.get("href")
+                                    for c in cards
+                                    if c.get("href") and c.get("href") not in seen_hrefs
+                                }
+                                self.log.info(
+                                    "%s: Seite %d - %d Kandidaten (%d neu) auf %s",
+                                    self.SOURCE_KEY,
+                                    page_num,
+                                    len(cards),
+                                    len(new_hrefs),
+                                    url,
+                                )
+                                for raw in cards:
+                                    href = raw.get("href")
+                                    if href:
+                                        seen_hrefs.add(href)
+                                    try:
+                                        item = self.normalize(raw, page_url=url)
+                                        if item and item.url:
+                                            results.append(item)
+                                    except Exception:
+                                        self.log.exception(
+                                            "Normalisierung fehlgeschlagen: %s",
+                                            href,
+                                        )
+                            finally:
+                                page.close()
+
+                            # Stop paginating this base URL once a page adds
+                            # nothing new: either we reached the end of the
+                            # real result set, or PAGE_PARAM isn't
+                            # understood by this portal and it keeps
+                            # returning page 1 - either way, further pages
+                            # would just be wasted requests.
+                            if page_num > self.PAGE_START and not new_hrefs:
+                                break
+                        except Exception:
+                            self.log.exception(
+                                "URL fehlgeschlagen, nächste URL: %s", url
                             )
-                            for raw in cards:
-                                try:
-                                    item = self.normalize(raw, page_url=url)
-                                    if item and item.url:
-                                        results.append(item)
-                                except Exception:
-                                    self.log.exception(
-                                        "Normalisierung fehlgeschlagen: %s",
-                                        raw.get("href"),
-                                    )
-                        finally:
-                            page.close()
-                    except Exception:
-                        self.log.exception(
-                            "URL fehlgeschlagen, nächste URL: %s", url
-                        )
+                            break
             finally:
                 if context:
                     context.close()
@@ -477,33 +545,62 @@ class BaseScraper(ABC):
         ]
 
     def extract_prices(self, price_text, text):
+        """Return (price, price_total).
+
+        `price_total` is only ever set when the text explicitly labels a
+        number as Warmmiete/Gesamtmiete - it must never be guessed, because
+        matching.py relies on it being a confirmed warm rent rather than an
+        assumption. `price` is the first plain price found (commonly the
+        Kaltmiete, since that is what portals usually lead with) and is
+        used by matching.py only as a flagged estimate when no warm rent is
+        known.
+        """
         s = price_text or text or ""
         vals = self._numbers(s)
         eur_parts = re.findall(r"([\d.]+(?:,\d+)?)\s*€", s)
-        eur = [
-            float(x.replace(".", "").replace(",", "."))
-            for x in eur_parts
-        ]
+        eur = [float(x.replace(".", "").replace(",", ".")) for x in eur_parts]
 
-        if eur:
-            warm = None
-            m = re.search(
-                r"(?:warmmiete|warm|gesamtmiete)[^\d]{0,20}([\d.]+(?:,\d+)?)\s*€",
-                s,
-                re.I,
-            )
-            if m:
-                warm = float(
-                    m.group(1).replace(".", "").replace(",", ".")
-                )
-            return eur[0], warm
+        warm = None
+        m = re.search(
+            r"(?:warmmiete|gesamtmiete|miete\s*inkl\.?|inkl\.?\s*nebenkosten)"
+            r"[^\d]{0,25}([\d.]+(?:,\d+)?)\s*€",
+            s,
+            re.I,
+        )
+        if m:
+            warm = float(m.group(1).replace(".", "").replace(",", "."))
 
-        return (vals[0] if vals else None), None
+        # A number explicitly labeled Kaltmiete is the clearest signal for
+        # `price`; otherwise fall back to whichever € amount appears first.
+        cold = None
+        m = re.search(
+            r"(?:kaltmiete|grundmiete|nettokaltmiete)"
+            r"[^\d]{0,25}([\d.]+(?:,\d+)?)\s*€",
+            s,
+            re.I,
+        )
+        if m:
+            cold = float(m.group(1).replace(".", "").replace(",", "."))
+        elif eur:
+            cold = eur[0]
+        elif vals:
+            cold = vals[0]
+
+        return cold, warm
 
     def extract_rooms(self, specific, text):
         s = specific or text or ""
+        # Covers "2 Zimmer", "2-Zimmer", "2 Zi.", "2,5 Zimmer", "2.5 Zimmer"
+        # and the traditional "2 1/2 Zimmer" fraction notation.
         m = re.search(
-            r"([0-9]+(?:[,.][0-9]+)?)\s*(?:-|bis)?\s*Zimmer\b",
+            r"([0-9]+)\s+1/2\s*(?:-|bis)?\s*Zi(?:mmer)?\.?\b",
+            s,
+            re.I,
+        )
+        if m:
+            return float(m.group(1)) + 0.5
+        m = re.search(
+            r"([0-9]+(?:[,.][0-9]+)?)\s*(?:-|bis)?\s*Zi(?:mmer)?\.?\b",
             s,
             re.I,
         )

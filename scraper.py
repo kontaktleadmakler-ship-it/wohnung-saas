@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
 
 import db
 from matching import listing_fingerprint, score_listing
@@ -21,6 +21,14 @@ log = logging.getLogger("worker")
 POLL_INTERVAL_SECONDS = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
 MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
 MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "4")))
+
+REASON_LABELS = {
+    "excluded_keyword": "Ausschlussbegriff im Text",
+    "over_budget": "über dem Mietbudget",
+    "too_small": "zu klein",
+    "too_few_rooms": "zu wenig Zimmer",
+    "too_many_rooms": "zu viele Zimmer",
+}
 
 
 def _locations(profile):
@@ -56,26 +64,31 @@ def _run_job(job):
     return source, profile_ids, listings
 
 
-def process_listing(item, profiles_by_id, profile_ids):
+def process_listing(item, profiles_by_id, profile_ids, profile_stats):
     listing_id, _is_new = db.upsert_listing(item)
 
     for pid in profile_ids:
+        stats = profile_stats[pid]
+        stats["seen"] += 1
+
         profile = profiles_by_id[pid]
-        result = score_listing(item.__dict__, profile)
+        payload = dict(item.__dict__)
+        result = score_listing(payload, profile)
         if result is None:
+            reason = payload.get("_exclude_reason", "other")
+            stats["excluded"][reason] += 1
             continue
 
+        stats["matched"] += 1
         score, components, reasons = result
-        should_notify = db.save_match(
-            listing_id, pid, score, components, reasons
-        )
+        should_notify = db.save_match(listing_id, pid, score, components, reasons)
 
         if should_notify and score >= MIN_NOTIFY_SCORE:
             msg = format_match_message(
                 profile["name"],
                 score,
                 item.title,
-                item.price or item.price_total,
+                item.price_total or item.price,
                 item.rooms,
                 item.size,
                 item.address,
@@ -84,6 +97,38 @@ def process_listing(item, profiles_by_id, profile_ids):
             )
             if send_telegram(msg):
                 db.mark_notified(listing_id, pid)
+
+
+def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
+    """Turn the raw per-profile counters into the human-readable funnel the
+    dashboard shows, and log it, so a profile that ends up with zero matches
+    can be explained (missing scraper results vs. a filter being too
+    strict) instead of just showing an empty list."""
+    funnel = {}
+    for pid, stats in profile_stats.items():
+        name = profiles_by_id.get(pid, {}).get("name", f"Profil {pid}")
+        excluded_total = sum(stats["excluded"].values())
+        by_reason = {
+            REASON_LABELS.get(reason, reason): count
+            for reason, count in stats["excluded"].items()
+            if count
+        }
+        funnel[pid] = {
+            "profile_name": name,
+            "candidates_seen": stats["seen"],
+            "excluded_total": excluded_total,
+            "excluded_by_reason": by_reason,
+            "matched": stats["matched"],
+        }
+        log.info(
+            "[FUNNEL] Profil '%s': %d Kandidaten -> %d ausgeschlossen (%s) -> %d passend",
+            name,
+            stats["seen"],
+            excluded_total,
+            ", ".join(f"{v} {k}" for k, v in by_reason.items()) or "-",
+            stats["matched"],
+        )
+    return {"per_source": source_counts, "per_profile": funnel}
 
 
 def run_once():
@@ -111,6 +156,8 @@ def run_once():
         ]
 
         all_results = []
+        source_counts = defaultdict(int)
+        source_errors = []
         with ThreadPoolExecutor(
             max_workers=min(MAX_CONCURRENT_SCRAPERS, max(1, len(work))),
             thread_name_prefix="scrape",
@@ -123,13 +170,20 @@ def run_once():
                     source, profile_ids, listings = future.result()
                     log.info("[%s] %d Inserate", source, len(listings))
                     total += len(listings)
+                    source_counts[source] += len(listings)
                     all_results.append((profile_ids, listings))
                 except Exception:
+                    # A failing portal must never take the whole scan down -
+                    # the other sources keep going and still produce results.
                     log.exception("[%s] Portal fehlgeschlagen", source)
+                    source_errors.append(source)
 
         # Cross-source in-memory dedupe. DB uniqueness remains the final guard.
         seen = set()
         processed = 0
+        profile_stats = defaultdict(
+            lambda: {"seen": 0, "matched": 0, "excluded": defaultdict(int)}
+        )
         for profile_ids, listings in all_results:
             for item in listings:
                 key = listing_fingerprint(item.__dict__)
@@ -137,18 +191,28 @@ def run_once():
                     continue
                 seen.add(key)
                 try:
-                    process_listing(item, profiles_by_id, profile_ids)
+                    process_listing(item, profiles_by_id, profile_ids, profile_stats)
                     processed += 1
                 except Exception:
                     log.exception(
                         "Listing-Verarbeitung fehlgeschlagen: %s", item.url
                     )
 
+        funnel = _log_and_build_funnel(profiles_by_id, profile_stats, dict(source_counts))
+        funnel["source_errors"] = source_errors
+        funnel["scraped_total"] = total
+        funnel["unique_total"] = processed
+
         elapsed = time.monotonic() - started
         log.info(
-            "Scan beendet: jobs=%d, scraped=%d, unique=%d, duration=%.1fs",
-            len(work), total, processed, elapsed,
+            "Scan beendet: jobs=%d, scraped=%d, unique=%d, duration=%.1fs, fehlerhafte_quellen=%s",
+            len(work), total, processed, elapsed, source_errors or "-",
         )
+        try:
+            db.save_scan_run(funnel, elapsed)
+        except Exception:
+            log.exception("Scan-Zusammenfassung konnte nicht gespeichert werden")
+
         return {"jobs": len(work), "listings": total, "unique": processed}
     finally:
         db.release_scan_lock(lock)

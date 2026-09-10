@@ -42,7 +42,9 @@ def logout(): session.clear(); return redirect(url_for('login'))
 def home():
  try: rows=db.get_dashboard_rows(int(request.args.get('min_score',0)),request.args.get('profile_id') or None)
  except Exception: rows=[]; flash('Datenbank konnte nicht gelesen werden.')
- return render_template('dashboard.html',rows=rows,profiles=db.get_active_profiles(),min_score=int(request.args.get('min_score',0)),selected_profile=request.args.get('profile_id') or '',scan_running=bool(scan_thread and scan_thread.is_alive()))
+ try: last_scan=db.get_last_scan_run()
+ except Exception: last_scan=None
+ return render_template('dashboard.html',rows=rows,profiles=db.get_active_profiles(),min_score=int(request.args.get('min_score',0)),selected_profile=request.args.get('profile_id') or '',scan_running=bool(scan_thread and scan_thread.is_alive()),last_scan=last_scan)
 
 @app.route('/scan/run',methods=['POST'])
 @auth

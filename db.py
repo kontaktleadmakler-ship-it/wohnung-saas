@@ -43,12 +43,16 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS profile_sources(profile_id INT REFERENCES profiles(id) ON DELETE CASCADE, source TEXT NOT NULL, PRIMARY KEY(profile_id,source));
             CREATE TABLE IF NOT EXISTS profile_regions(profile_id INT REFERENCES profiles(id) ON DELETE CASCADE, region_code TEXT NOT NULL, PRIMARY KEY(profile_id,region_code));
+            CREATE TABLE IF NOT EXISTS scan_runs(
+              id BIGSERIAL PRIMARY KEY, started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), duration_seconds NUMERIC, summary JSONB NOT NULL DEFAULT '{}'::jsonb
+            );
             CREATE INDEX IF NOT EXISTS idx_listings_last_seen ON listings(last_seen DESC);
             CREATE INDEX IF NOT EXISTS idx_listings_source ON listings(source);
             CREATE INDEX IF NOT EXISTS idx_matches_score ON matches(score DESC);
             CREATE INDEX IF NOT EXISTS idx_matches_profile_created ON matches(profile_id,created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_profile_sources_source ON profile_sources(source);
             CREATE INDEX IF NOT EXISTS idx_profile_regions_region ON profile_regions(region_code);
+            CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
             """)
             cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS raw JSONB NOT NULL DEFAULT '{}'::jsonb")
         c.commit()
@@ -138,6 +142,21 @@ def save_match(listing_id,profile_id,score,components,reasons):
 def mark_notified(listing_id,profile_id):
     with get_conn() as c:
         with c.cursor() as cur: cur.execute("UPDATE matches SET notified=TRUE,updated_at=NOW() WHERE listing_id=%s AND profile_id=%s",(listing_id,profile_id)); c.commit()
+
+def save_scan_run(summary, duration_seconds=None):
+    with get_conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO scan_runs(duration_seconds,summary) VALUES(%s,%s)",
+                (duration_seconds, psycopg2.extras.Json(summary)),
+            )
+        c.commit()
+
+def get_last_scan_run():
+    with get_conn() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 1")
+            return cur.fetchone()
 
 def get_dashboard_rows(min_score=0,profile_id=None,limit=300):
     with get_conn() as c:

@@ -14,6 +14,8 @@ Flask-Dashboard + PostgreSQL + Playwright/BeautifulSoup + periodischer Worker + 
 
 Die Scraper benutzen eine plattformspezifische URL-/Link-Strategie, mehrere Selektoren und danach einen generischen DOM-Fallback. Pro URL wird ein Fehler isoliert. Playwright wartet mindestens 10 Sekunden auf clientseitig gerenderte Inhalte und versucht übliche Cookie-Dialoge zu akzeptieren.
 
+**Pagination:** Jede Such-URL wird bis zu `SCRAPE_MAX_PAGES` (Standard 3) Seiten weit verfolgt und stoppt automatisch, sobald eine Seite keine neuen Inserate mehr liefert – das war der Hauptgrund, warum Profile bisher oft nur eine Handvoll Wohnungen sahen (die meisten Portale zeigen ca. 20 Treffer pro Seite). Der Seitenparameter ist pro Scraper in `scrapers/sites.py` konfigurierbar (`PAGE_PARAM`); für ImmoScout24 ist `pagenumber` hinterlegt, alle anderen nutzen aktuell den generischen `?page=N`-Fallback. **Wichtig:** Diese Parameter konnten in dieser Umgebung nicht gegen die echten Portale verifiziert werden (kein Netzwerkzugriff auf Immobilienportale). Ein falscher Parameter führt nicht zu Fehlern – das Portal liefert dann einfach wiederholt Seite 1, die per Deduplizierung verworfen wird –, sollte aber nach dem Deployment anhand der Logs (`Seite N - X Kandidaten (Y neu)`) geprüft und bei Bedarf angepasst werden.
+
 **Wichtiger aktueller Hinweis:** Die öffentlich erreichbare Kalaydo-Präsenz ist inzwischen primär eine Jobbörse. Der Kalaydo-Adapter ist deshalb absichtlich fehlertolerant und erzeugt keine erfundenen Immobilienangebote. Wenn Kalaydo wieder eine öffentliche Wohnimmobilien-Suche anbietet, muss nur die URL-Konfiguration in `scrapers/sites.py` angepasst werden.
 
 ## Lokal starten
