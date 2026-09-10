@@ -1,5 +1,5 @@
 {% extends 'base.html' %}{% block title %}Treffer — Wohnungsradar{% endblock %}{% block content %}
-<div class="head"><div><div class="eyebrow">LIVE LISTINGS</div><h1>Wohnungstreffer</h1></div><form method="post" action="{{url_for('run_scan')}}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button {% if scan_running %}disabled{% endif %}>{{'SCAN LÄUFT…' if scan_running else 'SCAN STARTEN'}}</button></form></div>
+<div class="head"><div><div class="eyebrow">LIVE LISTINGS</div><h1>Wohnungstreffer</h1></div><form method="post" action="{{url_for('run_scan')}}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="profile_id" value="{{ selected_profile }}"><button {% if scan_running %}disabled{% endif %}>{{'SCAN LÄUFT…' if scan_running else 'SCAN STARTEN'}}</button></form></div>
 {% if heartbeat_status %}
 <div class="scan-summary heartbeat-{{heartbeat_status}}">
   {{heartbeat_message}}

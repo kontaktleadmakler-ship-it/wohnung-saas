@@ -27,7 +27,7 @@ MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
 MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "1")))
 # Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
 # aus einem Portal auf einmal in Playwright/Python weiterreichen.
-MAX_CANDIDATES_PER_SOURCE = max(1, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "10")))
+MAX_CANDIDATES_PER_SOURCE = max(0, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "0")))
 # TODO: Ein geteilter Browser mit ausgeliehenen Contexts könnte später mehr Parallelität
 # erlauben; auf kleinen Render-Instanzen ist ein Browser pro Job sonst zu speicherintensiv.
 
@@ -194,6 +194,14 @@ def run_once(profile_id=None):
 
     try:
         profiles_by_id = {p["id"]: p for p in profiles}
+        for p in profiles:
+            log.info(
+                "Profil %s '%s': Quellen=%s Regionen=%s Orte=%s Filter=%s-%s EUR, %s-%s Zimmer, ab %s m²",
+                p["id"], p.get("name", ""), sorted(p.get("sources") or []),
+                sorted(p.get("regions") or []), _locations(p),
+                p.get("min_price"), p.get("max_price"), p.get("min_rooms"),
+                p.get("max_rooms"), p.get("min_size"),
+            )
         jobs = build_jobs(profiles)
         log.info(
             "Scan-Kontext: Profile=%s, Quellen=%s",

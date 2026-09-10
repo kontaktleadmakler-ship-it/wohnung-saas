@@ -30,6 +30,14 @@ class ImmonetScraper(BaseScraper):
             return html
 
     def build_search_urls(self, params: SearchParams) -> list[str]:
+        # Konkrete Orte aus dem Profil haben Vorrang vor der reinen Region.
+        if params.locations:
+            from urllib.parse import quote_plus
+            return [
+                "https://www.immonet.de/immobiliensuche/sel.do"
+                f"?suchart=miete&location={quote_plus(location)}"
+                for location in params.locations
+            ]
         if params.nationwide or not params.region_codes:
             return ["https://www.immonet.de/immobiliensuche/sel.do?suchart=miete"]
         return [

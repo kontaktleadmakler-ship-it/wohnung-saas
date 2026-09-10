@@ -273,7 +273,7 @@ def diagnose():
         try:
             scraper = get_scraper(source)
             params = SearchParams(
-                nationwide="DE" in regions,
+                nationwide=("DE" in regions and not locations),
                 region_codes=[] if "DE" in regions else list(regions),
                 locations=list(locations),
             )
