@@ -158,9 +158,21 @@ def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
     return {"per_source": source_counts, "per_profile": funnel}
 
 
-def run_once():
-    profiles = db.get_active_profiles_with_sources()
-    log.info("run_once: %d aktive Profile geladen", len(profiles))
+def run_once(profile_id=None):
+    """Run one scan, optionally restricted to exactly one dashboard-selected profile."""
+    if profile_id is not None:
+        try:
+            profile_id = int(profile_id)
+        except (TypeError, ValueError):
+            log.warning("Ungültige Profil-ID %r - Scan abgebrochen", profile_id)
+            return {"jobs": 0, "listings": 0, "error": "invalid_profile_id"}
+        profile = db.get_profile(profile_id)
+        profiles = [profile] if profile and profile.get("active") else []
+        log.info("run_once: gezieltes Profil %s geladen: %s",
+                 profile_id, profile.get("name") if profile else "NICHT GEFUNDEN")
+    else:
+        profiles = db.get_active_profiles_with_sources()
+        log.info("run_once: %d aktive Profile geladen", len(profiles))
     if not profiles:
         log.warning(
             "Keine aktiven Profile - nichts zu tun. Bitte im Dashboard "
@@ -183,6 +195,11 @@ def run_once():
     try:
         profiles_by_id = {p["id"]: p for p in profiles}
         jobs = build_jobs(profiles)
+        log.info(
+            "Scan-Kontext: Profile=%s, Quellen=%s",
+            sorted(profiles_by_id),
+            sorted({src for (src, _regions, _locations) in jobs}) if jobs else [],
+        )
 
         # One job per unique source + search scope. Profiles sharing the same
         # scope reuse the same scrape result instead of hitting the portal again.
@@ -319,7 +336,7 @@ def worker_loop():
         time.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
 
 
-def run_once_and_heartbeat():
+def run_once_and_heartbeat(profile_id=None):
     """Ein einzelner Scan-Zyklus für den `--once`-Modus (Subprozess, der vom
     Web-Prozess periodisch gestartet wird).
 
@@ -336,7 +353,7 @@ def run_once_and_heartbeat():
     log.info("Einzelscan (--once) gestartet (pid=%s)", os.getpid())
     try:
         db.init_db()
-        result = run_once()
+        result = run_once(profile_id=profile_id)
         return result
     finally:
         elapsed = time.monotonic() - started
@@ -386,6 +403,14 @@ if __name__ == "__main__":
     if "--dry-run" in sys.argv:
         _dry_run()
     elif "--once" in sys.argv:
-        run_once_and_heartbeat()
+        profile_id = None
+        if "--profile-id" in sys.argv:
+            try:
+                idx = sys.argv.index("--profile-id")
+                profile_id = int(sys.argv[idx + 1])
+            except (ValueError, IndexError):
+                log.error("--profile-id benötigt eine gültige ID")
+                raise SystemExit(2)
+        run_once_and_heartbeat(profile_id=profile_id)
     else:
         worker_loop()

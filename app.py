@@ -305,24 +305,40 @@ def diagnose():
 @auth
 def run_scan():
     global scan_thread
+    raw_profile_id = request.form.get("profile_id") or request.args.get("profile_id")
+    try:
+        profile_id = int(raw_profile_id) if raw_profile_id else None
+    except (TypeError, ValueError):
+        flash("Ungültiges Profil.")
+        return redirect(url_for("home"))
+
     with scan_lock:
         if scan_thread and scan_thread.is_alive():
             flash("Scan läuft bereits.")
             return redirect(url_for("home"))
-        scan_thread = threading.Thread(target=_manual_scan, daemon=True)
+        scan_thread = threading.Thread(
+            target=_manual_scan,
+            args=(profile_id,),
+            daemon=True,
+            name="manual-scan",
+        )
         scan_thread.start()
-    flash("Scan gestartet. Der PostgreSQL-Lock verhindert parallele Scans auch zwischen Web und Worker.")
+    if profile_id is None:
+        flash("Scan für alle aktiven Profile gestartet.")
+    else:
+        flash(f"Scan für Profil {profile_id} gestartet.")
     return redirect(url_for("home"))
 
 
-def _manual_scan():
-    # Läuft ebenfalls als Subprozess (nicht worker.run_once() direkt im
-    # Thread) - sonst würde ein manuell ausgelöster Scan wieder Playwright
-    # im Web-Prozess blockieren und genau das ursprüngliche
-    # /healthz-Timeout-Problem für die Dauer des Scans reproduzieren.
+def _manual_scan(profile_id=None):
     try:
-        returncode = _run_scan_once_embedded()
-        log.info("Manueller Scan-Subprozess fertig (exit=%s)", returncode)
+        result = worker.run_once(profile_id=profile_id)
+        log.info(
+            "Manueller Scan fertig: profile_id=%s jobs=%s listings=%s",
+            profile_id,
+            result.get("jobs") if isinstance(result, dict) else "?",
+            result.get("listings") if isinstance(result, dict) else "?",
+        )
     except Exception:
         log.exception("Manueller Scan fehlgeschlagen")
 
