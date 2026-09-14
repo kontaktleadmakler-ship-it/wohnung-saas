@@ -53,9 +53,29 @@ class PortalSpider(scrapy.Spider):
         self.blocked_pages=0
         self._first_page_url_set=None
 
+    async def start(self):
+        """Scrapy 2.19+ entrypoint. Explicitly schedule every configured URL.
+
+        Using the modern ``start()`` API avoids relying on the legacy
+        ``start_requests()`` compatibility path and gives us a deterministic
+        request-scheduling point for the short-lived Render worker process.
+        """
+        if not self.start_urls:
+            self.logger.error("[%s] Keine Start-URLs konfiguriert", self.source_key)
+            return
+        self.logger.info(
+            "[%s] Spider gestartet: %d Start-URLs, max_pages=%d, playwright=%s",
+            self.source_key, len(self.start_urls), self.max_pages, self.use_playwright,
+        )
+        for u in self.start_urls:
+            self.logger.info("[%s] REQUEST_SCHEDULE: %s", self.source_key, u)
+            yield self._request(u, 1)
+
+    # Backwards compatibility for older Scrapy integrations/tests that call
+    # start_requests() directly. Scrapy 2.19 uses start() above.
     def start_requests(self):
         for u in self.start_urls:
-            yield self._request(u,1)
+            yield self._request(u, 1)
 
     def _pick_user_agent(self):
         pool=list(getattr(self,"settings",None).get("USER_AGENT_POOL") or []) if getattr(self,"settings",None) else []
