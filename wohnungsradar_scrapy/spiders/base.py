@@ -54,25 +54,24 @@ class PortalSpider(scrapy.Spider):
         self._first_page_url_set=None
 
     async def start(self):
-        """Scrapy 2.19+ entrypoint. Explicitly schedule every configured URL.
+        """Scrapy 2.19+ entrypoint.
 
-        Using the modern ``start()`` API avoids relying on the legacy
-        ``start_requests()`` compatibility path and gives us a deterministic
-        request-scheduling point for the short-lived Render worker process.
+        ``start_requests()`` was removed from the modern spider lifecycle.
+        Keeping request creation here is critical: without it the spider can
+        open successfully while scheduling zero requests.
         """
-        if not self.start_urls:
-            self.logger.error("[%s] Keine Start-URLs konfiguriert", self.source_key)
-            return
         self.logger.info(
-            "[%s] Spider gestartet: %d Start-URLs, max_pages=%d, playwright=%s",
-            self.source_key, len(self.start_urls), self.max_pages, self.use_playwright,
+            "[SCAN-DEBUG][%s] START: %d start URL(s): %s",
+            self.source_key, len(self.start_urls), self.start_urls,
         )
+        if not self.start_urls:
+            self.logger.error("[%s] Keine start_urls vorhanden", self.source_key)
+            return
         for u in self.start_urls:
-            self.logger.info("[%s] REQUEST_SCHEDULE: %s", self.source_key, u)
+            self.logger.info("[SCAN-DEBUG][%s] REQUEST_SCHEDULE: %s", self.source_key, u)
             yield self._request(u, 1)
 
-    # Backwards compatibility for older Scrapy integrations/tests that call
-    # start_requests() directly. Scrapy 2.19 uses start() above.
+    # Compatibility for older Scrapy versions. Scrapy 2.19 uses ``start``.
     def start_requests(self):
         for u in self.start_urls:
             yield self._request(u, 1)

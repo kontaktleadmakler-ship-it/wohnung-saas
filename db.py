@@ -25,9 +25,12 @@ MONGO_DB_NAME = _database_name_from_uri(MONGODB_URI)
 LOCK_KEY = "scan_lock"
 # MongoDB scan lock is a short renewable lease. A long fixed stale timeout
 # can leave an orphaned lock behind for 30 minutes after a deploy/crash.
-LOCK_LEASE_SECONDS = max(90, int(os.getenv("SCAN_LOCK_LEASE_SECONDS", "180")))
+LOCK_LEASE_SECONDS = max(60, int(os.getenv("SCAN_LOCK_LEASE_SECONDS", "300")))
 LOCK_RENEW_INTERVAL_SECONDS = max(15, min(LOCK_LEASE_SECONDS // 3, int(os.getenv("SCAN_LOCK_RENEW_INTERVAL_SECONDS", "30"))))
 LEGACY_LOCK_STALE_SECONDS = max(60, int(os.getenv("LEGACY_SCAN_LOCK_STALE_SECONDS", "120")))
+# If an old/current lock was created but never renewed, treat it as orphaned
+# after two renewal intervals. An active scan renews well before this point.
+UNRENEWED_LOCK_STALE_SECONDS = max(90, LOCK_RENEW_INTERVAL_SECONDS * 3)
 LOCK_INSTANCE_ID = (os.getenv("RENDER_INSTANCE_ID") or os.getenv("RENDER_SERVICE_ID") or str(uuid.uuid4())).strip()
 
 _client = None
@@ -123,6 +126,7 @@ def try_scan_lock():
     now = _now()
     lease_until = now + timedelta(seconds=LOCK_LEASE_SECONDS)
     legacy_stale_before = now - timedelta(seconds=LEGACY_LOCK_STALE_SECONDS)
+    unrenewed_stale_before = now - timedelta(seconds=UNRENEWED_LOCK_STALE_SECONDS)
     token = f"{LOCK_INSTANCE_ID}-{os.getpid()}-{uuid.uuid4().hex}"
     owner = {
         "token": token,
@@ -146,6 +150,14 @@ def try_scan_lock():
                 {
                     "lease_until": {"$exists": False},
                     "acquired_at": {"$exists": False},
+                },
+                {
+                    "renewed_at": {"$exists": False},
+                    "acquired_at": {"$lt": unrenewed_stale_before},
+                },
+                {
+                    "renewed_at": None,
+                    "acquired_at": {"$lt": unrenewed_stale_before},
                 },
             ],
         },
@@ -178,27 +190,8 @@ def renew_scan_lock(conn):
 
 
 def get_scan_lock():
-    """Return diagnostic information about the current scan lock.
-
-    The caller can use ``lease_until`` to distinguish a real active scan from
-    an orphaned lease. The token is intentionally exposed only to diagnostics
-    inside the application and is never accepted from a client request.
-    """
-    doc = _db().locks.find_one({"_id": LOCK_KEY}, {"_id": 0})
-    if not doc:
-        return None
-    now = _now()
-    lease_until = doc.get("lease_until")
-    doc["expired"] = bool(lease_until and lease_until <= now)
-    doc["lease_remaining_seconds"] = (
-        max(0, round((lease_until - now).total_seconds(), 1))
-        if lease_until else None
-    )
-    doc["this_process"] = (
-        doc.get("owner_instance") == LOCK_INSTANCE_ID
-        and doc.get("owner_pid") == os.getpid()
-    )
-    return doc
+    """Return diagnostic information about the current scan lock."""
+    return _db().locks.find_one({"_id": LOCK_KEY}, {"_id": 0})
 
 
 def release_scan_lock(conn):

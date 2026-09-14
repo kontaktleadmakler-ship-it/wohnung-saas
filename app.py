@@ -39,15 +39,26 @@ app.secret_key = SECRET_KEY
 CSRFProtect(app)
 
 log = logging.getLogger("web")
+
+def _utc(value):
+    """Normalize BSON/PyMongo timestamps to timezone-aware UTC."""
+    import datetime
+    if value is None:
+        return None
+    if not isinstance(value, datetime.datetime):
+        return value
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
+
 scan_thread = None
 scan_lock = threading.Lock()
 _db_init_lock = threading.Lock()
 _db_initialized = False
 
-# Der Web-Service startet standardmäßig KEINEN automatischen Scan beim Boot.
-# Das verhindert, dass Playwright/Chromium die kleine Render-Instanz direkt
-# nach dem Start aus dem Speicher drängt. Scans werden über das Dashboard
-# manuell gestartet. Optional kann ENABLE_AUTO_SCAN=true gesetzt werden.
+# Der automatische Scan ist optional und wird ausschließlich über
+# ENABLE_AUTO_SCAN gesteuert. Scans laufen in einem separaten Kindprozess,
+# damit Scrapy/Playwright den Gunicorn-Prozess nicht blockiert.
 _NO_HEARTBEAT_MESSAGE = (
     "Worker nicht erreichbar. Der Scan läuft im Web-Service - "
     "prüfe die Render-Logs von wohnung-saas-web auf "
@@ -210,14 +221,7 @@ def _heartbeat_status():
         return hb, "down", _NO_HEARTBEAT_MESSAGE
 
     import datetime
-
-    # PyMongo/BSON returns datetime values as naive UTC datetimes by default.
-    # Normalize both forms to timezone-aware UTC before subtraction.
-    last_seen_at = hb.get("last_seen_at")
-    if last_seen_at.tzinfo is None:
-        last_seen_at = last_seen_at.replace(tzinfo=datetime.timezone.utc)
-    else:
-        last_seen_at = last_seen_at.astimezone(datetime.timezone.utc)
+    last_seen_at = _utc(hb.get("last_seen_at"))
     age = (datetime.datetime.now(datetime.timezone.utc) - last_seen_at).total_seconds()
     interval = hb.get("poll_interval_seconds") or worker.POLL_INTERVAL_SECONDS
 
@@ -392,19 +396,23 @@ def scan_diagnostics():
         last=db.get_last_scan_run() or {}
         lock=db.get_scan_lock()
         if lock:
-            now=db._now()
-            lease=lock.get("lease_until")
-            if lease and getattr(lease,"tzinfo",None) is None:
-                lease=lease.replace(tzinfo=__import__('datetime').timezone.utc)
-            expired=bool(lease and lease <= now)
+            import datetime
+            now=datetime.datetime.now(datetime.timezone.utc)
+            lease=_utc(lock.get("lease_until"))
+            acquired_at=_utc(lock.get("acquired_at"))
+            renewed_at=_utc(lock.get("renewed_at"))
+            expired=bool(lease and isinstance(lease, datetime.datetime) and lease.timestamp() <= now.timestamp())
+            remaining=(lease.timestamp()-now.timestamp()) if isinstance(lease, datetime.datetime) else None
             lock_view={"present":True,"token_present":bool(lock.get("token")),
                        "owner_pid":lock.get("owner_pid"),"owner_instance":lock.get("owner_instance"),
-                       "acquired_at":lock.get("acquired_at"),"renewed_at":lock.get("renewed_at"),
+                       "acquired_at":acquired_at,"renewed_at":renewed_at,
                        "lease_until":lease,"expired":expired,
+                       "lease_remaining_seconds":round(remaining,1) if remaining is not None else None,
                        "held_by_this_process":lock.get("owner_pid")==os.getpid() and lock.get("owner_instance")==db.LOCK_INSTANCE_ID}
         else:
             lock_view={"present":False,"token_present":False,"owner_pid":None,"owner_instance":None,
-                       "acquired_at":None,"renewed_at":None,"lease_until":None,"expired":False,"held_by_this_process":False}
+                       "acquired_at":None,"renewed_at":None,"lease_until":None,"expired":False,
+                       "lease_remaining_seconds":None,"held_by_this_process":False}
         return jsonify({
             "ok":True,"generated_at":time.time(),"duration_ms":round((time.monotonic()-started)*1000,1),
             "process":{"pid":os.getpid(),"scan_thread_running":bool(scan_thread and scan_thread.is_alive())},
@@ -545,13 +553,7 @@ def healthz():
             hb = None
         if hb and hb.get("last_seen_at"):
             import datetime
-            # PyMongo/BSON returns datetime values as naive UTC datetimes by default.
-            # Normalize both forms to timezone-aware UTC before subtraction.
-            last_seen_at = hb.get("last_seen_at")
-            if last_seen_at.tzinfo is None:
-                last_seen_at = last_seen_at.replace(tzinfo=datetime.timezone.utc)
-            else:
-                last_seen_at = last_seen_at.astimezone(datetime.timezone.utc)
+            last_seen_at = _utc(hb.get("last_seen_at"))
             age = (datetime.datetime.now(datetime.timezone.utc) - last_seen_at).total_seconds()
             payload["worker_last_seen_seconds_ago"] = round(age, 1)
             payload["worker_poll_interval_seconds"] = hb.get("poll_interval_seconds")

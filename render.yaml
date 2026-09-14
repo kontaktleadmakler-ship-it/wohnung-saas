@@ -62,8 +62,6 @@ services:
         value: "75"
       - key: SCRAPE_MAX_PAGES
         value: "3"
-      - key: SCAN_PROCESS_TIMEOUT_SECONDS
-        value: "1800"
       - key: MAX_CANDIDATES_PER_SOURCE
         value: "0"
       - key: SCRAPE_DELAY_MIN
@@ -98,3 +96,5 @@ services:
         value: "30"
       - key: LEGACY_SCAN_LOCK_STALE_SECONDS
         value: "120"
+      - key: SCAN_PROCESS_TIMEOUT_SECONDS
+        value: "1800"

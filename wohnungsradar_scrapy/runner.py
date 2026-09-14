@@ -41,7 +41,6 @@ def run_jobs(jobs):
             "TELNETCONSOLE_ENABLED":False,"REQUEST_FINGERPRINTER_IMPLEMENTATION":REQUEST_FINGERPRINTER_IMPLEMENTATION,
         }
         process=CrawlerProcess(settings=settings)
-        log.info("SCRAPY-RUNNER: %d Jobs werden registriert", len(jobs))
         # CrawlerProcess.crawl(...) returns a Twisted Deferred, not the
         # Crawler instance. Keep the real crawler so stats/spider state can
         # be inspected after process.start(). This also prevents a successful
@@ -51,16 +50,9 @@ def run_jobs(jobs):
             cls=SPIDER_CLASSES[job["source"]]
             crawler=process.create_crawler(cls)
             crawlers.append((job,crawler))
-            urls=job.get("urls", [])
-            log.info(
-                "SCRAPY-RUNNER: register source=%s job_id=%s urls=%d max_pages=%s",
-                job.get("source"), job.get("job_id"), len(urls), job.get("max_pages"),
-            )
-            process.crawl(
-                crawler, start_urls=urls,
-                max_pages=job.get("max_pages"),
-                job_id=job.get("job_id"),
-            )
+            process.crawl(crawler,start_urls=job.get("urls",[]),
+                          max_pages=job.get("max_pages"),
+                          job_id=job.get("job_id"))
         process_start_error = None
         try:
             # Scrapy 2.19 uses the snake_case keyword. The scraper runs in
