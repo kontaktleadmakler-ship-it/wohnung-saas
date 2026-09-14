@@ -414,21 +414,16 @@ def save_scan_run(summary, duration_seconds=None):
     })
 
 
-def get_recent_scan_runs(limit=10):
-    """Return recent scan runs for diagnostics without exposing Mongo internals."""
-    limit = max(1, min(50, int(limit)))
-    docs = []
-    for doc in _db().scan_runs.find().sort("started_at", DESCENDING).limit(limit):
-        doc.pop("_id", None)
-        docs.append(doc)
-    return docs
-
-
 def get_last_scan_run():
     doc = _db().scan_runs.find_one(sort=[("started_at", DESCENDING)])
     if doc:
         doc.pop("_id", None)
     return doc
+
+def get_recent_scan_runs(limit=10):
+    limit=max(1,int(limit))
+    docs=list(_db().scan_runs.find({}, {"_id":0}).sort("started_at", DESCENDING).limit(limit))
+    return docs
 
 
 def record_worker_heartbeat(duration_seconds=None, pid=None, poll_interval_seconds=None):

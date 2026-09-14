@@ -96,7 +96,3 @@ services:
         value: "60"
       - key: LEGACY_SCAN_LOCK_STALE_SECONDS
         value: "120"
-
-# Temporarily enabled for end-to-end scan diagnostics. Set to false after validation.
-  - key: SCAN_DEBUG
-    value: "true"

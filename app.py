@@ -366,147 +366,65 @@ def diagnose():
     )
 
 
-@app.route("/scan/diagnostics")
+@app.route("/scan/diagnostics", methods=["GET"])
 @auth
 def scan_diagnostics():
-    """Machine-readable end-to-end scan diagnostics.
-
-    This endpoint deliberately exposes operational metadata only: profiles,
-    selected sources, generated search URLs, lock state, recent scan summaries,
-    Scrapy status and safe runtime configuration. Secrets/connection strings
-    are never returned.
-    """
-    started = time.monotonic()
-    diagnostics = {
-        "ok": True,
-        "generated_at": time.time(),
-        "process": {"pid": os.getpid(), "scan_thread_running": bool(scan_thread and scan_thread.is_alive())},
-        "config": {
-            "auto_scan_enabled": os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"},
-            "poll_interval_seconds": worker.POLL_INTERVAL_SECONDS,
-            "initial_scan_delay_seconds": int(os.getenv("INITIAL_SCAN_DELAY_SECONDS", "30")),
-            "scan_process_timeout_seconds": int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800")),
-            "scrape_max_pages": int(os.getenv("SCRAPE_MAX_PAGES", "3")),
-            "scan_lock_lease_seconds": int(os.getenv("SCAN_LOCK_LEASE_SECONDS", "300")),
-            "scan_lock_renew_interval_seconds": int(os.getenv("SCAN_LOCK_RENEW_INTERVAL_SECONDS", "60")),
-            "legacy_scan_lock_stale_seconds": int(os.getenv("LEGACY_SCAN_LOCK_STALE_SECONDS", "120")),
-            "log_level": os.getenv("LOG_LEVEL", "INFO"),
-            "mongodb_uri_configured": bool(os.getenv("MONGODB_URI")),
-        },
-        "in_process_scan": {"manual_thread_running": bool(scan_thread and scan_thread.is_alive())},
-    }
-
+    """Machine-readable end-to-end scan diagnostics. Secrets are never returned."""
+    started=time.monotonic()
     try:
-        diagnostics["db"] = {"connected": True, "setup": db.get_setup_stats()}
-    except Exception as exc:
-        log.exception("/scan/diagnostics: DB-Status fehlgeschlagen")
-        diagnostics["db"] = {"connected": False, "error": type(exc).__name__ + ": " + str(exc)}
-        diagnostics["ok"] = False
-
-    try:
-        lock = db.get_scan_lock()
-        now = time.time()
-        if lock:
-            def _iso(value):
-                return value.isoformat() if hasattr(value, "isoformat") else value
-            diagnostics["scan_lock"] = {
-                "present": True,
-                "owner_pid": lock.get("owner_pid"),
-                "owner_instance": lock.get("owner_instance"),
-                "acquired_at": _iso(lock.get("acquired_at")),
-                "renewed_at": _iso(lock.get("renewed_at")),
-                "lease_until": _iso(lock.get("lease_until")),
-                "token_present": bool(lock.get("token")),
-            }
-            lease_until = lock.get("lease_until")
-            diagnostics["scan_lock"]["expired"] = bool(lease_until and lease_until.timestamp() < now)
-            diagnostics["scan_lock"]["held_by_this_process"] = lock.get("owner_pid") == os.getpid()
-        else:
-            diagnostics["scan_lock"] = {"present": False, "expired": False, "held_by_this_process": False}
-    except Exception as exc:
-        log.exception("/scan/diagnostics: Lock-Status fehlgeschlagen")
-        diagnostics["scan_lock"] = {"error": type(exc).__name__ + ": " + str(exc)}
-        diagnostics["ok"] = False
-
-    try:
-        profiles = db.get_active_profiles_with_sources()
-        safe_profiles = []
-        for p in profiles:
-            safe_profiles.append({
-                "id": p.get("id"), "name": p.get("name"), "active": p.get("active"),
-                "sources": sorted(p.get("sources") or []),
-                "regions": sorted(p.get("regions") or []),
-                "districts": p.get("districts"),
-                "min_price": p.get("min_price"), "max_price": p.get("max_price"),
-                "min_rooms": p.get("min_rooms"), "max_rooms": p.get("max_rooms"),
-                "min_size": p.get("min_size"),
-            })
-        diagnostics["profiles"] = safe_profiles
-
-        jobs = worker.build_jobs(profiles)
-        job_details = []
-        for (source, regions, locations), profile_ids in jobs.items():
-            detail = {
-                "source": source, "regions": list(regions), "locations": list(locations),
-                "profile_ids": sorted(profile_ids), "urls": [], "url_error": None,
-                "adapter_available": True,
-            }
+        profiles=db.get_active_profiles_with_sources()
+        jobs=[]
+        for (source, regions, locations), profile_ids in (worker.build_jobs(profiles) if profiles else {}).items():
+            adapter=None
             try:
-                scraper = get_scraper(source)
-                params = SearchParams(
-                    nationwide=("DE" in regions and not locations),
-                    region_codes=[] if "DE" in regions else list(regions),
-                    locations=list(locations),
-                )
-                detail["urls"] = scraper.build_search_urls(params)
-                detail["adapter_available"] = bool(getattr(scraper, "AVAILABLE", True))
+                adapter=get_scraper(source)
+                params=SearchParams(nationwide=("DE" in regions and not locations),
+                                    region_codes=[] if "DE" in regions else list(regions),
+                                    locations=list(locations))
+                urls=adapter.build_search_urls(params)
+                url_error=None
             except Exception as exc:
-                detail["url_error"] = type(exc).__name__ + ": " + str(exc)
-                detail["adapter_available"] = False
-            detail["urls_count"] = len(detail["urls"])
-            job_details.append(detail)
-        diagnostics["jobs"] = {"count": len(job_details), "items": job_details}
+                urls=[]; url_error=f"{type(exc).__name__}: {exc}"
+            jobs.append({"source":source,"profile_ids":sorted(profile_ids),"regions":list(regions),
+                         "locations":list(locations),"urls":urls,"urls_count":len(urls),
+                         "adapter_available":bool(getattr(adapter,"AVAILABLE",True)) if 'adapter' in locals() else False,
+                         "url_error":url_error})
+        last=db.get_last_scan_run() or {}
+        lock=db.get_scan_lock()
+        if lock:
+            now=db._now()
+            lease=lock.get("lease_until")
+            if lease and getattr(lease,"tzinfo",None) is None:
+                lease=lease.replace(tzinfo=__import__('datetime').timezone.utc)
+            expired=bool(lease and lease <= now)
+            lock_view={"present":True,"token_present":bool(lock.get("token")),
+                       "owner_pid":lock.get("owner_pid"),"owner_instance":lock.get("owner_instance"),
+                       "acquired_at":lock.get("acquired_at"),"renewed_at":lock.get("renewed_at"),
+                       "lease_until":lease,"expired":expired,
+                       "held_by_this_process":lock.get("owner_pid")==os.getpid() and lock.get("owner_instance")==db.LOCK_INSTANCE_ID}
+        else:
+            lock_view={"present":False,"token_present":False,"owner_pid":None,"owner_instance":None,
+                       "acquired_at":None,"renewed_at":None,"lease_until":None,"expired":False,"held_by_this_process":False}
+        return jsonify({
+            "ok":True,"generated_at":time.time(),"duration_ms":round((time.monotonic()-started)*1000,1),
+            "process":{"pid":os.getpid(),"scan_thread_running":bool(scan_thread and scan_thread.is_alive())},
+            "config":{"log_level":os.getenv("LOG_LEVEL","INFO"),"scan_debug":os.getenv("SCAN_DEBUG","true"),
+                      "auto_scan_enabled":os.getenv("ENABLE_AUTO_SCAN","false").lower() in {"1","true","yes","on"},
+                      "scrape_max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3")),
+                      "scan_process_timeout_seconds":int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS","1800")),
+                      "scan_lock_lease_seconds":db.LOCK_LEASE_SECONDS,
+                      "scan_lock_renew_interval_seconds":db.LOCK_RENEW_INTERVAL_SECONDS},
+            "db":{"connected":True,"setup":db.get_setup_stats()},
+            "profiles":[{"id":p.get("id"),"name":p.get("name"),"active":p.get("active"),
+                         "sources":p.get("sources") or [],"regions":p.get("regions") or [],"districts":p.get("districts")} for p in profiles],
+            "jobs":{"count":len(jobs),"items":jobs},"scan_lock":lock_view,
+            "in_process_scan":{"manual_thread_running":bool(scan_thread and scan_thread.is_alive())},
+            "last_scan_run":last,
+            "recent_scan_runs":db.get_recent_scan_runs(10),
+        })
     except Exception as exc:
-        log.exception("/scan/diagnostics: Profil-/Job-Diagnose fehlgeschlagen")
-        diagnostics["jobs"] = {"error": type(exc).__name__ + ": " + str(exc)}
-        diagnostics["ok"] = False
-
-    try:
-        diagnostics["scrapy"] = {
-            "last_run_status": worker.get_last_run_status(),
-        }
-    except Exception as exc:
-        diagnostics["scrapy"] = {"error": type(exc).__name__ + ": " + str(exc)}
-
-    try:
-        hb, hb_status, hb_message = _heartbeat_status()
-        diagnostics["heartbeat"] = {
-            "status": hb_status, "message": hb_message,
-            "last_seen_at": hb.get("last_seen_at").isoformat() if hb and hb.get("last_seen_at") else None,
-            "pid": hb.get("pid") if hb else None,
-            "duration_seconds": hb.get("duration_seconds") if hb else None,
-            "poll_interval_seconds": hb.get("poll_interval_seconds") if hb else None,
-        }
-    except Exception as exc:
-        diagnostics["heartbeat"] = {"error": type(exc).__name__ + ": " + str(exc)}
-
-    try:
-        runs = db.get_recent_scan_runs(10)
-        for run in runs:
-            for key in ("started_at",):
-                if hasattr(run.get(key), "isoformat"):
-                    run[key] = run[key].isoformat()
-        diagnostics["recent_scan_runs"] = runs
-    except Exception as exc:
-        diagnostics["recent_scan_runs"] = {"error": type(exc).__name__ + ": " + str(exc)}
-
-    diagnostics["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
-    log.info("SCAN-DIAGNOSTICS: ok=%s jobs=%s lock=%s duration_ms=%s",
-             diagnostics.get("ok"),
-             diagnostics.get("jobs", {}).get("count") if isinstance(diagnostics.get("jobs"), dict) else None,
-             diagnostics.get("scan_lock", {}).get("present") if isinstance(diagnostics.get("scan_lock"), dict) else None,
-             diagnostics["duration_ms"])
-    return jsonify(diagnostics)
+        log.exception("/scan/diagnostics fehlgeschlagen")
+        return jsonify({"ok":False,"error":f"{type(exc).__name__}: {exc}","duration_ms":round((time.monotonic()-started)*1000,1)}),500
 
 
 @app.route("/scan/run", methods=["POST"])

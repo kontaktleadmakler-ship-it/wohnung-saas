@@ -3,7 +3,7 @@ import os, re
 from urllib.parse import quote, quote_plus
 from scrapers.models import Listing, SearchParams
 from scrapers.regions import STATE_CITY_SAMPLES
-from .runner import run_jobs
+from .runner import run_jobs, get_last_run_debug
 from .spiders.portals import SPIDER_CLASSES
 import logging
 log=logging.getLogger("wohnungsradar.adapters")
@@ -149,6 +149,7 @@ def run_scrapy_jobs(work):
             LAST_RUN_STATUS.append({"source":job["source"],"job_id":job["job_id"],"status":"source unavailable"})
             log.warning("[%s] source unavailable: keine verifizierte Such-URL", job["source"])
     raw=run_jobs(jobs)
+    LAST_RUN_STATUS.extend(get_last_run_debug())
     grouped={str(i):[] for i in range(len(work))}
     for item in raw:
         if item.get("_runner_status") == "error":

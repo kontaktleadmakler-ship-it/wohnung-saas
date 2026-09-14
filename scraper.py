@@ -173,20 +173,6 @@ def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
     return {"per_source": source_counts, "per_profile": funnel}
 
 
-def _scan_debug_enabled():
-    return os.getenv("SCAN_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _debug_log_config(profiles):
-    if not _scan_debug_enabled():
-        return
-    log.info("SCAN-DEBUG: pid=%s profile_count=%d sources=%s max_pages=%s timeout=%ss",
-             os.getpid(), len(profiles),
-             sorted({src for p in profiles for src in (p.get("sources") or [])}),
-             os.getenv("SCRAPE_MAX_PAGES", "3"),
-             os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800"))
-
-
 def run_once(profile_id=None):
     """Run one scan, optionally restricted to exactly one dashboard-selected profile."""
     if profile_id is not None:
@@ -209,8 +195,6 @@ def run_once(profile_id=None):
         )
         return {"jobs": 0, "listings": 0}
 
-    _debug_log_config(profiles)
-
     lock = db.try_scan_lock()
     if not lock:
         log.warning(
@@ -218,9 +202,7 @@ def run_once(profile_id=None):
             "Worker-Service teilen sich denselben Advisory-Lock)"
         )
         return {"jobs": 0, "listings": 0, "locked": True}
-    log.info("Scan-Lock erworben (Lease=%ss, renew=%ss)", db.LOCK_LEASE_SECONDS, db.LOCK_RENEW_INTERVAL_SECONDS)
-    if _scan_debug_enabled():
-        log.info("SCAN-DEBUG: lock token acquired; beginning job construction and portal execution")
+    log.info("Scan-Lock erworben (Lease=%ss)", db.LOCK_LEASE_SECONDS)
 
     started = time.monotonic()
     total = 0
@@ -256,9 +238,6 @@ def run_once(profile_id=None):
                 p.get("max_rooms"), p.get("min_size"),
             )
         jobs = build_jobs(profiles)
-        if _scan_debug_enabled():
-            for (source, regions, locations), profile_ids in jobs.items():
-                log.info("SCAN-DEBUG: job source=%s profiles=%s regions=%s locations=%s", source, sorted(profile_ids), list(regions), list(locations))
         log.info(
             "Scan-Kontext: Profile=%s, Quellen=%s",
             sorted(profiles_by_id),
@@ -293,9 +272,7 @@ def run_once(profile_id=None):
         # Ein Scrapy-Prozess pro kompletter Scan. Alle Portal-Spider laufen
         # darin, damit der Twisted-Reactor nicht mehrfach gestartet werden muss.
         try:
-            log.info("SCAN-DEBUG: entering Scrapy/Playwright execution with %d job(s)", len(work))
             all_results = run_scrapy_jobs(work)
-            log.info("SCAN-DEBUG: Scrapy/Playwright returned %d result group(s)", len(all_results))
             runner_status = get_last_run_status()
             for status in runner_status:
                 if status.get("status") == "source unavailable":
@@ -345,6 +322,9 @@ def run_once(profile_id=None):
         funnel["unique_total"] = processed
         funnel["profiles_count"] = len(profiles)
         funnel["jobs_count"] = len(work)
+        # Persist per-source Scrapy lifecycle telemetry so /scan/diagnostics
+        # can inspect the last real crawl even though Scrapy runs in a child process.
+        funnel["scrapy_debug"] = [dict(x) for x in get_last_run_status() if x.get("job_id") is not None]
 
         log.info(
             "Quellen-Ergebnis: %s",

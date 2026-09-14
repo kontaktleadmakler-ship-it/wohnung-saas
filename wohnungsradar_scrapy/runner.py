@@ -6,19 +6,16 @@ from .settings import *
 from .spiders.portals import SPIDER_CLASSES
 
 log=logging.getLogger("wohnungsradar.scrapy")
+LAST_RUN_DEBUG=[]
+
+def get_last_run_debug():
+    return [dict(x) for x in LAST_RUN_DEBUG]
 
 def run_jobs(jobs):
-    debug = os.getenv("SCAN_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+    global LAST_RUN_DEBUG
+    LAST_RUN_DEBUG=[]
     jobs=[j for j in (jobs or []) if j.get("source") in SPIDER_CLASSES and j.get("urls")]
-    log.info("SCRAPY-DEBUG: runner received %d valid job(s)", len(jobs))
-    if debug:
-        for job in jobs:
-            log.info("SCRAPY-DEBUG: job=%s source=%s urls=%d max_pages=%s", job.get("job_id"), job.get("source"), len(job.get("urls") or []), job.get("max_pages"))
-            for url in job.get("urls") or []:
-                log.info("SCRAPY-DEBUG: request target [%s] %s", job.get("source"), url)
-    if not jobs:
-        log.warning("SCRAPY-DEBUG: no runnable jobs (unknown source or empty URL list)")
-        return []
+    if not jobs: return []
     with tempfile.TemporaryDirectory(prefix="wohnungsradar-scrapy-") as tmp:
         feed=Path(tmp)/"items.json"
         settings={
@@ -72,21 +69,50 @@ def run_jobs(jobs):
             reason=stats.get("finish_reason")
             pages=stats.get("response_received_count",0)
             errors=stats.get("log_count/ERROR",0)
-            spider_errors = getattr(getattr(crawler, "spider", None), "page_errors", 0)
-            if debug:
-                log.info("SCRAPY-DEBUG: source=%s finish_reason=%s responses=%s errors=%s page_errors=%s stats=%s",
-                         job["source"], reason, pages, errors, spider_errors,
-                         {k: v for k, v in stats.items() if k in {
-                             "downloader/request_count", "downloader/response_count",
-                             "downloader/response_status_count/200", "downloader/response_status_count/403",
-                             "downloader/response_status_count/429", "retry/count", "item_scraped_count",
-                             "spider_exceptions/count", "finish_time", "start_time"
-                         }})
+            spider=getattr(crawler, "spider", None)
+            spider_errors=getattr(spider, "page_errors", 0)
+            blocked_pages=getattr(spider, "blocked_pages", 0)
+            pages_seen=getattr(spider, "pages_seen", 0)
+            status_codes={}
+            for key,value in stats.items():
+                prefix="downloader/response_status_count/"
+                if str(key).startswith(prefix):
+                    status_codes[str(key)[len(prefix):]]=value
+            start=stats.get("start_time")
+            end=stats.get("finish_time")
+            duration=None
+            if start and end:
+                try: duration=(end-start).total_seconds()
+                except Exception: pass
+            debug={
+                "source":job["source"], "job_id":str(job.get("job_id","")),
+                "status":"finished" if reason == "finished" and not spider_errors else "error",
+                "lifecycle": ["JOB_CREATED", "CRAWLER_CREATED", "CRAWLER_STARTED",
+                              "REQUEST_SCHEDULED" if stats.get("scheduler/enqueued",0) else "REQUEST_NOT_SCHEDULED",
+                              "REQUEST_SENT" if stats.get("downloader/request_count",0) else "REQUEST_NOT_SENT",
+                              "RESPONSE_RECEIVED" if pages else "NO_RESPONSE",
+                              "JOB_FINISHED" if reason == "finished" else "JOB_FAILED"],
+                "start_url_count":len(job.get("urls") or []),
+                "requests_scheduled":stats.get("scheduler/enqueued",0),
+                "requests_sent":stats.get("downloader/request_count",0),
+                "responses_received":pages,
+                "http_statuses":status_codes,
+                "retries":stats.get("retry/count",0),
+                "download_errors":stats.get("downloader/exception_count",0),
+                "log_errors":errors, "page_errors":spider_errors,
+                "blocked_pages":blocked_pages, "pages_seen":pages_seen,
+                "items_scraped":stats.get("item_scraped_count",0),
+                "finish_reason":reason, "duration_seconds":duration,
+                "runner_error":str(process_start_error) if process_start_error else None,
+            }
+            LAST_RUN_DEBUG.append(debug)
+            log.info("[SCAN-DEBUG][%s] %s",job["source"],json.dumps(debug,ensure_ascii=False,default=str))
             if reason not in (None,"finished") or spider_errors:
                 log.error("[%s] Crawl nicht vollständig: reason=%s responses=%s request_errors=%s log_errors=%s",
                           job["source"],reason,pages,spider_errors,errors)
             else:
-                log.info("[%s] Crawl beendet: Responses=%s",job["source"],pages)
+                log.info("[%s] Crawl beendet: Responses=%s Requests=%s HTTP=%s Items=%s",
+                         job["source"],pages,stats.get("downloader/request_count",0),status_codes,stats.get("item_scraped_count",0))
         if not feed.exists(): return []
         try:
             items=json.loads(feed.read_text(encoding="utf-8"))
