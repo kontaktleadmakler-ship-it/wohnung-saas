@@ -207,7 +207,16 @@ def _heartbeat_status():
 
     import datetime
 
-    age = (datetime.datetime.now(datetime.timezone.utc) - hb["last_seen_at"]).total_seconds()
+    # MongoDB/PyMongo may return BSON datetimes as timezone-naive when
+    # tz_aware is not enabled. Normalize the heartbeat timestamp to UTC
+    # before subtracting it from the timezone-aware current time.
+    last_seen_at = hb["last_seen_at"]
+    if last_seen_at.tzinfo is None:
+        last_seen_at = last_seen_at.replace(tzinfo=datetime.timezone.utc)
+    else:
+        last_seen_at = last_seen_at.astimezone(datetime.timezone.utc)
+
+    age = (datetime.datetime.now(datetime.timezone.utc) - last_seen_at).total_seconds()
     interval = hb.get("poll_interval_seconds") or worker.POLL_INTERVAL_SECONDS
 
     if age < 1.5 * interval:
