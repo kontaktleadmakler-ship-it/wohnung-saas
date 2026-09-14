@@ -84,17 +84,23 @@ def run_jobs(jobs):
             if start and end:
                 try: duration=(end-start).total_seconds()
                 except Exception: pass
+            requests_scheduled = stats.get("scheduler/enqueued", 0)
+            requests_sent = stats.get("downloader/request_count", 0)
+            no_request_failure = bool(job.get("urls")) and requests_sent == 0
+            effective_error = bool(spider_errors) or no_request_failure or (
+                process_start_error is not None and not pages
+            )
             debug={
                 "source":job["source"], "job_id":str(job.get("job_id","")),
-                "status":"finished" if reason == "finished" and not spider_errors else "error",
+                "status":"error" if effective_error else "finished",
                 "lifecycle": ["JOB_CREATED", "CRAWLER_CREATED", "CRAWLER_STARTED",
-                              "REQUEST_SCHEDULED" if stats.get("scheduler/enqueued",0) else "REQUEST_NOT_SCHEDULED",
-                              "REQUEST_SENT" if stats.get("downloader/request_count",0) else "REQUEST_NOT_SENT",
+                              "REQUEST_SCHEDULED" if requests_scheduled else "REQUEST_NOT_SCHEDULED",
+                              "REQUEST_SENT" if requests_sent else "REQUEST_NOT_SENT",
                               "RESPONSE_RECEIVED" if pages else "NO_RESPONSE",
                               "JOB_FINISHED" if reason == "finished" else "JOB_FAILED"],
                 "start_url_count":len(job.get("urls") or []),
-                "requests_scheduled":stats.get("scheduler/enqueued",0),
-                "requests_sent":stats.get("downloader/request_count",0),
+                "requests_scheduled":requests_scheduled,
+                "requests_sent":requests_sent,
                 "responses_received":pages,
                 "http_statuses":status_codes,
                 "retries":stats.get("retry/count",0),
@@ -104,12 +110,14 @@ def run_jobs(jobs):
                 "items_scraped":stats.get("item_scraped_count",0),
                 "finish_reason":reason, "duration_seconds":duration,
                 "runner_error":str(process_start_error) if process_start_error else None,
+                "failure_reason": ("no_requests_sent" if no_request_failure else None),
             }
             LAST_RUN_DEBUG.append(debug)
             log.info("[SCAN-DEBUG][%s] %s",job["source"],json.dumps(debug,ensure_ascii=False,default=str))
-            if reason not in (None,"finished") or spider_errors:
-                log.error("[%s] Crawl nicht vollständig: reason=%s responses=%s request_errors=%s log_errors=%s",
-                          job["source"],reason,pages,spider_errors,errors)
+            if reason not in (None,"finished") or effective_error:
+                log.error("[%s] Crawl nicht vollständig: reason=%s responses=%s requests=%s request_errors=%s log_errors=%s failure=%s",
+                          job["source"],reason,pages,requests_sent,spider_errors,errors,
+                          "no_requests_sent" if no_request_failure else None)
             else:
                 log.info("[%s] Crawl beendet: Responses=%s Requests=%s HTTP=%s Items=%s",
                          job["source"],pages,stats.get("downloader/request_count",0),status_codes,stats.get("item_scraped_count",0))
@@ -126,11 +134,18 @@ def run_jobs(jobs):
             # misreported as a healthy source with zero listings. Only mark
             # crawlers that never received a response and never got a finish
             # reason; completed crawlers keep their normal result status.
+            requests_sent = crawler.stats.get_stats().get("downloader/request_count", 0)
             runner_failed = process_start_error is not None and reason is None and not response_count
-            if runner_failed or reason not in (None,"finished") or request_errors:
+            no_request_failure = bool(job.get("urls")) and requests_sent == 0
+            if runner_failed or no_request_failure or reason not in (None,"finished") or request_errors:
                 items.append({"_runner_status":"error","source":job["source"],"job_id":str(job.get("job_id","")),
-                              "reason":("crawler_process_start_failed" if runner_failed else (reason or "request_error")),
+                              "reason":(
+                                  "crawler_process_start_failed" if runner_failed
+                                  else "no_requests_sent" if no_request_failure
+                                  else (reason or "request_error")
+                              ),
                               "request_errors":request_errors,
+                              "requests_sent":requests_sent,
                               "runner_error":str(process_start_error) if runner_failed else None})
         return items
 

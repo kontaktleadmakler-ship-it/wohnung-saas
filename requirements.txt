@@ -3,7 +3,7 @@ pymongo>=4.9,<5
 requests>=2.32,<3
 beautifulsoup4>=4.13,<5
 Scrapy>=2.19,<2.20
-scrapy-playwright>=0.0.44,<1
+scrapy-playwright>=0.0.48,<0.1
 playwright==1.62.0
 flask-wtf>=1.2,<2
 

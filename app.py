@@ -420,6 +420,8 @@ def scan_diagnostics():
             "jobs":{"count":len(jobs),"items":jobs},"scan_lock":lock_view,
             "in_process_scan":{"manual_thread_running":bool(scan_thread and scan_thread.is_alive())},
             "last_scan_run":last,
+            "last_scrapy_debug": (last.get("summary", {}).get("scrapy_debug", [])
+                                  if isinstance(last, dict) else []),
             "recent_scan_runs":db.get_recent_scan_runs(10),
         })
     except Exception as exc:
