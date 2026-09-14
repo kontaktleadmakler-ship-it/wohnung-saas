@@ -47,9 +47,15 @@ def run_jobs(jobs):
             process.crawl(crawler,start_urls=job.get("urls",[]),
                           max_pages=job.get("max_pages"),
                           job_id=job.get("job_id"))
+        process_start_error = None
         try:
-            process.start(stop_after_crawl=True,installSignalHandlers=False)
-        except Exception:
+            # Scrapy 2.19 uses the snake_case keyword. The scraper runs in
+            # its own short-lived subprocess, so we explicitly disable
+            # Twisted/Scrapy signal handlers here and let the parent worker
+            # process control the subprocess lifetime.
+            process.start(stop_after_crawl=True, install_signal_handlers=False)
+        except Exception as exc:
+            process_start_error = exc
             log.exception("Scrapy-Lauf fehlgeschlagen")
             # Feed may still contain items from successfully completed spiders.
         for job,crawler in crawlers:
@@ -70,10 +76,18 @@ def run_jobs(jobs):
             log.exception("Scrapy-Feed konnte nicht gelesen werden: %s",feed); return []
         for job,crawler in crawlers:
             reason=crawler.stats.get_stats().get("finish_reason")
+            response_count=crawler.stats.get_stats().get("response_received_count",0)
             request_errors=getattr(getattr(crawler, "spider", None), "page_errors", 0)
-            if reason not in (None,"finished") or request_errors:
+            # A runner-level failure before the crawl starts must not be
+            # misreported as a healthy source with zero listings. Only mark
+            # crawlers that never received a response and never got a finish
+            # reason; completed crawlers keep their normal result status.
+            runner_failed = process_start_error is not None and reason is None and not response_count
+            if runner_failed or reason not in (None,"finished") or request_errors:
                 items.append({"_runner_status":"error","source":job["source"],"job_id":str(job.get("job_id","")),
-                              "reason":reason or "request_error","request_errors":request_errors})
+                              "reason":("crawler_process_start_failed" if runner_failed else (reason or "request_error")),
+                              "request_errors":request_errors,
+                              "runner_error":str(process_start_error) if runner_failed else None})
         return items
 
 def main():
