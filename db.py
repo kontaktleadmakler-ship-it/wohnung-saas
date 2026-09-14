@@ -45,7 +45,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS matches(
               listing_id BIGINT REFERENCES listings(id) ON DELETE CASCADE, profile_id INT REFERENCES profiles(id) ON DELETE CASCADE,
               score INT NOT NULL CHECK(score BETWEEN 0 AND 100), price_score INT DEFAULT 0, rooms_score INT DEFAULT 0, size_score INT DEFAULT 0, location_score INT DEFAULT 0,
-              reasons JSONB NOT NULL DEFAULT '[]'::jsonb, notified BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              reasons JSONB NOT NULL DEFAULT '[]'::jsonb, notified BOOLEAN NOT NULL DEFAULT FALSE, telegram_notified BOOLEAN NOT NULL DEFAULT FALSE, email_notified BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               PRIMARY KEY(listing_id, profile_id)
             );
             CREATE TABLE IF NOT EXISTS profile_sources(profile_id INT REFERENCES profiles(id) ON DELETE CASCADE, source TEXT NOT NULL, PRIMARY KEY(profile_id,source));
@@ -71,6 +71,8 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
             """)
             cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS raw JSONB NOT NULL DEFAULT '{}'::jsonb")
+            cur.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS telegram_notified BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS email_notified BOOLEAN NOT NULL DEFAULT FALSE")
         c.commit()
 
 def cleanup_scan_runs(days=30):
@@ -200,13 +202,41 @@ def upsert_listing(item):
 
 def save_match(listing_id,profile_id,score,components,reasons):
     with get_connection() as c:
-        with c.cursor() as cur:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""INSERT INTO matches(listing_id,profile_id,score,price_score,rooms_score,size_score,location_score,reasons)
-              VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(listing_id,profile_id) DO UPDATE SET score=EXCLUDED.score,price_score=EXCLUDED.price_score,rooms_score=EXCLUDED.rooms_score,size_score=EXCLUDED.size_score,location_score=EXCLUDED.location_score,reasons=EXCLUDED.reasons,updated_at=NOW() RETURNING notified""",(listing_id,profile_id,score,*components,psycopg2.extras.Json(reasons))); notified=cur.fetchone()[0]; c.commit(); return not notified
+              VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+              ON CONFLICT(listing_id,profile_id) DO UPDATE SET
+                score=EXCLUDED.score,price_score=EXCLUDED.price_score,rooms_score=EXCLUDED.rooms_score,
+                size_score=EXCLUDED.size_score,location_score=EXCLUDED.location_score,reasons=EXCLUDED.reasons,
+                updated_at=NOW()
+              RETURNING notified,telegram_notified,email_notified""",
+              (listing_id,profile_id,score,*components,psycopg2.extras.Json(reasons)))
+            row=cur.fetchone()
+        c.commit()
+        return dict(row)
+
+def mark_telegram_notified(listing_id,profile_id):
+    with get_connection() as c:
+        with c.cursor() as cur:
+            cur.execute("""UPDATE matches SET telegram_notified=TRUE,
+                         notified=(TRUE OR email_notified),updated_at=NOW()
+                         WHERE listing_id=%s AND profile_id=%s""",(listing_id,profile_id))
+        c.commit()
+
+def mark_email_notified(listing_id,profile_id):
+    with get_connection() as c:
+        with c.cursor() as cur:
+            cur.execute("""UPDATE matches SET email_notified=TRUE,
+                         notified=(TRUE OR telegram_notified),updated_at=NOW()
+                         WHERE listing_id=%s AND profile_id=%s""",(listing_id,profile_id))
+        c.commit()
 
 def mark_notified(listing_id,profile_id):
+    """Backward-compatible helper: mark the overall match as notified."""
     with get_connection() as c:
-        with c.cursor() as cur: cur.execute("UPDATE matches SET notified=TRUE,updated_at=NOW() WHERE listing_id=%s AND profile_id=%s",(listing_id,profile_id)); c.commit()
+        with c.cursor() as cur:
+            cur.execute("UPDATE matches SET notified=TRUE,updated_at=NOW() WHERE listing_id=%s AND profile_id=%s",(listing_id,profile_id))
+        c.commit()
 
 def save_scan_run(summary, duration_seconds=None):
     with get_connection() as c:

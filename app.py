@@ -48,11 +48,11 @@ _db_initialized = False
 # nach dem Start aus dem Speicher drängt. Scans werden über das Dashboard
 # manuell gestartet. Optional kann ENABLE_AUTO_SCAN=true gesetzt werden.
 _NO_HEARTBEAT_MESSAGE = (
-    "Worker nicht erreichbar. Es gibt keinen separaten Worker-Service mehr - "
-    "prüfe stattdessen die Render-Logs des Web-Service (wohnung-saas-web) auf "
-    "die Zeilen 'Eingebetteter Scan-Thread gestartet' und "
-    "'Scan-Subprozess fertig'. Fehlen diese, startet der Subprozess nicht "
-    "oder wird vor Abschluss gekillt (z. B. OOM)."
+    "Worker nicht erreichbar. Der Scan läuft im Web-Service - "
+    "prüfe die Render-Logs von wohnung-saas-web auf "
+    "'Eingebetteter Scan-Thread gestartet' und 'Eingebetteter Scan fertig'. "
+    "Fehlen diese, startet der Hintergrundscan nicht oder wird vor Abschluss "
+    "beendet (z. B. wegen Speichermangel)."
 )
 _background_scanner_lock = threading.Lock()
 _background_scanner_started = False
@@ -100,7 +100,7 @@ def _run_scan_once_embedded():
 
 def _background_scanner():
     """Läuft als Daemon-Thread im Web-Prozess und stößt periodisch einen
-    Scan-Subprozess an. Ersetzt den früheren separaten Worker-Service."""
+    Scan im selben Python-Prozess an."""
     poll_interval = worker.POLL_INTERVAL_SECONDS
     log.info(
         "Eingebetteter Scan-Thread gestartet (pid=%s): poll_interval=%ss",
@@ -265,7 +265,7 @@ def diagnose():
     if setup_stats and setup_stats.get("profiles_with_sources", 0) == 0:
         warnings.append("Keinem Profil sind Quellen zugewiesen.")
     if heartbeat_status == "down":
-        warnings.append("Worker-Service läuft nicht oder teilt die DB nicht.")
+        warnings.append("Hintergrundscan läuft nicht oder teilt die DB nicht.")
 
     profile_urls = []
     jobs = worker.build_jobs(profiles) if profiles else {}

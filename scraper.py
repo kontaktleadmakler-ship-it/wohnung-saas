@@ -10,7 +10,9 @@ import db
 from logging_setup import configure_logging
 from matching import listing_fingerprint, score_listing
 from telegram import send_telegram, format_match_message
+from email_notifier import send_email, format_match_email, is_configured as email_configured
 from scrapers.registry import get_scraper
+from wohnungsradar_scrapy.adapters import run_scrapy_jobs
 from scrapers.models import SearchParams
 from scrapers.regions import STATE_CITY_SAMPLES
 
@@ -106,9 +108,9 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
 
         stats["matched"] += 1
         score, components, reasons = result
-        should_notify = db.save_match(listing_id, pid, score, components, reasons)
+        notification_state = db.save_match(listing_id, pid, score, components, reasons)
 
-        if should_notify and score >= MIN_NOTIFY_SCORE:
+        if score >= MIN_NOTIFY_SCORE:
             msg = format_match_message(
                 profile["name"],
                 score,
@@ -120,10 +122,22 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
                 item.url,
                 item.source,
             )
-            if send_telegram(msg):
-                # Erst nach erfolgreichem Telegram-Versand markieren, damit ein
-                # temporär nicht erreichbarer Bot beim nächsten Scan erneut benachrichtigt wird (Retry).
-                db.mark_notified(listing_id, pid)
+
+            # Telegram and e-mail are tracked independently. A temporary
+            # failure of one channel therefore does not suppress retries for
+            # that channel on the next scan.
+            if not notification_state.get("telegram_notified"):
+                if send_telegram(msg):
+                    db.mark_telegram_notified(listing_id, pid)
+
+            if email_configured() and not notification_state.get("email_notified"):
+                subject, text = format_match_email(
+                    profile["name"], score, item.title,
+                    item.price_total or item.price, item.rooms,
+                    item.size, item.address, item.url, item.source,
+                )
+                if send_email(subject, text):
+                    db.mark_email_notified(listing_id, pid)
 
 
 def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
@@ -233,24 +247,24 @@ def run_once(profile_id=None):
         source_errors = []
         source_empty = []
 
-        # Absichtlich strikt sequenziell: Auf kleinen Render-Instanzen darf
-        # nie mehr als ein Portal gleichzeitig einen Browser starten.
-        for job in work:
-            source = job[0]
-            try:
-                source, profile_ids, listings = _run_job(job)
+        # Ein Scrapy-Prozess pro kompletter Scan. Alle Portal-Spider laufen
+        # darin, damit der Twisted-Reactor nicht mehrfach gestartet werden muss.
+        try:
+            all_results = run_scrapy_jobs(work)
+            for job, (profile_ids, listings) in zip(work, all_results):
+                source = job[0]
                 log.info(
-                    "[%s] Portal OK: %d Listings, Profile: %s",
+                    "[%s] Scrapy-Portal OK: %d Listings, Profile: %s",
                     source, len(listings), sorted(profile_ids),
                 )
                 if not listings:
                     source_empty.append(source)
                 total += len(listings)
                 source_counts[source] += len(listings)
-                all_results.append((profile_ids, listings))
-            except Exception:
-                log.exception("[%s] Portal fehlgeschlagen", source)
-                source_errors.append(source)
+        except Exception:
+            log.exception("Scrapy-Gesamtlauf fehlgeschlagen")
+            source_errors.extend(sorted({job[0] for job in work}))
+            all_results = []
 
         # Cross-source in-memory dedupe. DB uniqueness remains the final guard.
         seen = set()
@@ -308,6 +322,7 @@ def worker_loop():
         "Konfiguration: DATABASE_URL=%s, TELEGRAM=%s, POLL=%ss, MIN_NOTIFY_SCORE=%s",
         "gesetzt" if os.getenv("DATABASE_URL") else "FEHLT",
         "gesetzt" if os.getenv("TELEGRAM_BOT_TOKEN") else "nicht gesetzt",
+        "gesetzt" if email_configured() else "nicht gesetzt",
         POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
     )
     log.info(

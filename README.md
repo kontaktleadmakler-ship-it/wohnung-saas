@@ -1,128 +1,157 @@
-# Wohnungsradar-Bot
+# Wohnungsradar – deutsche Immobilien-Scraping-Anwendung
 
-Kombiniert Scraper, Normalizer, Profil-Matcher, Duplikat-Check (SQLite) und
-Telegram-Notifier zu einem einzigen, automatisch laufenden Projekt.
+Flask-Dashboard + PostgreSQL + Playwright/BeautifulSoup + periodischer Scan + Telegram- und E-Mail-Benachrichtigungen.
 
-**Architektur:** `Scraper → Normalizer → Profil-Matcher → Duplikat-Check (SQLite) → Notifier (Telegram)`,
-alle 15 Minuten (konfigurierbar) via Hintergrund-Scheduler ausgeführt. Ein
-FastAPI-Healthendpoint läuft parallel dazu.
+## Enthaltene Quellen
 
-## Wichtige Annahme zu den Eingabe-Komponenten
+- eBay Kleinanzeigen
+- ImmobilienScout24
+- Immowelt
+- Immonet
+- WG-Gesucht
+- meinestadt.de
+- Kalaydo
 
-`scrapy-master.zip` enthielt beim Zusammenführen den unveränderten
-Quellcode des allgemeinen Scrapy-Frameworks (keine wohnungsspezifischen
-Spiders). Als tatsächliche, funktionsfähige Scraper-Komponente wurde daher
-die bereits vorhandene, portal-spezifische Scraping-Logik aus
-`wohnung-saas-main` (Playwright + BeautifulSoup, Portale: Kleinanzeigen,
-ImmoScout24, Immowelt, WG-Gesucht) übernommen und auf die geforderte
-Architektur (SQLite statt Postgres, profiles.json, FastAPI, Scheduler statt
-Flask-Dashboard) portiert. Dies ist als Kommentar in `app/scrapers/sites.py`
-dokumentiert. Weitere Portale lassen sich nach demselben Muster als neue
-`BaseScraper`-Subklasse ergänzen.
+Die aktiven Scraper liegen ausschließlich in `scrapers/sites.py`; alte, nicht von `registry.py` geladene Adapter-Dateien wurden entfernt.
 
-## Projektstruktur
+Die Scraper benutzen eine plattformspezifische URL-/Link-Strategie, mehrere Selektoren und danach einen generischen DOM-Fallback. Pro URL wird ein Fehler isoliert. Playwright wartet mindestens 10 Sekunden auf clientseitig gerenderte Inhalte und versucht übliche Cookie-Dialoge zu akzeptieren.
 
-```
-wohnungsradar-bot/
-├── main.py                    # Startet Scheduler-Thread + FastAPI
-├── profiles.json              # Suchprofile (leicht erweiterbar)
-├── requirements.txt
-├── .env.example
-├── Dockerfile
-├── docker-compose.yml
-├── data/                      # SQLite-DB (Volume)
-├── logs/                      # Logdatei (Volume)
-└── app/
-    ├── config.py               # Zentrale Konfiguration aus ENV
-    ├── logging_setup.py        # Logging in Datei + Konsole
-    ├── models.py                # Listing / SearchParams
-    ├── db.py                    # SQLite: Duplikat-Check, Matches, Scan-Log
-    ├── matching.py               # Score-basiertes Profil-Matching
-    ├── normalizer.py             # Roh-Listing -> einheitliches Schema
-    ├── notifier.py                # Telegram-Versand
-    ├── profiles.py                 # profiles.json laden
-    ├── pipeline.py                  # Orchestriert einen Scan-Durchlauf
-    ├── scheduler.py                  # Alle X Minuten automatisch
-    ├── api.py                         # FastAPI: /health, /scan, /matches
-    └── scrapers/
-        ├── base.py                    # Basisklasse: Playwright, Retry, Fehlerbehandlung
-        ├── sites.py                    # Portal-spezifische Scraper
-        └── registry.py                  # Quelle -> Scraper-Klasse
-```
+**Pagination:** Jede Such-URL wird bis zu `SCRAPE_MAX_PAGES` (Standard 3) Seiten weit verfolgt und stoppt automatisch, sobald eine Seite keine neuen Inserate mehr liefert – das war der Hauptgrund, warum Profile bisher oft nur eine Handvoll Wohnungen sahen (die meisten Portale zeigen ca. 20 Treffer pro Seite). Der Seitenparameter ist pro Scraper in `scrapers/sites.py` konfigurierbar (`PAGE_PARAM`); für ImmoScout24 ist `pagenumber` hinterlegt, eBay Kleinanzeigen überschreibt `build_page_url` und nutzt stattdessen `seite:N` im Pfad, alle anderen nutzen aktuell den generischen `?page=N`-Fallback. **Wichtig:** Diese Parameter konnten in dieser Umgebung nicht gegen die echten Portale verifiziert werden (kein Netzwerkzugriff auf Immobilienportale). Ein falscher Parameter führt nicht zu Fehlern – das Portal liefert dann einfach wiederholt Seite 1, die per Deduplizierung verworfen wird –, sollte aber nach dem Deployment anhand der Logs (`Seite N - X Kandidaten (Y neu)`) geprüft und bei Bedarf angepasst werden.
 
-## Suchprofile (`profiles.json`)
+**Wichtiger aktueller Hinweis:** Die öffentlich erreichbare Kalaydo-Präsenz ist inzwischen primär eine Jobbörse. Der Kalaydo-Adapter ist deshalb absichtlich fehlertolerant und erzeugt keine erfundenen Immobilienangebote. Wenn Kalaydo wieder eine öffentliche Wohnimmobilien-Suche anbietet, muss nur die URL-Konfiguration in `scrapers/sites.py` angepasst werden.
 
-Jedes Profil ist ein JSON-Objekt:
-
-```json
-{
-  "name": "Berlin Moabit 2-3 Zimmer",
-  "max_price": 1200,
-  "min_size": 55,
-  "min_rooms": 2,
-  "plz_list": ["105", "106", "134"],
-  "radius_km": 5,
-  "must_have": [],
-  "nice_to_have": ["balkon", "einbauküche"],
-  "sources": ["kleinanzeigen", "immoscout24", "immowelt", "wg_gesucht"],
-  "locations": ["Berlin"],
-  "active": true
-}
-```
-
-- `plz_list` wird als Liste akzeptabler **PLZ-Präfixe** behandelt (Ersatz für
-  eine echte Umkreissuche, siehe Kommentar in `app/matching.py`).
-- `must_have` = harter Ausschluss, wenn ein Begriff fehlt.
-- `nice_to_have` = Score-Bonus, kein Ausschlusskriterium.
-- `active: false` deaktiviert ein Profil, ohne es zu löschen.
-
-## Setup: lokal
+## Lokal starten
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+# Windows: .venv\\Scripts\\activate
+# Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
-playwright install --with-deps chromium
-cp .env.example .env   # danach TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID eintragen
-python main.py
+playwright install chromium
 ```
 
-## Setup: Docker (empfohlen)
+Benötigt wird PostgreSQL. Danach setzen:
+
+```text
+DATABASE_URL=postgresql://...
+SECRET_KEY=ein-langes-zufälliges-secret
+APP_PASSWORD=dashboard-passwort
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+POLL_INTERVAL_SECONDS=300
+MIN_NOTIFY_SCORE=75
+PLAYWRIGHT_BROWSERS_PATH=0
+MAX_CONCURRENT_SCRAPERS=1
+DASHBOARD_LIMIT=300
+```
+
+Web:
 
 ```bash
-cp .env.example .env   # danach TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID eintragen
-docker compose up --build -d
+python app.py
 ```
 
-Das ist der **einzige Startbefehl**, der alles hochfährt: Container baut,
-installiert Playwright/Chromium, startet Scheduler + FastAPI, mountet
-`data/`, `logs/` und `profiles.json` als Volumes.
-
-## Prüfen, ob es läuft
+Worker:
 
 ```bash
-curl http://localhost:8000/health      # Status + letzter Scan
-curl -X POST http://localhost:8000/scan  # Scan sofort manuell auslösen
-curl http://localhost:8000/matches     # letzte Treffer
-docker compose logs -f                 # Live-Logs
+python scraper.py
 ```
 
-## Fehlerbehandlung (bereits eingebaut)
+## Render
 
-- **Scraper-Ausfall / Portal-Änderung:** Jede Quelle läuft in einem eigenen
-  `try/except` in `pipeline.py` – ein kaputtes Portal beendet nicht den
-  gesamten Scan. Zusätzlich hat `base.py` einen adaptiven Fallback-Parser,
-  falls die üblichen CSS-Selektoren wegen eines Redesigns ins Leere laufen.
-- **Rate-Limits (403/429):** Automatischer Retry mit exponentiellem Backoff
-  (`SCRAPE_RETRIES`, Standard 3 Versuche) in `base.py::_load_with_retry`.
-- **Duplikate:** `UNIQUE(source, external_id)` in SQLite + zusätzlicher
-  In-Memory-Fingerprint-Check pro Scan-Lauf (`matching.listing_fingerprint`).
-- **Telegram nicht erreichbar:** Match wird trotzdem gespeichert, `notified`
-  bleibt `false` → wird beim nächsten Scan automatisch erneut versucht.
-- **Logging:** Alles geht sowohl auf die Konsole (`docker compose logs`) als
-  auch in `logs/wohnungsradar.log` (rotierend, max. 3× 5 MB).
+Das Repository enthält `render.yaml` mit zwei Services:
 
-## Konfiguration (`.env`)
+1. `wohnung-saas-web` – Flask-Dashboard
+2. `wohnung-saas-worker` – periodischer Scraper
 
-Siehe `.env.example` – u.a. `POLL_INTERVAL_MINUTES` (Standard 15),
-`MIN_NOTIFY_SCORE` (Standard 70), `MAX_CANDIDATES_PER_SOURCE` als
-Speicher-Sicherheitslimit pro Portal und Scan.
+Beide installieren Chromium über `playwright install --with-deps chromium`. Die Datenbanktabellen werden einmalig beim Prozessstart initialisiert; Healthchecks verwenden denselben Cache. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` Pflicht. Für den eingebetteten Flask-Scan-Thread sollte ein einzelner Web-Worker verwendet werden.
+
+### Render-Variablen
+
+`DATABASE_URL`, `SECRET_KEY`, `APP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL_SECONDS`, `MIN_NOTIFY_SCORE`, `PLAYWRIGHT_BROWSERS_PATH`.
+
+Für E-Mail über SMTP zusätzlich: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`, optional `SMTP_USE_TLS=true`.
+Telegram und E-Mail werden unabhängig voneinander als zugestellt gespeichert. Fällt ein Kanal vorübergehend aus, wird nur dieser Kanal beim nächsten passenden Scan erneut versucht.
+
+### Warum keine Treffer?
+
+Empfohlene Reihenfolge zum Eingrenzen:
+
+1. **`/diagnose` im Dashboard aufrufen.** Zeigt Setup-Stats, Worker-Heartbeat, alle aktiven Profile mit ihren Quellen/Regionen und die daraus tatsächlich gebauten Such-URLs (ohne Playwright, ohne Portal-Request).
+2. **`/healthz` aufrufen.** Enthält neben `active_profiles`/`profiles_with_sources`/`scan_runs` auch `worker_last_seen_seconds_ago`, `worker_poll_interval_seconds` und `worker_pid`. Ist `worker_last_seen_seconds_ago` groß oder `null`, läuft der eingebettete Hintergrundscan nicht.
+3. Erst danach die Render-Logs prüfen.
+
+Häufige Ursachen im Detail:
+
+- Der Hintergrundscan läuft im selben Render-Web-Service wie das Dashboard. In den Logs muss beim Start `Eingebetteter Scan-Thread gestartet` erscheinen.
+- `LOG_LEVEL=INFO` muss in beiden Services gesetzt sein. `DEBUG` ist deutlich lauter; `WARNING` oder `ERROR` schneidet die Scraper- und Funnel-Logs komplett ab, die zeigen, warum ein Scan 0 Treffer liefert.
+- Ist `profiles_with_sources` 0, wurde im Dashboard noch keinem Profil eine Quelle zugewiesen - dann kann der Worker laufen, ohne je einen Job zu bauen.
+- Manche Portale liefern gegenüber Rechenzentrums-IPs (wie sie Render vergibt) andere Ergebnisse oder blockieren gelegentlich Anfragen. Das äußert sich in den Logs als leere Kandidatenlisten oder HTTP-Fehler für genau eine Quelle, während andere Quellen weiter Treffer liefern. Das Projekt implementiert bewusst keine Umgehung dafür (siehe „Rechtliches / Betrieb" unten) - bei dauerhaften Problemen mit einer einzelnen Quelle die Abruffrequenz über `SCRAPE_DELAY_MIN`/`SCRAPE_DELAY_MAX` senken oder die Quelle vorübergehend aus den Profilen entfernen.
+
+## Matching
+
+Der Score ist 0–100:
+
+- Preis 35 %
+- Zimmer 20 %
+- Größe 25 %
+- Lage 20 %
+
+Harte Ausschlüsse:
+
+- Preis > 105 % des Maximalbudgets
+- bekannte Wohnfläche unter Mindestfläche
+- Zimmer unter Mindestzimmerzahl
+- Zimmer über konfiguriertem Maximum
+- Ausschlussbegriffe in Titel/Beschreibung/Lage
+
+Inserate bis 5 % über dem Budget bleiben erhalten, erhalten aber einen linear reduzierten Preis-Score.
+
+## Datenbank
+
+`profiles`, `listings`, `matches`, `profile_sources`, `profile_regions` werden automatisch erzeugt. Listings sind über `(source, external_id)` eindeutig. Zusätzlich existieren Indizes für Quelle, Aktualität, Profil und Score.
+
+Ein PostgreSQL-Advisory-Lock verhindert parallele Scans, z. B. wenn ein manueller Scan und der Hintergrundscan zeitgleich starten.
+
+## Selektoren anpassen
+
+Die Plattform-spezifische Konfiguration befindet sich zentral in `scrapers/sites.py`:
+
+- `CARD_SELECTORS`
+- `LINK_SELECTORS`
+- `build_search_urls()`
+- `is_listing_href()`
+
+Wenn eine Plattform ihre CSS-Klassen ändert, versucht der gemeinsame Parser zuerst die bekannten Selektoren und danach einen adaptiven Fallback über semantische Listing-URLs, Preis-/m²-/Zimmer-Muster und JSON-LD.
+
+## Test
+
+Der mitgelieferte Smoke-Test benötigt keine externe Website und prüft Datenmodell, Matching und den adaptiven Parser:
+
+```bash
+python test_smoke.py
+```
+
+Ein echter Live-Scan muss in der Zielumgebung ausgeführt werden, weil einige Portale Bot-Schutz, Geobeschränkungen oder dynamische Inhalte verwenden. Der Code beendet bei einem Portalfehler niemals den gesamten Lauf.
+
+Zum Prüfen, welche aktiven Profile es gibt und welche Such-URLs daraus gebaut würden - ganz ohne Playwright oder Portal-Requests:
+
+```bash
+python scraper.py --dry-run
+```
+
+Das ist der schnellste Weg zu sehen, ob ein Profil überhaupt zu Jobs führt, bevor man einen vollen Scan abwartet.
+
+## Rechtliches / Betrieb
+
+Nur öffentlich zugängliche Inhalte abrufen, Nutzungsbedingungen und Robots-/Zugriffsregeln der jeweiligen Plattform beachten und die Abruffrequenz niedrig halten. Dieses Projekt enthält keine CAPTCHA-, Login- oder Anti-Bot-Umgehung.
+
+
+## Betriebshinweise
+
+- `DASHBOARD_LIMIT` steuert die maximale Anzahl der Treffer im Dashboard (Standard 300).
+- `MAX_CONCURRENT_SCRAPERS=1` ist der speichersichere Standard für kleine Render-Instanzen. Höhere Werte sind bewusst eine Betriebsentscheidung.
+- Ein `DE`-Profil wird bei den Scrapers als `SearchParams.nationwide=True` behandelt und nicht auf Berlin zurückgefallen. Regionale Profile ohne Districts werden über 2–3 große Städte je Bundesland als Suchanker aufgebaut; explizite Districts haben Vorrang.
+- Cookie-Consent wird zusätzlich in gängigen Consent-iframes versucht, damit eingebettete Banner die Extraktion nicht blockieren.
+- Der Scan-Thread läuft im Web-Prozess. Bei mehreren Gunicorn-Workern ist der Laufstatus deshalb nicht global; der PostgreSQL-Advisory-Lock verhindert jedoch parallele Scans. Für den integrierten Thread `python app.py` bzw. einen einzelnen Web-Worker verwenden.
+- **Entscheidung offen: Kalaydo/Immonet.** Beide bleiben vorerst in `SOURCE_CLASSES` und fehlertolerant. Kalaydo ist aktuell primär Jobbörse; Immonet ist weitgehend in Immowelt konsolidiert. Sie wurden bewusst nicht entfernt, damit eine spätere Reaktivierung per Konfiguration möglich bleibt. Die endgültige Entfernung sollte erst nach einem echten Produktionsscan bzw. einer bewussten Konfigurationsentscheidung erfolgen.
