@@ -35,19 +35,18 @@ def run_jobs(jobs):
             "TELNETCONSOLE_ENABLED":False,"REQUEST_FINGERPRINTER_IMPLEMENTATION":REQUEST_FINGERPRINTER_IMPLEMENTATION,
         }
         process=CrawlerProcess(settings=settings)
-        # IMPORTANT: CrawlerProcess.crawl(...) returns a Twisted Deferred,
-        # not the Crawler instance.  Keep the actual Crawler objects so that
-        # stats/spider state can be inspected after the reactor has finished.
-        # This fixes the previous "Deferred has no attribute stats" failure,
-        # which made every otherwise-running source look like zero results.
+        # CrawlerProcess.crawl(...) returns a Twisted Deferred, not the
+        # Crawler instance. Keep the real crawler so stats/spider state can
+        # be inspected after process.start(). This also prevents a successful
+        # crawl from being reported as a source failure.
         crawlers=[]
         for job in jobs:
             cls=SPIDER_CLASSES[job["source"]]
             crawler=process.create_crawler(cls)
-            process.crawl(crawler, start_urls=job.get("urls",[]),
+            crawlers.append((job,crawler))
+            process.crawl(crawler,start_urls=job.get("urls",[]),
                           max_pages=job.get("max_pages"),
                           job_id=job.get("job_id"))
-            crawlers.append((job,crawler))
         try:
             process.start(stop_after_crawl=True,installSignalHandlers=False)
         except Exception:

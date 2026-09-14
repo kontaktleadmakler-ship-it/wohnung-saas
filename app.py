@@ -207,7 +207,14 @@ def _heartbeat_status():
 
     import datetime
 
-    age = (datetime.datetime.now(datetime.timezone.utc) - hb["last_seen_at"]).total_seconds()
+    # PyMongo/BSON returns datetime values as naive UTC datetimes by default.
+    # Normalize both forms to timezone-aware UTC before subtraction.
+    last_seen_at = hb.get("last_seen_at")
+    if last_seen_at.tzinfo is None:
+        last_seen_at = last_seen_at.replace(tzinfo=datetime.timezone.utc)
+    else:
+        last_seen_at = last_seen_at.astimezone(datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - last_seen_at).total_seconds()
     interval = hb.get("poll_interval_seconds") or worker.POLL_INTERVAL_SECONDS
 
     if age < 1.5 * interval:
@@ -466,7 +473,14 @@ def healthz():
             hb = None
         if hb and hb.get("last_seen_at"):
             import datetime
-            age = (datetime.datetime.now(datetime.timezone.utc) - hb["last_seen_at"]).total_seconds()
+            # PyMongo/BSON returns datetime values as naive UTC datetimes by default.
+            # Normalize both forms to timezone-aware UTC before subtraction.
+            last_seen_at = hb.get("last_seen_at")
+            if last_seen_at.tzinfo is None:
+                last_seen_at = last_seen_at.replace(tzinfo=datetime.timezone.utc)
+            else:
+                last_seen_at = last_seen_at.astimezone(datetime.timezone.utc)
+            age = (datetime.datetime.now(datetime.timezone.utc) - last_seen_at).total_seconds()
             payload["worker_last_seen_seconds_ago"] = round(age, 1)
             payload["worker_poll_interval_seconds"] = hb.get("poll_interval_seconds")
             payload["worker_pid"] = hb.get("pid")
