@@ -75,6 +75,23 @@ def init_db():
             cur.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS email_notified BOOLEAN NOT NULL DEFAULT FALSE")
         c.commit()
 
+def cleanup_old_listings(days=60):
+    """Löscht Inserate (und über CASCADE ihre Matches), die seit `days`
+    Tagen in keinem Scan mehr gesehen wurden (last_seen). Reduziert die
+    Speichermenge und begrenzt, wie lange potenziell personenbezogene
+    Felder (contact_name/contact_phone) vorgehalten werden."""
+    days = max(1, int(days))
+    with get_connection() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "DELETE FROM listings WHERE last_seen < NOW() - (%s * INTERVAL '1 day')",
+                (days,),
+            )
+            deleted = cur.rowcount
+        c.commit()
+    return deleted
+
+
 def cleanup_scan_runs(days=30):
     """Entfernt alte Scan-Läufe separat von der Schema-Initialisierung."""
     # Die Retention bleibt aus init_db herausgelöst, damit Web und Worker

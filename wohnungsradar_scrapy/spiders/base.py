@@ -1,10 +1,27 @@
 from __future__ import annotations
-import logging, os, re
+import logging, os, random, re
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 import scrapy
 from scrapy_playwright.page import PageMethod
 from ..items import ApartmentItem
 from ..parsing import node_text, clean_text, canonical_url, external_id_from_url, parse_rents, parse_rooms, parse_size, parse_location, parse_number, jsonld_objects, jsonld_to_raw
+
+# Text markers that indicate a bot-check/interstitial page rather than a
+# genuine "0 results" search page. Kept case-insensitive and portal-agnostic
+# on purpose: these are the standard phrasings used by Cloudflare/PerimeterX
+# style challenges and the German equivalents portals show.
+BLOCK_PAGE_MARKERS = (
+    "bestätigen sie, dass sie kein roboter",
+    "sind sie ein mensch",
+    "verify you are human",
+    "checking your browser",
+    "attention required! | cloudflare",
+    "just a moment...",
+    "captcha",
+    "access denied",
+    "unusual traffic",
+    "automatisierte anfragen",
+)
 
 class PortalSpider(scrapy.Spider):
     source_key=""
@@ -33,13 +50,23 @@ class PortalSpider(scrapy.Spider):
         self.max_pages=max(1,int(max_pages if max_pages is not None else os.getenv("SCRAPE_MAX_PAGES","3")))
         self._seen_urls=set(); self._seen_pages=set()
         self.page_errors=0; self.pages_seen=0
+        self.blocked_pages=0
+        self._first_page_url_set=None
 
     def start_requests(self):
         for u in self.start_urls:
             yield self._request(u,1)
 
+    def _pick_user_agent(self):
+        pool=list(getattr(self,"settings",None).get("USER_AGENT_POOL") or []) if getattr(self,"settings",None) else []
+        if not pool:
+            return None
+        return random.choice(pool)
+
     def _request(self,url,page_number):
         meta={"page_number":page_number}
+        ua=self._pick_user_agent()
+        headers={"User-Agent":ua} if ua else None
         if self.use_playwright:
             meta.update({"playwright":True,"playwright_page_methods":[
                 PageMethod("wait_for_timeout",1200),
@@ -61,7 +88,7 @@ class PortalSpider(scrapy.Spider):
                 PageMethod("evaluate","window.scrollTo(0, document.body.scrollHeight)"),
                 PageMethod("wait_for_timeout",800),
             ]})
-        return scrapy.Request(url,callback=self.parse,errback=self.errback,meta=meta,dont_filter=True)
+        return scrapy.Request(url,callback=self.parse,errback=self.errback,meta=meta,headers=headers,dont_filter=True)
 
     def build_page_url(self, base_url, page):
         if page<=1: return base_url
@@ -70,21 +97,52 @@ class PortalSpider(scrapy.Spider):
     def _build_page_url(self,base_url,page):
         return None
 
+    def _looks_blocked(self,response):
+        body=(response.text or "")[:20000].casefold()
+        return any(marker in body for marker in BLOCK_PAGE_MARKERS)
+
     def parse(self,response):
         self.pages_seen += 1
         page_number=int(response.meta.get("page_number",1))
         cards=self.parse_listing_cards(response)
+        if not cards and self._looks_blocked(response):
+            self.blocked_pages += 1
+            # Reuse the existing page_errors counter so this also shows up
+            # as "source_errors" in the scan funnel (scraper.py), not just
+            # in the raw logs - a blocked source should look different from
+            # a source that legitimately had zero matches.
+            self.page_errors += 1
+            self.logger.error(
+                "[%s] Seite %d sieht wie eine Bot-Check-/Block-Seite aus (0 Kandidaten, "
+                "Marker gefunden) - vermutlich blockiert, nicht wirklich leer.",
+                self.source_key, page_number,
+            )
+            return
         new=0
+        page_urls=set()
         for raw in cards:
             try:
                 item=self.normalize_card(raw,response)
                 if not item: continue
+                page_urls.add(item["url"])
                 if item["url"] in self._seen_urls: continue
                 self._seen_urls.add(item["url"]); new += 1
                 yield item
             except Exception:
                 self.logger.exception("[%s] Listing konnte nicht normalisiert werden",self.source_key)
         self.logger.info("[%s] Seite %d: %d Kandidaten, %d neu",self.source_key,page_number,len(cards),new)
+
+        if page_number==1:
+            self._first_page_url_set=page_urls
+        elif page_urls and self._first_page_url_set and page_urls==self._first_page_url_set:
+            # Same exact set of listing URLs as page 1 => the pagination
+            # parameter for this portal is very likely wrong and every
+            # "next page" request just re-fetches page 1 under the hood.
+            self.logger.warning(
+                "[%s] Seite %d liefert exakt dieselben Treffer wie Seite 1 - "
+                "Pagination-Parameter vermutlich falsch konfiguriert.",
+                self.source_key, page_number,
+            )
 
         next_url=self.next_page_url(response,page_number,len(cards),new)
         if next_url and page_number<self.max_pages:

@@ -36,6 +36,11 @@ def _locations(params):
 
 class ScrapyPortalAdapter:
     SOURCE_KEY=""; SOURCE_LABEL=""; BASE_URL=""; SPIDER=None
+    # False hides the source from the selectable list in the profile form
+    # (scrapers/registry.py::list_sources). Used for adapters that cannot
+    # currently build any real search URL, so users can't silently pick a
+    # source that will never return results.
+    AVAILABLE=True
     def build_search_urls(self, params): raise NotImplementedError
     def run(self, params):
         urls=self.build_search_urls(params)
@@ -118,6 +123,7 @@ class MeinestadtAdapter(ScrapyPortalAdapter):
 
 class KalaydoAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="kalaydo"; SOURCE_LABEL="Kalaydo"; BASE_URL="https://www.kalaydo.de"
+    AVAILABLE=False
     def build_search_urls(self,p):
         # The current site is primarily jobs/classified content; don't invent
         # residential results when no verified residential search exists.

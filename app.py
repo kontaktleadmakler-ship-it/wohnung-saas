@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import secrets
@@ -232,7 +233,7 @@ _maybe_start_background_scanner()
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        if not APP_PASSWORD or request.form.get("password", "") == APP_PASSWORD:
+        if not APP_PASSWORD or hmac.compare_digest(request.form.get("password", ""), APP_PASSWORD):
             session["logged_in"] = True
             return redirect(request.args.get("next") or url_for("home"))
         return render_template("login.html", error="Falsches Passwort")

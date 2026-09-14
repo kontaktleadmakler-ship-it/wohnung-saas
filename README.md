@@ -58,16 +58,16 @@ python scraper.py
 
 ## Render
 
-Das Repository enthält `render.yaml` mit einem Web-Service:
+Das Repository enthält `render.yaml` mit zwei Services:
 
-1. `wohnung-saas-web` – Flask-Dashboard
-2. `wohnung-saas-worker` – periodischer Scraper
+1. `wohnung-saas-web` – Flask-Dashboard. Darf auf dem Free-Tier nach 15 Minuten ohne Traffic einschlafen; das betrifft nur die Anzeige, nicht mehr das Scanning.
+2. `wohnung-saas-cron` – **Render Cron Job**, führt `python scraper.py --once` auf einem festen Zeitplan (Standard: alle 10 Minuten) aus. Läuft unabhängig vom Web-Traffic und schläft nicht ein – ein externer Keep-Alive-Ping (z. B. UptimeRobot) ist dafür nicht mehr nötig. `ENABLE_AUTO_SCAN` im Web-Service ist deshalb standardmäßig `false`; wird der Cron-Service nicht verwendet, kann es zurück auf `true` gesetzt werden, um stattdessen den alten eingebetteten Hintergrundscan zu nutzen.
 
-Der Web-Service installiert Chromium über `playwright install --with-deps chromium`. Die Datenbanktabellen werden einmalig beim Prozessstart initialisiert; Healthchecks verwenden denselben Cache. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` Pflicht. Für den eingebetteten Flask-Scan-Thread sollte ein einzelner Web-Worker verwendet werden.
+Beide Services installieren Chromium über `playwright install --with-deps chromium` und teilen sich denselben Postgres-Advisory-Lock (`db.py`), sodass sich ein manueller Dashboard-Scan und ein zeitgleicher Cron-Lauf nicht überschneiden. Die Datenbanktabellen werden beim Prozessstart einmalig initialisiert. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` im Web-Service Pflicht.
 
 ### Render-Variablen
 
-`DATABASE_URL`, `SECRET_KEY`, `APP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL_SECONDS`, `MIN_NOTIFY_SCORE`, `PLAYWRIGHT_BROWSERS_PATH`.
+`DATABASE_URL`, `SECRET_KEY` (nur Web), `APP_PASSWORD` (nur Web), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL_SECONDS`, `MIN_NOTIFY_SCORE`, `PLAYWRIGHT_BROWSERS_PATH`, `LISTING_RETENTION_DAYS` (Standard 60 – nach so vielen Tagen ohne erneute Sichtung werden alte Inserate inkl. Matches automatisch gelöscht).
 
 Für E-Mail über SMTP zusätzlich: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`, optional `SMTP_USE_TLS=true`.
 Telegram und E-Mail werden unabhängig voneinander als zugestellt gespeichert. Fällt ein Kanal vorübergehend aus, wird nur dieser Kanal beim nächsten passenden Scan erneut versucht.
@@ -82,10 +82,11 @@ Empfohlene Reihenfolge zum Eingrenzen:
 
 Häufige Ursachen im Detail:
 
-- Der Hintergrundscan läuft im selben Render-Web-Service wie das Dashboard. In den Logs muss beim Start `Eingebetteter Scan-Thread gestartet` erscheinen.
+- Standardmäßig läuft der Scan im `wohnung-saas-cron`-Service, nicht mehr im Web-Prozess. In dessen Logs muss `SCRAPER: --once started` bzw. `SCRAPER: --once completed` erscheinen. Nur wenn `ENABLE_AUTO_SCAN=true` im Web-Service gesetzt ist, läuft stattdessen der ältere eingebettete Thread (`Eingebetteter Scan-Thread gestartet`).
 - `LOG_LEVEL=INFO` muss in beiden Services gesetzt sein. `DEBUG` ist deutlich lauter; `WARNING` oder `ERROR` schneidet die Scraper- und Funnel-Logs komplett ab, die zeigen, warum ein Scan 0 Treffer liefert.
-- Ist `profiles_with_sources` 0, wurde im Dashboard noch keinem Profil eine Quelle zugewiesen - dann kann der Worker laufen, ohne je einen Job zu bauen.
-- Manche Portale liefern gegenüber Rechenzentrums-IPs (wie sie Render vergibt) andere Ergebnisse oder blockieren gelegentlich Anfragen. Das äußert sich in den Logs als leere Kandidatenlisten oder HTTP-Fehler für genau eine Quelle, während andere Quellen weiter Treffer liefern. Das Projekt implementiert bewusst keine Umgehung dafür (siehe „Rechtliches / Betrieb" unten) - bei dauerhaften Problemen mit einer einzelnen Quelle die Abruffrequenz über `SCRAPE_DELAY_MIN`/`SCRAPE_DELAY_MAX` senken oder die Quelle vorübergehend aus den Profilen entfernen.
+- Ist `profiles_with_sources` 0, wurde im Dashboard noch keinem Profil eine Quelle zugewiesen - dann kann der Cron-Job laufen, ohne je einen Job zu bauen.
+- Manche Portale liefern gegenüber Rechenzentrums-IPs (wie sie Render vergibt) andere Ergebnisse oder blockieren gelegentlich Anfragen (403/429, oder eine Bot-Check-Zwischenseite). Ein Spider-Log `sieht wie eine Bot-Check-/Block-Seite aus` unterscheidet das explizit von einem echten "0 Treffer"-Ergebnis. Das Projekt implementiert bewusst keine aktive Umgehung (kein Captcha-Solving, kein Proxy-Dienst) - bei dauerhaften Problemen mit einer einzelnen Quelle die Abruffrequenz über `SCRAPE_DELAY_MIN`/`SCRAPE_DELAY_MAX` senken oder die Quelle vorübergehend aus den Profilen entfernen.
+- Ein Warn-Log `liefert exakt dieselben Treffer wie Seite 1` deutet auf einen falsch konfigurierten Pagination-Parameter für dieses Portal hin (siehe `wohnungsradar_scrapy/spiders/portals.py`).
 
 ## Matching
 
@@ -114,14 +115,12 @@ Ein PostgreSQL-Advisory-Lock verhindert parallele Scans, z. B. wenn ein manuelle
 
 ## Selektoren anpassen
 
-Die Plattform-spezifische Konfiguration befindet sich zentral in `scrapers/sites.py`:
+Die Plattform-spezifische Konfiguration befindet sich in zwei Dateien:
 
-- `CARD_SELECTORS`
-- `LINK_SELECTORS`
-- `build_search_urls()`
-- `is_listing_href()`
+- `wohnungsradar_scrapy/adapters.py` – `build_search_urls()` pro Portal (welche URLs überhaupt angefragt werden). Ein Adapter mit `AVAILABLE=False` (aktuell: Kalaydo) wird im Profil-Formular nicht als Quelle angeboten, weil er keine echte Such-URL bauen kann.
+- `wohnungsradar_scrapy/spiders/portals.py` – `card_selectors`, `link_selectors`, `is_listing_href()`, Pagination (`_build_page_url()`) pro Portal.
 
-Wenn eine Plattform ihre CSS-Klassen ändert, versucht der gemeinsame Parser zuerst die bekannten Selektoren und danach einen adaptiven Fallback über semantische Listing-URLs, Preis-/m²-/Zimmer-Muster und JSON-LD.
+Wenn eine Plattform ihre CSS-Klassen ändert, versucht der gemeinsame Parser (`wohnungsradar_scrapy/spiders/base.py`) zuerst die bekannten Selektoren und danach einen adaptiven Fallback über semantische Listing-URLs, Preis-/m²-/Zimmer-Muster und JSON-LD. Zusätzlich rotiert er den User-Agent pro Request aus `USER_AGENT_POOL` (`wohnungsradar_scrapy/settings.py`) und erkennt gängige Bot-Check-/Captcha-Zwischenseiten anhand von Textmarkern (`BLOCK_PAGE_MARKERS`).
 
 ## Test
 

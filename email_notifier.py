@@ -28,7 +28,7 @@ def is_configured() -> bool:
     return bool(SMTP_HOST and EMAIL_FROM and EMAIL_TO)
 
 
-def send_email(subject: str, text: str, html: str | None = None) -> bool:
+def send_email(subject: str, text: str, html_body: str | None = None) -> bool:
     """Send one e-mail. Returns False when not configured or on SMTP errors."""
     if not is_configured():
         return False
@@ -38,8 +38,8 @@ def send_email(subject: str, text: str, html: str | None = None) -> bool:
     message["From"] = EMAIL_FROM
     message["To"] = EMAIL_TO
     message.set_content(text)
-    if html:
-        message.add_alternative(html, subtype="html")
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
 
     try:
         if SMTP_USE_TLS:

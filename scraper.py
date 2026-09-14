@@ -341,6 +341,12 @@ def worker_loop():
     )
     db.init_db()
     db.cleanup_scan_runs()
+    try:
+        deleted = db.cleanup_old_listings(days=int(os.getenv("LISTING_RETENTION_DAYS", "60")))
+        if deleted:
+            log.info("Retention: %d alte Inserate entfernt", deleted)
+    except Exception:
+        log.exception("Retention für alte Inserate fehlgeschlagen")
     log.info("DB initialisiert, Retention aufgeräumt - erster Scan startet in Kürze")
     while True:
         started = time.monotonic()
@@ -385,6 +391,13 @@ def run_once_and_heartbeat(profile_id=None):
     try:
         db.init_db()
         log.info("SCRAPER: DB initialized")
+        try:
+            db.cleanup_scan_runs()
+            deleted = db.cleanup_old_listings(days=int(os.getenv("LISTING_RETENTION_DAYS", "60")))
+            if deleted:
+                log.info("SCRAPER: Retention entfernte %d alte Inserate", deleted)
+        except Exception:
+            log.exception("SCRAPER: Retention fehlgeschlagen")
         profiles = db.get_active_profiles_with_sources()
         log.info("SCRAPER: active profiles with sources=%d", len(profiles))
         result = run_once(profile_id=profile_id)

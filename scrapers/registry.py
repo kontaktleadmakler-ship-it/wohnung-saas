@@ -11,7 +11,14 @@ def get_scraper(source_key):
 
 
 def list_sources():
+    """Sources selectable in the profile form.
+
+    Adapters with AVAILABLE=False (e.g. Kalaydo, which currently cannot
+    build any real search URL) are excluded so users can't pick a source
+    that is guaranteed to return zero results.
+    """
     return [
         {"key": adapter.SOURCE_KEY, "label": adapter.SOURCE_LABEL}
         for adapter in SOURCE_REGISTRY.values()
+        if getattr(adapter, "AVAILABLE", True)
     ]

@@ -2,6 +2,7 @@ import unittest
 from scrapy.http import HtmlResponse, Request
 from wohnungsradar_scrapy.spiders.portals import KleinanzeigenSpider, ImmoScout24Spider, WgGesuchtSpider
 from wohnungsradar_scrapy.parsing import parse_rents, parse_rooms, parse_size, parse_location, canonical_url
+from scrapers.registry import list_sources
 
 class ParserTests(unittest.TestCase):
     def response(self, html, url="https://x.test/suche"):
@@ -67,4 +68,36 @@ class ParserTests(unittest.TestCase):
         response=self.response(html)
         card=s.parse_listing_cards(response)[0]
         self.assertEqual(card["href"],"https://x.test/s-anzeige/wohnung-123456")
+
+    def test_block_page_detected_instead_of_empty(self):
+        html="<html><body><h1>Bestätigen Sie, dass Sie kein Roboter sind</h1></body></html>"
+        s=KleinanzeigenSpider(start_urls=[])
+        response=self.response(html)
+        self.assertEqual(len(s.parse_listing_cards(response)),0)
+        self.assertTrue(s._looks_blocked(response))
+
+    def test_genuinely_empty_page_is_not_flagged_as_blocked(self):
+        html="<html><body><p>Keine Ergebnisse für diese Suche.</p></body></html>"
+        s=KleinanzeigenSpider(start_urls=[])
+        response=self.response(html)
+        self.assertEqual(len(s.parse_listing_cards(response)),0)
+        self.assertFalse(s._looks_blocked(response))
+
+    def test_page_identical_to_page_one_is_detected(self):
+        html="""<article class="aditem"><a href="/s-anzeige/wohnung-123456"><h2>Wohnung</h2>
+        <div class="price"><span>900</span><span>€</span></div></article>"""
+        s=KleinanzeigenSpider(start_urls=[])
+        page1=list(s.parse(self.response(html,url="https://x.test/suche")))
+        self.assertEqual(s._first_page_url_set,{"https://x.test/s-anzeige/wohnung-123456"})
+        response2=self.response(html,url="https://x.test/suche")
+        response2.meta["page_number"]=2
+        with self.assertLogs(s.name,level="WARNING") as logs:
+            list(s.parse(response2))
+        self.assertTrue(any("dieselben Treffer wie Seite 1" in m for m in logs.output))
+
+    def test_kalaydo_not_selectable(self):
+        keys=[src["key"] for src in list_sources()]
+        self.assertNotIn("kalaydo",keys)
+        self.assertIn("kleinanzeigen",keys)
+
 if __name__=="__main__": unittest.main()
