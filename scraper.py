@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections import defaultdict
 
@@ -172,6 +173,20 @@ def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
     return {"per_source": source_counts, "per_profile": funnel}
 
 
+def _scan_debug_enabled():
+    return os.getenv("SCAN_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_log_config(profiles):
+    if not _scan_debug_enabled():
+        return
+    log.info("SCAN-DEBUG: pid=%s profile_count=%d sources=%s max_pages=%s timeout=%ss",
+             os.getpid(), len(profiles),
+             sorted({src for p in profiles for src in (p.get("sources") or [])}),
+             os.getenv("SCRAPE_MAX_PAGES", "3"),
+             os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800"))
+
+
 def run_once(profile_id=None):
     """Run one scan, optionally restricted to exactly one dashboard-selected profile."""
     if profile_id is not None:
@@ -194,6 +209,8 @@ def run_once(profile_id=None):
         )
         return {"jobs": 0, "listings": 0}
 
+    _debug_log_config(profiles)
+
     lock = db.try_scan_lock()
     if not lock:
         log.warning(
@@ -201,10 +218,32 @@ def run_once(profile_id=None):
             "Worker-Service teilen sich denselben Advisory-Lock)"
         )
         return {"jobs": 0, "listings": 0, "locked": True}
-    log.info("Advisory-Lock erworben")
+    log.info("Scan-Lock erworben (Lease=%ss, renew=%ss)", db.LOCK_LEASE_SECONDS, db.LOCK_RENEW_INTERVAL_SECONDS)
+    if _scan_debug_enabled():
+        log.info("SCAN-DEBUG: lock token acquired; beginning job construction and portal execution")
 
     started = time.monotonic()
     total = 0
+    stop_lock_renewer = threading.Event()
+    lock_lost = threading.Event()
+
+    def _renew_lock_loop():
+        while not stop_lock_renewer.wait(db.LOCK_RENEW_INTERVAL_SECONDS):
+            try:
+                if not db.renew_scan_lock(lock):
+                    lock_lost.set()
+                    log.error("Scan-Lock konnte nicht erneuert werden; Lease könnte verloren sein")
+                    return
+                log.debug("Scan-Lock erneuert (Lease=%ss)", db.LOCK_LEASE_SECONDS)
+            except Exception:
+                # A transient MongoDB error should not immediately abort a
+                # running crawl; the next renewal attempt gets another chance.
+                log.exception("Scan-Lock-Erneuerung fehlgeschlagen")
+
+    lock_renewer = threading.Thread(
+        target=_renew_lock_loop, daemon=True, name="scan-lock-renewer"
+    )
+    lock_renewer.start()
 
     try:
         profiles_by_id = {p["id"]: p for p in profiles}
@@ -217,6 +256,9 @@ def run_once(profile_id=None):
                 p.get("max_rooms"), p.get("min_size"),
             )
         jobs = build_jobs(profiles)
+        if _scan_debug_enabled():
+            for (source, regions, locations), profile_ids in jobs.items():
+                log.info("SCAN-DEBUG: job source=%s profiles=%s regions=%s locations=%s", source, sorted(profile_ids), list(regions), list(locations))
         log.info(
             "Scan-Kontext: Profile=%s, Quellen=%s",
             sorted(profiles_by_id),
@@ -251,7 +293,9 @@ def run_once(profile_id=None):
         # Ein Scrapy-Prozess pro kompletter Scan. Alle Portal-Spider laufen
         # darin, damit der Twisted-Reactor nicht mehrfach gestartet werden muss.
         try:
+            log.info("SCAN-DEBUG: entering Scrapy/Playwright execution with %d job(s)", len(work))
             all_results = run_scrapy_jobs(work)
+            log.info("SCAN-DEBUG: Scrapy/Playwright returned %d result group(s)", len(all_results))
             runner_status = get_last_run_status()
             for status in runner_status:
                 if status.get("status") == "source unavailable":
@@ -322,6 +366,10 @@ def run_once(profile_id=None):
 
         return {"jobs": len(work), "listings": total, "unique": processed}
     finally:
+        stop_lock_renewer.set()
+        lock_renewer.join(timeout=2)
+        if lock_lost.is_set():
+            log.error("Scan beendet, nachdem der Scan-Lock verloren ging")
         db.release_scan_lock(lock)
 
 
@@ -458,6 +506,10 @@ if __name__ == "__main__":
             except (ValueError, IndexError):
                 log.error("--profile-id benötigt eine gültige ID")
                 raise SystemExit(2)
-        run_once_and_heartbeat(profile_id=profile_id)
+        result = run_once_and_heartbeat(profile_id=profile_id)
+        if result.get("locked"):
+            # Exit non-zero so the web supervisor does not report a blocked
+            # scan as a successful scan. 3 is reserved for lock contention.
+            raise SystemExit(3)
     else:
         worker_loop()

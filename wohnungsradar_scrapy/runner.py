@@ -8,8 +8,17 @@ from .spiders.portals import SPIDER_CLASSES
 log=logging.getLogger("wohnungsradar.scrapy")
 
 def run_jobs(jobs):
+    debug = os.getenv("SCAN_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
     jobs=[j for j in (jobs or []) if j.get("source") in SPIDER_CLASSES and j.get("urls")]
-    if not jobs: return []
+    log.info("SCRAPY-DEBUG: runner received %d valid job(s)", len(jobs))
+    if debug:
+        for job in jobs:
+            log.info("SCRAPY-DEBUG: job=%s source=%s urls=%d max_pages=%s", job.get("job_id"), job.get("source"), len(job.get("urls") or []), job.get("max_pages"))
+            for url in job.get("urls") or []:
+                log.info("SCRAPY-DEBUG: request target [%s] %s", job.get("source"), url)
+    if not jobs:
+        log.warning("SCRAPY-DEBUG: no runnable jobs (unknown source or empty URL list)")
+        return []
     with tempfile.TemporaryDirectory(prefix="wohnungsradar-scrapy-") as tmp:
         feed=Path(tmp)/"items.json"
         settings={
@@ -64,6 +73,15 @@ def run_jobs(jobs):
             pages=stats.get("response_received_count",0)
             errors=stats.get("log_count/ERROR",0)
             spider_errors = getattr(getattr(crawler, "spider", None), "page_errors", 0)
+            if debug:
+                log.info("SCRAPY-DEBUG: source=%s finish_reason=%s responses=%s errors=%s page_errors=%s stats=%s",
+                         job["source"], reason, pages, errors, spider_errors,
+                         {k: v for k, v in stats.items() if k in {
+                             "downloader/request_count", "downloader/response_count",
+                             "downloader/response_status_count/200", "downloader/response_status_count/403",
+                             "downloader/response_status_count/429", "retry/count", "item_scraped_count",
+                             "spider_exceptions/count", "finish_time", "start_time"
+                         }})
             if reason not in (None,"finished") or spider_errors:
                 log.error("[%s] Crawl nicht vollständig: reason=%s responses=%s request_errors=%s log_errors=%s",
                           job["source"],reason,pages,spider_errors,errors)

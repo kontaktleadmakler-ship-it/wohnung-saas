@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
+import uuid
 
 import certifi
 from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
@@ -22,7 +23,12 @@ def _database_name_from_uri(uri):
 
 MONGO_DB_NAME = _database_name_from_uri(MONGODB_URI)
 LOCK_KEY = "scan_lock"
-LOCK_STALE_SECONDS = 30 * 60  # Schutz gegen ewig gehaltenen Lock bei Absturz
+# MongoDB scan lock is a short renewable lease. A long fixed stale timeout
+# can leave an orphaned lock behind for 30 minutes after a deploy/crash.
+LOCK_LEASE_SECONDS = max(60, int(os.getenv("SCAN_LOCK_LEASE_SECONDS", "300")))
+LOCK_RENEW_INTERVAL_SECONDS = max(15, min(LOCK_LEASE_SECONDS // 3, int(os.getenv("SCAN_LOCK_RENEW_INTERVAL_SECONDS", "60"))))
+LEGACY_LOCK_STALE_SECONDS = max(60, int(os.getenv("LEGACY_SCAN_LOCK_STALE_SECONDS", "120")))
+LOCK_INSTANCE_ID = (os.getenv("RENDER_INSTANCE_ID") or os.getenv("RENDER_SERVICE_ID") or str(uuid.uuid4())).strip()
 
 _client = None
 
@@ -105,25 +111,45 @@ def cleanup_scan_runs(days=30):
 
 
 def try_scan_lock():
-    """Ersetzt den Postgres-Advisory-Lock durch ein Lock-Dokument.
-    Gibt bei Erfolg ein Token zurück (das später an release_scan_lock geht),
-    sonst None."""
+    """Acquire the cross-process scan lock as a renewable MongoDB lease.
+
+    Older deployments stored only ``acquired_at`` and used a 30-minute stale
+    timeout. Such a lock could survive a crashed/deployed worker for a long
+    time. New locks have ``lease_until`` and owner metadata; a scan renews the
+    lease while it is running. Legacy lock documents without ``lease_until``
+    are considered stale after a short migration window.
+    """
     d = _db()
     now = _now()
-    stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
-    token = f"{os.getpid()}-{now.timestamp()}"
-    # First try to replace a stale/missing lock atomically. Do not use
-    # upsert here: if a fresh lock already exists, MongoDB would otherwise
-    # attempt an insert and raise DuplicateKeyError.
+    lease_until = now + timedelta(seconds=LOCK_LEASE_SECONDS)
+    legacy_stale_before = now - timedelta(seconds=LEGACY_LOCK_STALE_SECONDS)
+    token = f"{LOCK_INSTANCE_ID}-{os.getpid()}-{uuid.uuid4().hex}"
+    owner = {
+        "token": token,
+        "owner_pid": os.getpid(),
+        "owner_instance": LOCK_INSTANCE_ID,
+        "acquired_at": now,
+        "lease_until": lease_until,
+    }
+
+    # Replace an expired lease atomically. For legacy locks without a lease,
+    # only take over once their old acquired_at is past the migration timeout.
     doc = d.locks.find_one_and_update(
         {
             "_id": LOCK_KEY,
             "$or": [
-                {"acquired_at": {"$lt": stale_before}},
-                {"acquired_at": {"$exists": False}},
+                {"lease_until": {"$lt": now}},
+                {
+                    "lease_until": {"$exists": False},
+                    "acquired_at": {"$lt": legacy_stale_before},
+                },
+                {
+                    "lease_until": {"$exists": False},
+                    "acquired_at": {"$exists": False},
+                },
             ],
         },
-        {"$set": {"token": token, "acquired_at": now}},
+        {"$set": owner},
         return_document=ReturnDocument.AFTER,
     )
     if doc and doc.get("token") == token:
@@ -132,10 +158,28 @@ def try_scan_lock():
     # No lock document exists yet. The insert is intentionally guarded
     # against a race with another process creating the lock at the same time.
     try:
-        d.locks.insert_one({"_id": LOCK_KEY, "token": token, "acquired_at": now})
+        d.locks.insert_one({"_id": LOCK_KEY, **owner})
         return token
     except DuplicateKeyError:
         return None
+
+
+def renew_scan_lock(conn):
+    """Extend an active scan lease, but only for its owning token."""
+    if not conn:
+        return False
+    now = _now()
+    lease_until = now + timedelta(seconds=LOCK_LEASE_SECONDS)
+    result = _db().locks.update_one(
+        {"_id": LOCK_KEY, "token": conn},
+        {"$set": {"lease_until": lease_until, "renewed_at": now}},
+    )
+    return result.matched_count == 1
+
+
+def get_scan_lock():
+    """Return diagnostic information about the current scan lock."""
+    return _db().locks.find_one({"_id": LOCK_KEY}, {"_id": 0})
 
 
 def release_scan_lock(conn):
@@ -368,6 +412,16 @@ def save_scan_run(summary, duration_seconds=None):
         "duration_seconds": duration_seconds,
         "summary": summary,
     })
+
+
+def get_recent_scan_runs(limit=10):
+    """Return recent scan runs for diagnostics without exposing Mongo internals."""
+    limit = max(1, min(50, int(limit)))
+    docs = []
+    for doc in _db().scan_runs.find().sort("started_at", DESCENDING).limit(limit):
+        doc.pop("_id", None)
+        docs.append(doc)
+    return docs
 
 
 def get_last_scan_run():

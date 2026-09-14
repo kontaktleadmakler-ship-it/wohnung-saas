@@ -87,3 +87,16 @@ services:
         value: "1"
       - key: WEB_CONCURRENCY
         value: "1"
+      # Shared MongoDB scan lock is a renewable lease. This keeps auto/manual
+      # scans coordinated while allowing an orphaned lock to expire quickly
+      # after a deploy or hard crash.
+      - key: SCAN_LOCK_LEASE_SECONDS
+        value: "300"
+      - key: SCAN_LOCK_RENEW_INTERVAL_SECONDS
+        value: "60"
+      - key: LEGACY_SCAN_LOCK_STALE_SECONDS
+        value: "120"
+
+# Temporarily enabled for end-to-end scan diagnostics. Set to false after validation.
+  - key: SCAN_DEBUG
+    value: "true"

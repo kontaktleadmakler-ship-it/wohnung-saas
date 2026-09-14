@@ -9,7 +9,7 @@ import threading
 import time
 from functools import wraps
 
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 from flask_wtf.csrf import CSRFProtect
 
 from logging_setup import configure_logging
@@ -104,8 +104,12 @@ def _run_scan_once_embedded():
             timeout=max(300, int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800"))),
             check=False,
         )
-        if result.returncode:
+        if result.returncode == 3:
+            log.warning("Scan-Kindprozess nicht gestartet: gemeinsamer Scan-Lock ist bereits belegt")
+        elif result.returncode:
             log.error("Scan-Kindprozess beendet mit Exit-Code %s", result.returncode)
+        else:
+            log.info("Scan-Kindprozess erfolgreich beendet")
         return result.returncode
     except subprocess.TimeoutExpired:
         log.error("Scan-Kindprozess wegen Timeout beendet")
@@ -362,6 +366,149 @@ def diagnose():
     )
 
 
+@app.route("/scan/diagnostics")
+@auth
+def scan_diagnostics():
+    """Machine-readable end-to-end scan diagnostics.
+
+    This endpoint deliberately exposes operational metadata only: profiles,
+    selected sources, generated search URLs, lock state, recent scan summaries,
+    Scrapy status and safe runtime configuration. Secrets/connection strings
+    are never returned.
+    """
+    started = time.monotonic()
+    diagnostics = {
+        "ok": True,
+        "generated_at": time.time(),
+        "process": {"pid": os.getpid(), "scan_thread_running": bool(scan_thread and scan_thread.is_alive())},
+        "config": {
+            "auto_scan_enabled": os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"},
+            "poll_interval_seconds": worker.POLL_INTERVAL_SECONDS,
+            "initial_scan_delay_seconds": int(os.getenv("INITIAL_SCAN_DELAY_SECONDS", "30")),
+            "scan_process_timeout_seconds": int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800")),
+            "scrape_max_pages": int(os.getenv("SCRAPE_MAX_PAGES", "3")),
+            "scan_lock_lease_seconds": int(os.getenv("SCAN_LOCK_LEASE_SECONDS", "300")),
+            "scan_lock_renew_interval_seconds": int(os.getenv("SCAN_LOCK_RENEW_INTERVAL_SECONDS", "60")),
+            "legacy_scan_lock_stale_seconds": int(os.getenv("LEGACY_SCAN_LOCK_STALE_SECONDS", "120")),
+            "log_level": os.getenv("LOG_LEVEL", "INFO"),
+            "mongodb_uri_configured": bool(os.getenv("MONGODB_URI")),
+        },
+        "in_process_scan": {"manual_thread_running": bool(scan_thread and scan_thread.is_alive())},
+    }
+
+    try:
+        diagnostics["db"] = {"connected": True, "setup": db.get_setup_stats()}
+    except Exception as exc:
+        log.exception("/scan/diagnostics: DB-Status fehlgeschlagen")
+        diagnostics["db"] = {"connected": False, "error": type(exc).__name__ + ": " + str(exc)}
+        diagnostics["ok"] = False
+
+    try:
+        lock = db.get_scan_lock()
+        now = time.time()
+        if lock:
+            def _iso(value):
+                return value.isoformat() if hasattr(value, "isoformat") else value
+            diagnostics["scan_lock"] = {
+                "present": True,
+                "owner_pid": lock.get("owner_pid"),
+                "owner_instance": lock.get("owner_instance"),
+                "acquired_at": _iso(lock.get("acquired_at")),
+                "renewed_at": _iso(lock.get("renewed_at")),
+                "lease_until": _iso(lock.get("lease_until")),
+                "token_present": bool(lock.get("token")),
+            }
+            lease_until = lock.get("lease_until")
+            diagnostics["scan_lock"]["expired"] = bool(lease_until and lease_until.timestamp() < now)
+            diagnostics["scan_lock"]["held_by_this_process"] = lock.get("owner_pid") == os.getpid()
+        else:
+            diagnostics["scan_lock"] = {"present": False, "expired": False, "held_by_this_process": False}
+    except Exception as exc:
+        log.exception("/scan/diagnostics: Lock-Status fehlgeschlagen")
+        diagnostics["scan_lock"] = {"error": type(exc).__name__ + ": " + str(exc)}
+        diagnostics["ok"] = False
+
+    try:
+        profiles = db.get_active_profiles_with_sources()
+        safe_profiles = []
+        for p in profiles:
+            safe_profiles.append({
+                "id": p.get("id"), "name": p.get("name"), "active": p.get("active"),
+                "sources": sorted(p.get("sources") or []),
+                "regions": sorted(p.get("regions") or []),
+                "districts": p.get("districts"),
+                "min_price": p.get("min_price"), "max_price": p.get("max_price"),
+                "min_rooms": p.get("min_rooms"), "max_rooms": p.get("max_rooms"),
+                "min_size": p.get("min_size"),
+            })
+        diagnostics["profiles"] = safe_profiles
+
+        jobs = worker.build_jobs(profiles)
+        job_details = []
+        for (source, regions, locations), profile_ids in jobs.items():
+            detail = {
+                "source": source, "regions": list(regions), "locations": list(locations),
+                "profile_ids": sorted(profile_ids), "urls": [], "url_error": None,
+                "adapter_available": True,
+            }
+            try:
+                scraper = get_scraper(source)
+                params = SearchParams(
+                    nationwide=("DE" in regions and not locations),
+                    region_codes=[] if "DE" in regions else list(regions),
+                    locations=list(locations),
+                )
+                detail["urls"] = scraper.build_search_urls(params)
+                detail["adapter_available"] = bool(getattr(scraper, "AVAILABLE", True))
+            except Exception as exc:
+                detail["url_error"] = type(exc).__name__ + ": " + str(exc)
+                detail["adapter_available"] = False
+            detail["urls_count"] = len(detail["urls"])
+            job_details.append(detail)
+        diagnostics["jobs"] = {"count": len(job_details), "items": job_details}
+    except Exception as exc:
+        log.exception("/scan/diagnostics: Profil-/Job-Diagnose fehlgeschlagen")
+        diagnostics["jobs"] = {"error": type(exc).__name__ + ": " + str(exc)}
+        diagnostics["ok"] = False
+
+    try:
+        diagnostics["scrapy"] = {
+            "last_run_status": worker.get_last_run_status(),
+        }
+    except Exception as exc:
+        diagnostics["scrapy"] = {"error": type(exc).__name__ + ": " + str(exc)}
+
+    try:
+        hb, hb_status, hb_message = _heartbeat_status()
+        diagnostics["heartbeat"] = {
+            "status": hb_status, "message": hb_message,
+            "last_seen_at": hb.get("last_seen_at").isoformat() if hb and hb.get("last_seen_at") else None,
+            "pid": hb.get("pid") if hb else None,
+            "duration_seconds": hb.get("duration_seconds") if hb else None,
+            "poll_interval_seconds": hb.get("poll_interval_seconds") if hb else None,
+        }
+    except Exception as exc:
+        diagnostics["heartbeat"] = {"error": type(exc).__name__ + ": " + str(exc)}
+
+    try:
+        runs = db.get_recent_scan_runs(10)
+        for run in runs:
+            for key in ("started_at",):
+                if hasattr(run.get(key), "isoformat"):
+                    run[key] = run[key].isoformat()
+        diagnostics["recent_scan_runs"] = runs
+    except Exception as exc:
+        diagnostics["recent_scan_runs"] = {"error": type(exc).__name__ + ": " + str(exc)}
+
+    diagnostics["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
+    log.info("SCAN-DIAGNOSTICS: ok=%s jobs=%s lock=%s duration_ms=%s",
+             diagnostics.get("ok"),
+             diagnostics.get("jobs", {}).get("count") if isinstance(diagnostics.get("jobs"), dict) else None,
+             diagnostics.get("scan_lock", {}).get("present") if isinstance(diagnostics.get("scan_lock"), dict) else None,
+             diagnostics["duration_ms"])
+    return jsonify(diagnostics)
+
+
 @app.route("/scan/run", methods=["POST"])
 @auth
 def run_scan():
@@ -402,7 +549,12 @@ def _manual_scan(profile_id=None):
             timeout=max(300, int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800"))),
             check=False,
         )
-        log.info("Manueller Scan fertig: profile_id=%s exit=%s", profile_id, result.returncode)
+        if result.returncode == 3:
+            log.warning("Manueller Scan übersprungen: gemeinsamer Scan-Lock ist bereits belegt (profile_id=%s)", profile_id)
+        elif result.returncode:
+            log.error("Manueller Scan fehlgeschlagen: profile_id=%s exit=%s", profile_id, result.returncode)
+        else:
+            log.info("Manueller Scan fertig: profile_id=%s exit=0", profile_id)
     except Exception:
         log.exception("Manueller Scan fehlgeschlagen")
 
