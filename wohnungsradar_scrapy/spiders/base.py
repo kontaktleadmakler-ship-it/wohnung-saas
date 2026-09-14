@@ -69,7 +69,7 @@ class PortalSpider(scrapy.Spider):
         headers={"User-Agent":ua} if ua else None
         if self.use_playwright:
             meta.update({"playwright":True,"playwright_page_methods":[
-                PageMethod("wait_for_timeout",1200),
+                PageMethod("wait_for_timeout",10000),
                 PageMethod("evaluate", """
                     () => {
                         const labels = [

@@ -1,6 +1,6 @@
 # Wohnungsradar – deutsche Immobilien-Scraping-Anwendung
 
-Flask-Dashboard + PostgreSQL + Playwright/BeautifulSoup + periodischer Scan + Telegram- und E-Mail-Benachrichtigungen.
+Flask-Dashboard + MongoDB + Playwright/BeautifulSoup + periodischer Scan + Telegram- und E-Mail-Benachrichtigungen.
 
 ## Enthaltene Quellen
 
@@ -30,10 +30,10 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Benötigt wird PostgreSQL. Danach setzen:
+Benötigt wird MongoDB. Danach setzen:
 
 ```text
-DATABASE_URL=postgresql://...
+MONGODB_URI=mongodb+srv://...
 SECRET_KEY=ein-langes-zufälliges-secret
 APP_PASSWORD=dashboard-passwort
 TELEGRAM_BOT_TOKEN=...
@@ -63,11 +63,11 @@ Das Repository enthält `render.yaml` mit zwei Services:
 1. `wohnung-saas-web` – Flask-Dashboard. Darf auf dem Free-Tier nach 15 Minuten ohne Traffic einschlafen; das betrifft nur die Anzeige, nicht mehr das Scanning.
 2. `wohnung-saas-cron` – **Render Cron Job**, führt `python scraper.py --once` auf einem festen Zeitplan (Standard: alle 10 Minuten) aus. Läuft unabhängig vom Web-Traffic und schläft nicht ein – ein externer Keep-Alive-Ping (z. B. UptimeRobot) ist dafür nicht mehr nötig. `ENABLE_AUTO_SCAN` im Web-Service ist deshalb standardmäßig `false`; wird der Cron-Service nicht verwendet, kann es zurück auf `true` gesetzt werden, um stattdessen den alten eingebetteten Hintergrundscan zu nutzen.
 
-Beide Services installieren Chromium über `playwright install --with-deps chromium` und teilen sich denselben Postgres-Advisory-Lock (`db.py`), sodass sich ein manueller Dashboard-Scan und ein zeitgleicher Cron-Lauf nicht überschneiden. Die Datenbanktabellen werden beim Prozessstart einmalig initialisiert. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` im Web-Service Pflicht.
+Beide Services installieren Chromium über `playwright install --with-deps chromium` und teilen sich denselben MongoDB-Lock-Dokument (`db.py`), sodass sich ein manueller Dashboard-Scan und ein zeitgleicher Cron-Lauf nicht überschneiden. Die Datenbanktabellen werden beim Prozessstart einmalig initialisiert. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` im Web-Service Pflicht.
 
 ### Render-Variablen
 
-`DATABASE_URL`, `SECRET_KEY` (nur Web), `APP_PASSWORD` (nur Web), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL_SECONDS`, `MIN_NOTIFY_SCORE`, `PLAYWRIGHT_BROWSERS_PATH`, `LISTING_RETENTION_DAYS` (Standard 60 – nach so vielen Tagen ohne erneute Sichtung werden alte Inserate inkl. Matches automatisch gelöscht).
+`MONGODB_URI`, `SECRET_KEY` (nur Web), `APP_PASSWORD` (nur Web), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL_SECONDS`, `MIN_NOTIFY_SCORE`, `PLAYWRIGHT_BROWSERS_PATH`, `LISTING_RETENTION_DAYS` (Standard 60 – nach so vielen Tagen ohne erneute Sichtung werden alte Inserate inkl. Matches automatisch gelöscht).
 
 Für E-Mail über SMTP zusätzlich: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`, optional `SMTP_USE_TLS=true`.
 Telegram und E-Mail werden unabhängig voneinander als zugestellt gespeichert. Fällt ein Kanal vorübergehend aus, wird nur dieser Kanal beim nächsten passenden Scan erneut versucht.
@@ -111,7 +111,7 @@ Inserate bis 5 % über dem Budget bleiben erhalten, erhalten aber einen linear r
 
 `profiles`, `listings`, `matches`, `profile_sources`, `profile_regions` werden automatisch erzeugt. Listings sind über `(source, external_id)` eindeutig. Zusätzlich existieren Indizes für Quelle, Aktualität, Profil und Score.
 
-Ein PostgreSQL-Advisory-Lock verhindert parallele Scans, z. B. wenn ein manueller Scan und der Hintergrundscan zeitgleich starten.
+Ein MongoDB-Advisory-Lock verhindert parallele Scans, z. B. wenn ein manueller Scan und der Hintergrundscan zeitgleich starten.
 
 ## Selektoren anpassen
 
@@ -150,7 +150,7 @@ Nur öffentlich zugängliche Inhalte abrufen, Nutzungsbedingungen und Robots-/Zu
 - `DASHBOARD_LIMIT` steuert die maximale Anzahl der Treffer im Dashboard (Standard 300).
 - Ein `DE`-Profil wird bei den Scrapers als `SearchParams.nationwide=True` behandelt und nicht auf Berlin zurückgefallen. Regionale Profile ohne Districts werden über 2–3 große Städte je Bundesland als Suchanker aufgebaut; explizite Districts haben Vorrang.
 - Cookie-Consent wird zusätzlich in gängigen Consent-iframes versucht, damit eingebettete Banner die Extraktion nicht blockieren.
-- Der Scan-Thread läuft im Web-Prozess. Bei mehreren Gunicorn-Workern ist der Laufstatus deshalb nicht global; der PostgreSQL-Advisory-Lock verhindert jedoch parallele Scans. Für den integrierten Thread `python app.py` bzw. einen einzelnen Web-Worker verwenden.
+- Der Scan-Thread läuft im Web-Prozess. Bei mehreren Gunicorn-Workern ist der Laufstatus deshalb nicht global; der MongoDB-Advisory-Lock verhindert jedoch parallele Scans. Für den integrierten Thread `python app.py` bzw. einen einzelnen Web-Worker verwenden.
 - **Entscheidung offen: Kalaydo/Immonet.** Beide bleiben vorerst in `SOURCE_CLASSES` und fehlertolerant. Kalaydo ist aktuell primär Jobbörse; Immonet ist weitgehend in Immowelt konsolidiert. Sie wurden bewusst nicht entfernt, damit eine spätere Reaktivierung per Konfiguration möglich bleibt. Die endgültige Entfernung sollte erst nach einem echten Produktionsscan bzw. einer bewussten Konfigurationsentscheidung erfolgen.
 
 

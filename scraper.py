@@ -4,7 +4,6 @@ import logging
 import os
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import db
 from logging_setup import configure_logging
@@ -328,8 +327,8 @@ def run_once(profile_id=None):
 
 def worker_loop():
     log.info(
-        "Konfiguration: DATABASE_URL=%s, TELEGRAM=%s, POLL=%ss, MIN_NOTIFY_SCORE=%s",
-        "gesetzt" if os.getenv("DATABASE_URL") else "FEHLT",
+        "Konfiguration: MONGODB_URI=%s, TELEGRAM=%s, POLL=%ss, MIN_NOTIFY_SCORE=%s",
+        "gesetzt" if (os.getenv("MONGODB_URI") or os.getenv("DATABASE_URL")) else "FEHLT",
         "gesetzt" if os.getenv("TELEGRAM_BOT_TOKEN") else "nicht gesetzt",
         "gesetzt" if email_configured() else "nicht gesetzt",
         POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,

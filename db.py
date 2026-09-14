@@ -1,12 +1,24 @@
 from __future__ import annotations
 import os
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "wohnung_saas")
+MONGODB_URI = os.getenv("MONGODB_URI") or os.getenv("DATABASE_URL")
+
+def _database_name_from_uri(uri):
+    configured = os.getenv("MONGO_DB_NAME")
+    if configured:
+        return configured
+    try:
+        path = urlparse(uri).path.strip("/") if uri else ""
+        return path or "wohnung_saas"
+    except Exception:
+        return "wohnung_saas"
+
+MONGO_DB_NAME = _database_name_from_uri(MONGODB_URI)
 LOCK_KEY = "scan_lock"
 LOCK_STALE_SECONDS = 30 * 60  # Schutz gegen ewig gehaltenen Lock bei Absturz
 
@@ -15,10 +27,19 @@ _client = None
 
 def _get_client():
     global _client
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL fehlt")
+    if not MONGODB_URI:
+        raise RuntimeError("MONGODB_URI fehlt")
     if _client is None:
-        _client = MongoClient(DATABASE_URL)
+        _client = MongoClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "10000")),
+            connectTimeoutMS=int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "10000")),
+            socketTimeoutMS=int(os.getenv("MONGO_SOCKET_TIMEOUT_MS", "30000")),
+            retryWrites=True,
+        )
+    # Fail fast during startup instead of discovering an invalid URI only on
+    # the first dashboard request.
+    _client.admin.command("ping")
     return _client
 
 
@@ -84,7 +105,10 @@ def try_scan_lock():
     now = _now()
     stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
     token = f"{os.getpid()}-{now.timestamp()}"
-    result = d.locks.update_one(
+    # First try to replace a stale/missing lock atomically. Do not use
+    # upsert here: if a fresh lock already exists, MongoDB would otherwise
+    # attempt an insert and raise DuplicateKeyError.
+    doc = d.locks.find_one_and_update(
         {
             "_id": LOCK_KEY,
             "$or": [
@@ -93,13 +117,18 @@ def try_scan_lock():
             ],
         },
         {"$set": {"token": token, "acquired_at": now}},
-        upsert=True,
+        return_document=ReturnDocument.AFTER,
     )
-    if result.matched_count or result.upserted_id is not None:
-        doc = d.locks.find_one({"_id": LOCK_KEY})
-        if doc and doc.get("token") == token:
-            return token
-    return None
+    if doc and doc.get("token") == token:
+        return token
+
+    # No lock document exists yet. The insert is intentionally guarded
+    # against a race with another process creating the lock at the same time.
+    try:
+        d.locks.insert_one({"_id": LOCK_KEY, "token": token, "acquired_at": now})
+        return token
+    except DuplicateKeyError:
+        return None
 
 
 def release_scan_lock(conn):
@@ -267,7 +296,6 @@ def save_match(listing_id, profile_id, score, components, reasons):
     price_score, rooms_score, size_score, location_score = components
     now = _now()
     d = _db()
-    existing = d.matches.find_one({"listing_id": listing_id, "profile_id": profile_id})
     update_fields = {
         "score": score,
         "price_score": price_score,
@@ -277,26 +305,30 @@ def save_match(listing_id, profile_id, score, components, reasons):
         "reasons": reasons,
         "updated_at": now,
     }
-    if existing:
-        d.matches.update_one(
-            {"listing_id": listing_id, "profile_id": profile_id},
-            {"$set": update_fields},
-        )
-        return {
-            "notified": existing.get("notified", False),
-            "telegram_notified": existing.get("telegram_notified", False),
-            "email_notified": existing.get("email_notified", False),
-        }
-    update_fields.update({
-        "listing_id": listing_id,
-        "profile_id": profile_id,
-        "notified": False,
-        "telegram_notified": False,
-        "email_notified": False,
-        "created_at": now,
-    })
-    d.matches.insert_one(update_fields)
-    return {"notified": False, "telegram_notified": False, "email_notified": False}
+    # One atomic operation avoids the find-then-insert race when two workers
+    # process the same listing/profile concurrently. Existing notification
+    # flags are preserved.
+    doc = d.matches.find_one_and_update(
+        {"listing_id": listing_id, "profile_id": profile_id},
+        {
+            "$set": update_fields,
+            "$setOnInsert": {
+                "listing_id": listing_id,
+                "profile_id": profile_id,
+                "notified": False,
+                "telegram_notified": False,
+                "email_notified": False,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {
+        "notified": doc.get("notified", False),
+        "telegram_notified": doc.get("telegram_notified", False),
+        "email_notified": doc.get("email_notified", False),
+    }
 
 
 def mark_telegram_notified(listing_id, profile_id):
