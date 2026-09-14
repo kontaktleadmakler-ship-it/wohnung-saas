@@ -1,3 +1,5 @@
+import os
+
 BOT_NAME = "wohnungsradar"
 SPIDER_MODULES = ["wohnungsradar_scrapy.spiders"]
 NEWSPIDER_MODULE = "wohnungsradar_scrapy.spiders"
