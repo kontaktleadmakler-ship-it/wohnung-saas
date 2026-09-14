@@ -150,30 +150,125 @@ def jsonld_objects(soup):
         yield from flatten(data)
 
 def jsonld_to_raw(obj, base_url):
-    typ=obj.get("@type")
-    types={typ} if isinstance(typ,str) else set(typ or [])
-    if not types.intersection({"Apartment","Residence","House","Product","RealEstateListing","Offer"}):
+    """Convert one Schema.org object into the common raw-card shape.
+
+    Portals frequently wrap an Apartment inside an Offer/Product object.
+    Resolve those wrappers instead of requiring every field on one object.
+    """
+    def types_of(value):
+        t = value.get("@type") if isinstance(value, dict) else None
+        return {t} if isinstance(t, str) else set(t or [])
+
+    def first_dict(value):
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            return next((x for x in value if isinstance(x, dict)), {})
+        return {}
+
+    root = obj if isinstance(obj, dict) else {}
+    offers = first_dict(root.get("offers") or root.get("offer"))
+    nested = first_dict(
+        offers.get("itemOffered") or root.get("itemOffered")
+    )
+
+    # Prefer the actual real-estate object for title/address/rooms/area,
+    # while taking monetary fields from the Offer wrapper.
+    property_obj = nested if nested else root
+    all_types = types_of(root) | types_of(offers) | types_of(property_obj)
+    if not all_types.intersection({
+        "Apartment", "Residence", "House", "Product",
+        "RealEstateListing", "Offer", "Accommodation"
+    }):
         return None
-    offers=obj.get("offers") or obj.get("offer")
-    if isinstance(offers,list): offers=offers[0] if offers else {}
-    if not isinstance(offers,dict): offers={}
-    addr=obj.get("address") or {}
-    if isinstance(addr,str): addr={"streetAddress":addr}
-    if not isinstance(addr,dict): addr={}
-    url=canonical_url(obj.get("url") or offers.get("url") or "", base_url)
-    if not url: return None
-    title=clean_text(obj.get("name") or obj.get("headline"))
-    desc=clean_text(obj.get("description"))
-    price=obj.get("price") or offers.get("price")
-    total=obj.get("priceTotal") or offers.get("priceTotal")
-    locality=clean_text(addr.get("addressLocality") or obj.get("addressLocality"))
-    postal=clean_text(addr.get("postalCode") or obj.get("postalCode"))
-    address=clean_text(addr.get("streetAddress") or obj.get("address"))
-    area=obj.get("floorSize") or obj.get("area")
-    if isinstance(area,dict): area=area.get("value")
-    rooms=obj.get("numberOfRooms") or obj.get("numberOfBedrooms")
-    return {"href":url,"title":title,"description":desc,"price_text":str(price) if price is not None else None,
-            "price_total_text":str(total) if total is not None else None,
-            "rooms_text":str(rooms) if rooms is not None else None,"size_text":str(area) if area is not None else None,
-            "address":address,"city":locality,"postal_code":postal,
-            "published_at":clean_text(obj.get("datePublished") or obj.get("dateCreated"))}
+
+    url = canonical_url(
+        property_obj.get("url")
+        or root.get("url")
+        or offers.get("url")
+        or "",
+        base_url,
+    )
+    if not url:
+        return None
+
+    title = clean_text(
+        property_obj.get("name")
+        or root.get("name")
+        or root.get("headline")
+    )
+    desc = clean_text(
+        property_obj.get("description")
+        or root.get("description")
+    )
+
+    price = (
+        offers.get("price")
+        if offers.get("price") is not None
+        else property_obj.get("price")
+        if property_obj.get("price") is not None
+        else root.get("price")
+    )
+    total = (
+        offers.get("priceTotal")
+        if offers.get("priceTotal") is not None
+        else property_obj.get("priceTotal")
+        if property_obj.get("priceTotal") is not None
+        else root.get("priceTotal")
+    )
+
+    addr = property_obj.get("address") or root.get("address") or {}
+    if isinstance(addr, str):
+        addr = {"streetAddress": addr}
+    if not isinstance(addr, dict):
+        addr = {}
+
+    locality = clean_text(
+        addr.get("addressLocality")
+        or property_obj.get("addressLocality")
+        or root.get("addressLocality")
+    )
+    postal = clean_text(
+        addr.get("postalCode")
+        or property_obj.get("postalCode")
+        or root.get("postalCode")
+    )
+    address = clean_text(
+        addr.get("streetAddress")
+        or property_obj.get("streetAddress")
+    )
+
+    area = (
+        property_obj.get("floorSize")
+        or property_obj.get("area")
+        or root.get("floorSize")
+        or root.get("area")
+    )
+    if isinstance(area, dict):
+        area = area.get("value") or area.get("minValue")
+
+    rooms = (
+        property_obj.get("numberOfRooms")
+        or property_obj.get("numberOfBedrooms")
+        or root.get("numberOfRooms")
+    )
+
+    published = (
+        property_obj.get("datePublished")
+        or root.get("datePublished")
+        or root.get("dateCreated")
+    )
+
+    return {
+        "href": url,
+        "title": title,
+        "description": desc,
+        "price_text": str(price) if price is not None else None,
+        "price_total_text": str(total) if total is not None else None,
+        "rooms_text": str(rooms) if rooms is not None else None,
+        "size_text": str(area) if area is not None else None,
+        "address": address,
+        "city": locality,
+        "postal_code": postal,
+        "published_at": clean_text(published),
+    }

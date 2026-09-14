@@ -2,6 +2,7 @@ from __future__ import annotations
 import os, re
 from urllib.parse import quote, quote_plus
 from scrapers.models import Listing, SearchParams
+from scrapers.regions import STATE_CITY_SAMPLES
 from .runner import run_jobs
 from .spiders.portals import SPIDER_CLASSES
 import logging
@@ -15,7 +16,23 @@ def slugify_city(name: str) -> str:
     return "-".join(part for part in re.sub(r"[^A-Za-z0-9]+"," ",text).casefold().split())
 
 def _locations(params):
-    return list(params.locations or [])
+    # `districts` in the UI may contain neighborhoods such as Moabit.
+    # Those are NOT valid portal city slugs. Use them only for matching and
+    # choose a real city as the search anchor.
+    requested = [str(x).strip() for x in (params.locations or []) if str(x).strip()]
+    known = {c.casefold(): c for cities in STATE_CITY_SAMPLES.values() for c in cities}
+    cities = []
+    for value in requested:
+        if value.casefold() in known:
+            cities.append(known[value.casefold()])
+    if cities:
+        return list(dict.fromkeys(cities))
+    if params.region_codes:
+        for code in params.region_codes:
+            for city in STATE_CITY_SAMPLES.get(str(code).upper(), []):
+                if city not in cities:
+                    cities.append(city)
+    return cities
 
 class ScrapyPortalAdapter:
     SOURCE_KEY=""; SOURCE_LABEL=""; BASE_URL=""; SPIDER=None
@@ -53,9 +70,31 @@ class ImmoScout24Adapter(ScrapyPortalAdapter):
 
 class ImmoweltAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="immowelt"; SOURCE_LABEL="Immowelt"; BASE_URL="https://www.immowelt.de"
+    # Immowelt's current SEO URLs contain a state/city identifier. These
+    # verified city anchors avoid the old `/wohnung/berlin` URLs that return
+    # empty/non-result pages.
+    CITY_ANCHORS = {
+        "berlin": "/suche/mieten/wohnung/berlin/berlin-10115/ad08de8634",
+        "münchen": "/suche/mieten/wohnung/bayern/munchen-80331/ad08de6345",
+        "munchen": "/suche/mieten/wohnung/bayern/munchen-80331/ad08de6345",
+        "köln": "/suche/mieten/wohnung/nordrhein-westfalen/koln-50769/ad08de2179",
+        "koln": "/suche/mieten/wohnung/nordrhein-westfalen/koln-50769/ad08de2179",
+    }
     def build_search_urls(self,p):
-        if p.nationwide: return [f"{self.BASE_URL}/suche/mieten/wohnung/deutschland"]
-        return [f"{self.BASE_URL}/suche/mieten/wohnung/{slugify_city(x)}" for x in _locations(p)][:8]
+        if p.nationwide:
+            # Use a broad current search endpoint rather than inventing a
+            # city fallback. It can be followed by the spider normally.
+            return [f"{self.BASE_URL}/suche/mieten/wohnung"]
+        urls=[]
+        for city in _locations(p)[:8]:
+            anchor=self.CITY_ANCHORS.get(city.casefold())
+            if anchor:
+                urls.append(self.BASE_URL+anchor)
+            else:
+                # Unknown cities are marked unavailable instead of creating a
+                # URL that looks plausible but silently returns zero results.
+                continue
+        return urls
 
 class ImmonetAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="immonet"; SOURCE_LABEL="Immonet"; BASE_URL="https://www.immonet.de"

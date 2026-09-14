@@ -157,6 +157,21 @@ def _start_background_scanner_once():
         threading.Thread(target=_background_scanner, daemon=True, name="bg-scanner").start()
 
 
+def _maybe_start_background_scanner():
+    """Start the periodic scanner for both Flask and Gunicorn imports.
+
+    Gunicorn imports ``app`` and does not execute app.py's ``__main__`` block.
+    The previous implementation therefore served a healthy dashboard but
+    never launched the scanner in the production Render process.
+    """
+    enabled = os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}
+    if enabled:
+        _ensure_db_initialized()
+        _start_background_scanner_once()
+    else:
+        log.info("Automatischer Scan deaktiviert (ENABLE_AUTO_SCAN=false)")
+
+
 def _heartbeat_status():
     """Liefert (heartbeat_row, status, message) für Dashboard-Banner und /diagnose.
     status ist eine von 'ok', 'delayed', 'down'."""
@@ -196,6 +211,9 @@ def ensure_db():
     if request.endpoint != "static":
         _ensure_db_initialized()
 
+
+# Start in Gunicorn as well as `python app.py`/`python main.py`.
+_maybe_start_background_scanner()
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -484,10 +502,5 @@ def _profile_form():
 
 if __name__ == "__main__":
     _ensure_db_initialized()
-    # Bewusst standardmäßig aus: Render muss zuerst stabil erreichbar sein.
-    # Für einen periodischen Auto-Scan kann ENABLE_AUTO_SCAN=true gesetzt werden.
-    if os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}:
-        _start_background_scanner_once()
-    else:
-        log.info("Automatischer Scan beim Boot deaktiviert (ENABLE_AUTO_SCAN=false)")
+    _maybe_start_background_scanner()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

@@ -42,9 +42,24 @@ class PortalSpider(scrapy.Spider):
         meta={"page_number":page_number}
         if self.use_playwright:
             meta.update({"playwright":True,"playwright_page_methods":[
-                PageMethod("wait_for_timeout",800),
+                PageMethod("wait_for_timeout",1200),
+                PageMethod("evaluate", """
+                    () => {
+                        const labels = [
+                            'Alle akzeptieren', 'Akzeptieren', 'Einverstanden',
+                            'Zustimmen', 'Accept all', 'Accept'
+                        ];
+                        for (const el of document.querySelectorAll('button,[role="button"],input[type="button"]')) {
+                            const t = (el.innerText || el.value || '').trim().toLowerCase();
+                            if (labels.some(x => t === x.toLowerCase())) {
+                                try { el.click(); } catch (_) {}
+                            }
+                        }
+                    }
+                """),
+                PageMethod("wait_for_timeout",500),
                 PageMethod("evaluate","window.scrollTo(0, document.body.scrollHeight)"),
-                PageMethod("wait_for_timeout",300),
+                PageMethod("wait_for_timeout",800),
             ]})
         return scrapy.Request(url,callback=self.parse,errback=self.errback,meta=meta,dont_filter=True)
 
@@ -89,22 +104,30 @@ class PortalSpider(scrapy.Spider):
         return self.build_page_url(response.url,page_number+1)
 
     def parse_listing_cards(self,response):
+        # Portal selectors are an optimization, never the sole source of
+        # truth. Current portals change class names frequently, so always run
+        # the link-based adaptive extractor as a second pass.
         cards=[]; seen=set()
         for selector in self.card_selectors:
             for card in response.css(selector):
                 raw=self.extract_card(card,response.url)
-                if raw.get("href") and raw["href"] not in seen:
-                    seen.add(raw["href"]); cards.append(raw)
-            if cards: break
-        if not cards:
-            cards=self.adaptive_extract(response)
+                href=raw.get("href")
+                if href:
+                    key=canonical_url(href,response.url)
+                    if key and key not in seen:
+                        seen.add(key); cards.append(raw)
+        for raw in self.adaptive_extract(response):
+            href=raw.get("href")
+            key=canonical_url(href,response.url) if href else ""
+            if key and key not in seen:
+                seen.add(key); cards.append(raw)
         cards=self.merge_jsonld(response,cards)
-        return cards
+        return cards[:500]
 
     def extract_card(self,card,base_url):
         href=None
         for selector in self.link_selectors:
-            href=card.css(selector).get()
+            href=card.css(selector + "::attr(href)").get()
             if href: break
         if not href: href=card.css("a[href]::attr(href)").get()
         text=node_text(card)
@@ -143,8 +166,16 @@ class PortalSpider(scrapy.Spider):
                 if self.looks_like_listing_text(txt): best=node
             raw=self.extract_card(best,response.url)
             raw["href"]=urljoin(response.url,href)
+            # The anchor itself is always a useful title fallback. This is
+            # important when a portal renders the card title outside the
+            # selected ancestor.
+            anchor_text=node_text(a)
+            if anchor_text and (not raw.get("title") or len(raw.get("title","")) < 3):
+                raw["title"]=clean_text(anchor_text)
+            if not raw.get("title"):
+                raw["title"]=clean_text(node_text(best)[:180])
             out.append(raw)
-        return out[:300]
+        return out[:500]
 
     @staticmethod
     def looks_like_listing_text(text):

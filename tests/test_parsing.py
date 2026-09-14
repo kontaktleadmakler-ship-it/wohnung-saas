@@ -41,4 +41,30 @@ class ParserTests(unittest.TestCase):
     def test_wg_listing_id(self):
         s=WgGesuchtSpider(start_urls=[])
         self.assertTrue(s.is_listing_href("/13835398.html"))
+
+    def test_nested_jsonld_offer(self):
+        html="""<script type="application/ld+json">
+        {"@type":"Offer","url":"https://x.test/expose/123456",
+         "price":"1450","itemOffered":{"@type":"Apartment",
+         "name":"Nested Wohnung","numberOfRooms":2,
+         "floorSize":{"value":55,"unitCode":"MTK"},
+         "address":{"postalCode":"10115","addressLocality":"Berlin"}}}
+        </script>"""
+        s=ImmoScout24Spider(start_urls=[])
+        response=self.response(html)
+        cards=s.parse_listing_cards(response)
+        self.assertEqual(len(cards),1)
+        self.assertEqual(cards[0]["title"],"Nested Wohnung")
+        item=s.normalize_card(cards[0],response)
+        self.assertEqual(item["price"],1450.0)
+        self.assertEqual(item["rooms"],2.0)
+        self.assertEqual(item["size"],55.0)
+
+    def test_card_link_href_is_attribute(self):
+        html="""<article class="aditem"><a href="/s-anzeige/wohnung-123456"><h2>Wohnung</h2>
+        <div class="price"><span>900</span><span>€</span></div></article>"""
+        s=KleinanzeigenSpider(start_urls=[])
+        response=self.response(html)
+        card=s.parse_listing_cards(response)[0]
+        self.assertEqual(card["href"],"https://x.test/s-anzeige/wohnung-123456")
 if __name__=="__main__": unittest.main()
