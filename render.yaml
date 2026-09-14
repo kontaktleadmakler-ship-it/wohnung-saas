@@ -1,15 +1,9 @@
-# Zwei Services:
-#  - wohnung-saas-web: reines Dashboard. Darf auf dem Free-Tier ruhig
-#    einschlafen (15 Min ohne Traffic) - das ist für die Anzeige unkritisch
-#    und wacht beim nächsten Aufruf automatisch wieder auf.
-#  - wohnung-saas-cron: führt `python scraper.py --once` auf einem festen
-#    Zeitplan aus, unabhängig vom Web-Traffic. Render Cron Jobs schlafen
-#    nicht ein und benötigen daher KEINEN externen Keep-Alive-Ping (z. B.
-#    UptimeRobot) fürs Scanning - der ist höchstens noch sinnvoll, um beim
-#    Dashboard-Aufruf einen Cold-Start zu vermeiden.
-# Beide Prozesse teilen sich denselben Postgres-Advisory-Lock (db.py), ein
-# überlappender manueller Scan aus dem Dashboard wird also übersprungen statt
-# doppelt zu laufen.
+# Ein einzelner Service:
+#  - wohnung-saas-web: Dashboard UND Scanning in einem Prozess. Der Scan
+#    läuft als Hintergrund-Thread im Web-Prozess (ENABLE_AUTO_SCAN=true),
+#    kein separater Cron-Service nötig. Damit der Prozess nicht wegen
+#    Inaktivität einschläft und der Hintergrund-Scan dadurch pausiert,
+#    lohnt sich ein externer Keep-Alive-Ping (z. B. UptimeRobot).
 services:
   - type: web
     name: wohnung-saas-web
@@ -46,74 +40,12 @@ services:
         value: "300"
       - key: POLL_INTERVAL_SECONDS
         value: "300"
-      # Scanning läuft jetzt über den separaten wohnung-saas-cron-Service
-      # (siehe unten). Der Web-Prozess startet keinen eigenen Chromium-Scan
-      # mehr im Hintergrund, damit er ruhig einschlafen kann. Auf "true"
-      # setzen nur, wenn der Cron-Service bewusst NICHT verwendet wird.
+      # Kein separater Cron-Service mehr -> der Web-Prozess scannt selbst
+      # per Hintergrund-Thread. Deshalb hier "true".
       - key: ENABLE_AUTO_SCAN
-        value: "false"
+        value: "true"
       - key: INITIAL_SCAN_DELAY_SECONDS
         value: "30"
-      - key: MIN_NOTIFY_SCORE
-        value: "75"
-      - key: SCRAPE_MAX_PAGES
-        value: "3"
-      - key: MAX_CANDIDATES_PER_SOURCE
-        value: "0"
-      - key: SCRAPE_DELAY_MIN
-        value: "0.8"
-      - key: SCRAPE_DELAY_MAX
-        value: "1.8"
-      - key: SCRAPE_WAIT_MS
-        value: "1800"
-      - key: SCRAPE_PAGE_TIMEOUT_MS
-        value: "30000"
-      - key: SCRAPE_RETRIES
-        value: "3"
-      - key: SCRAPE_BACKOFF_BASE
-        value: "1.5"
-      - key: LOG_LEVEL
-        value: "INFO"
-      # PYTHONUNBUFFERED=1 zusammen mit dem Flushing-Handler in
-      # logging_setup.py, damit bei einem harten Kill (OOM,
-      # Health-Check-Timeout) keine Log-Zeilen im Puffer verloren gehen.
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: WEB_CONCURRENCY
-        value: "1"
-
-  - type: cron
-    name: wohnung-saas-cron
-    env: docker
-    dockerfilePath: ./Dockerfile
-    # Alle 10 Minuten. In POLL_INTERVAL_SECONDS-Größenordnung, aber als
-    # echter, vom Web-Traffic unabhängiger Render-Zeitplan statt eines
-    # Dauer-Threads im Webprozess.
-    schedule: "*/10 * * * *"
-    dockerCommand: python scraper.py --once
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: SMTP_HOST
-        sync: false
-      - key: SMTP_PORT
-        value: "587"
-      - key: SMTP_USERNAME
-        sync: false
-      - key: SMTP_PASSWORD
-        sync: false
-      - key: EMAIL_FROM
-        sync: false
-      - key: EMAIL_TO
-        sync: false
-      - key: SMTP_USE_TLS
-        value: "true"
-      - key: POLL_INTERVAL_SECONDS
-        value: "300"
       - key: MIN_NOTIFY_SCORE
         value: "75"
       - key: SCRAPE_MAX_PAGES
@@ -136,5 +68,10 @@ services:
         value: "60"
       - key: LOG_LEVEL
         value: "INFO"
+      # PYTHONUNBUFFERED=1 zusammen mit dem Flushing-Handler in
+      # logging_setup.py, damit bei einem harten Kill (OOM,
+      # Health-Check-Timeout) keine Log-Zeilen im Puffer verloren gehen.
       - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: WEB_CONCURRENCY
         value: "1"
