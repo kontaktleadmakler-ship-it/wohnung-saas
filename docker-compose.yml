@@ -1,0 +1,13 @@
+services:
+  wohnungsradar:
+    build: .
+    container_name: wohnungsradar-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./profiles.json:/app/profiles.json
