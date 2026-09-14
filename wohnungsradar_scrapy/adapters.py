@@ -123,7 +123,8 @@ class KalaydoAdapter(ScrapyPortalAdapter):
         # residential results when no verified residential search exists.
         return []
 
-ADAPTERS={c.SOURCE_KEY:c for c in (KleinanzeigenAdapter,ImmoScout24Adapter,ImmoweltAdapter,ImmonetAdapter,WgGesuchtAdapter,MeinestadtAdapter,KalaydoAdapter)}
+ADAPTER_CLASSES=(KleinanzeigenAdapter,ImmoScout24Adapter,ImmoweltAdapter,ImmonetAdapter,WgGesuchtAdapter,MeinestadtAdapter,KalaydoAdapter)
+ADAPTERS={c.SOURCE_KEY:c() for c in ADAPTER_CLASSES}
 
 def run_scrapy_jobs(work):
     global LAST_RUN_STATUS

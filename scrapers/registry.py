@@ -2,11 +2,16 @@ from wohnungsradar_scrapy.adapters import ADAPTERS
 
 SOURCE_REGISTRY = ADAPTERS
 
+
 def get_scraper(source_key):
-    cls = SOURCE_REGISTRY.get(source_key)
-    if not cls:
+    adapter = SOURCE_REGISTRY.get(source_key)
+    if adapter is None:
         raise KeyError(source_key)
-    return cls()
+    return adapter
+
 
 def list_sources():
-    return [{"key": cls.SOURCE_KEY, "label": cls.SOURCE_LABEL} for cls in SOURCE_REGISTRY.values()]
+    return [
+        {"key": adapter.SOURCE_KEY, "label": adapter.SOURCE_LABEL}
+        for adapter in SOURCE_REGISTRY.values()
+    ]
