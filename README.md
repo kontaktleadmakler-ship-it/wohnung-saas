@@ -58,12 +58,12 @@ python scraper.py
 
 ## Render
 
-Das Repository enthält `render.yaml` mit zwei Services:
+Das Repository enthält `render.yaml` mit einem Web-Service:
 
 1. `wohnung-saas-web` – Flask-Dashboard
 2. `wohnung-saas-worker` – periodischer Scraper
 
-Beide installieren Chromium über `playwright install --with-deps chromium`. Die Datenbanktabellen werden einmalig beim Prozessstart initialisiert; Healthchecks verwenden denselben Cache. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` Pflicht. Für den eingebetteten Flask-Scan-Thread sollte ein einzelner Web-Worker verwendet werden.
+Der Web-Service installiert Chromium über `playwright install --with-deps chromium`. Die Datenbanktabellen werden einmalig beim Prozessstart initialisiert; Healthchecks verwenden denselben Cache. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` Pflicht. Für den eingebetteten Flask-Scan-Thread sollte ein einzelner Web-Worker verwendet werden.
 
 ### Render-Variablen
 
@@ -179,3 +179,8 @@ python test_smoke.py
 ```
 
 Die Tests arbeiten mit Fixture-HTML und prüfen Parser, JSON-LD, Preis/Warmmiete, Zimmer, Fläche und URL-Normalisierung ohne Netzwerk.
+
+
+## Render Start Command
+
+Der produktive Start erfolgt mit Gunicorn (`gunicorn app:app`). Zusätzlich bleibt `python main.py` als kompatibler Fallback für bereits konfigurierte Render-Services erhalten; dafür ist kein Uvicorn/FastAPI erforderlich.

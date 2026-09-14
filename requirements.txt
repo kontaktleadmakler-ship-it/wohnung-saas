@@ -6,3 +6,5 @@ Scrapy>=2.19,<2.20
 scrapy-playwright>=0.0.44,<1
 playwright>=1.55,<2
 flask-wtf>=1.2,<2
+
+gunicorn>=23,<24

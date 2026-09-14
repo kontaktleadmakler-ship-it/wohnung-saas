@@ -9,8 +9,8 @@ services:
   - type: web
     name: wohnung-saas-web
     env: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium
-    startCommand: python app.py
+    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
     healthCheckPath: /healthz
     envVars:
       - key: DATABASE_URL
