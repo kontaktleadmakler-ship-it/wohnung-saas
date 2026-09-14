@@ -1,309 +1,418 @@
 from __future__ import annotations
 import os
-from contextlib import contextmanager
-import psycopg2
-import psycopg2.extras
+from datetime import datetime, timedelta, timezone
+
+from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-LOCK_KEY = 738291
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "wohnung_saas")
+LOCK_KEY = "scan_lock"
+LOCK_STALE_SECONDS = 30 * 60  # Schutz gegen ewig gehaltenen Lock bei Absturz
 
-@contextmanager
-def connection():
-    if not DATABASE_URL: raise RuntimeError("DATABASE_URL fehlt")
-    conn=psycopg2.connect(DATABASE_URL, sslmode="require")
-    try: yield conn
-    finally: conn.close()
+_client = None
 
-@contextmanager
-def get_connection():
-    """Öffnet eine DB-Verbindung und schließt sie garantiert auch bei Exceptions."""
+
+def _get_client():
+    global _client
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL fehlt")
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    try:
-        yield conn
-    finally:
-        conn.close()
+    if _client is None:
+        _client = MongoClient(DATABASE_URL)
+    return _client
+
+
+def _db():
+    return _get_client()[MONGO_DB_NAME]
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _next_id(name):
+    """Erzeugt fortlaufende Integer-IDs (Ersatz für SERIAL/BIGSERIAL),
+    damit URL-Routen wie /profiles/<int:pid>/edit unverändert funktionieren."""
+    doc = _db().counters.find_one_and_update(
+        {"_id": name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return doc["seq"]
+
 
 def init_db():
-    with connection() as c:
-        with c.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS profiles(
-              id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, min_price NUMERIC NOT NULL DEFAULT 0,
-              max_price NUMERIC NOT NULL, min_rooms NUMERIC NOT NULL DEFAULT 0, max_rooms NUMERIC,
-              min_size NUMERIC NOT NULL DEFAULT 0, districts TEXT, keywords_exclude TEXT,
-              active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS listings(
-              id BIGSERIAL PRIMARY KEY, source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL,
-              description TEXT, price NUMERIC, price_total NUMERIC, rooms NUMERIC, size NUMERIC,
-              location TEXT, city TEXT, postal_code TEXT, region_code TEXT, url TEXT NOT NULL,
-              contact_name TEXT, contact_phone TEXT, published_at TIMESTAMPTZ, first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), raw JSONB NOT NULL DEFAULT '{}'::jsonb,
-              CONSTRAINT listings_source_external_id_key UNIQUE(source, external_id)
-            );
-            CREATE TABLE IF NOT EXISTS matches(
-              listing_id BIGINT REFERENCES listings(id) ON DELETE CASCADE, profile_id INT REFERENCES profiles(id) ON DELETE CASCADE,
-              score INT NOT NULL CHECK(score BETWEEN 0 AND 100), price_score INT DEFAULT 0, rooms_score INT DEFAULT 0, size_score INT DEFAULT 0, location_score INT DEFAULT 0,
-              reasons JSONB NOT NULL DEFAULT '[]'::jsonb, notified BOOLEAN NOT NULL DEFAULT FALSE, telegram_notified BOOLEAN NOT NULL DEFAULT FALSE, email_notified BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              PRIMARY KEY(listing_id, profile_id)
-            );
-            CREATE TABLE IF NOT EXISTS profile_sources(profile_id INT REFERENCES profiles(id) ON DELETE CASCADE, source TEXT NOT NULL, PRIMARY KEY(profile_id,source));
-            CREATE TABLE IF NOT EXISTS profile_regions(profile_id INT REFERENCES profiles(id) ON DELETE CASCADE, region_code TEXT NOT NULL, PRIMARY KEY(profile_id,region_code));
-            CREATE TABLE IF NOT EXISTS scan_runs(
-              id BIGSERIAL PRIMARY KEY, started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), duration_seconds NUMERIC, summary JSONB NOT NULL DEFAULT '{}'::jsonb
-            );
-            CREATE TABLE IF NOT EXISTS worker_heartbeat(
-              id INT PRIMARY KEY DEFAULT 1,
-              last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              last_cycle_duration_seconds NUMERIC,
-              pid INT,
-              poll_interval_seconds INT,
-              CONSTRAINT worker_heartbeat_singleton CHECK (id = 1)
-            );
-            CREATE INDEX IF NOT EXISTS idx_listings_last_seen ON listings(last_seen DESC);
-            CREATE INDEX IF NOT EXISTS idx_listings_source ON listings(source);
-            CREATE INDEX IF NOT EXISTS idx_matches_score ON matches(score DESC);
-            CREATE INDEX IF NOT EXISTS idx_matches_profile_created ON matches(profile_id,created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_matches_notified ON matches(notified);
-            CREATE INDEX IF NOT EXISTS idx_profile_sources_source ON profile_sources(source);
-            CREATE INDEX IF NOT EXISTS idx_profile_regions_region ON profile_regions(region_code);
-            CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
-            """)
-            cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS raw JSONB NOT NULL DEFAULT '{}'::jsonb")
-            cur.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS telegram_notified BOOLEAN NOT NULL DEFAULT FALSE")
-            cur.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS email_notified BOOLEAN NOT NULL DEFAULT FALSE")
-        c.commit()
+    d = _db()
+    d.profiles.create_index([("id", ASCENDING)], unique=True)
+    d.profiles.create_index([("active", ASCENDING)])
+    d.listings.create_index([("id", ASCENDING)], unique=True)
+    d.listings.create_index([("source", ASCENDING), ("external_id", ASCENDING)], unique=True)
+    d.listings.create_index([("last_seen", DESCENDING)])
+    d.matches.create_index([("listing_id", ASCENDING), ("profile_id", ASCENDING)], unique=True)
+    d.matches.create_index([("score", DESCENDING)])
+    d.matches.create_index([("profile_id", ASCENDING), ("created_at", DESCENDING)])
+    d.matches.create_index([("notified", ASCENDING)])
+    d.scan_runs.create_index([("started_at", DESCENDING)])
+
 
 def cleanup_old_listings(days=60):
-    """Löscht Inserate (und über CASCADE ihre Matches), die seit `days`
-    Tagen in keinem Scan mehr gesehen wurden (last_seen). Reduziert die
-    Speichermenge und begrenzt, wie lange potenziell personenbezogene
-    Felder (contact_name/contact_phone) vorgehalten werden."""
+    """Löscht Inserate (und ihre Matches), die seit `days` Tagen in keinem
+    Scan mehr gesehen wurden (last_seen)."""
     days = max(1, int(days))
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute(
-                "DELETE FROM listings WHERE last_seen < NOW() - (%s * INTERVAL '1 day')",
-                (days,),
-            )
-            deleted = cur.rowcount
-        c.commit()
-    return deleted
+    d = _db()
+    cutoff = _now() - timedelta(days=days)
+    old_ids = [row["id"] for row in d.listings.find({"last_seen": {"$lt": cutoff}}, {"id": 1})]
+    if not old_ids:
+        return 0
+    d.matches.delete_many({"listing_id": {"$in": old_ids}})
+    result = d.listings.delete_many({"id": {"$in": old_ids}})
+    return result.deleted_count
 
 
 def cleanup_scan_runs(days=30):
-    """Entfernt alte Scan-Läufe separat von der Schema-Initialisierung."""
-    # Die Retention bleibt aus init_db herausgelöst, damit Web und Worker
-    # beim Prozessstart nicht denselben DELETE-Lauf doppelt anstoßen.
     days = max(0, int(days))
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute(
-                "DELETE FROM scan_runs WHERE started_at < NOW() - (%s * INTERVAL '1 day')",
-                (days,),
-            )
-        c.commit()
+    cutoff = _now() - timedelta(days=days)
+    _db().scan_runs.delete_many({"started_at": {"$lt": cutoff}})
 
 
 def try_scan_lock():
-    # Der Advisory-Lock muss auf genau dieser Verbindung gehalten werden,
-    # deshalb darf diese Verbindung erst in release_scan_lock() geschlossen werden.
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL fehlt")
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,))
-            ok = cur.fetchone()[0]
-        if ok:
-            return conn
-    except Exception:
-        conn.close()
-        raise
-    conn.close()
+    """Ersetzt den Postgres-Advisory-Lock durch ein Lock-Dokument.
+    Gibt bei Erfolg ein Token zurück (das später an release_scan_lock geht),
+    sonst None."""
+    d = _db()
+    now = _now()
+    stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
+    token = f"{os.getpid()}-{now.timestamp()}"
+    result = d.locks.update_one(
+        {
+            "_id": LOCK_KEY,
+            "$or": [
+                {"acquired_at": {"$lt": stale_before}},
+                {"acquired_at": {"$exists": False}},
+            ],
+        },
+        {"$set": {"token": token, "acquired_at": now}},
+        upsert=True,
+    )
+    if result.matched_count or result.upserted_id is not None:
+        doc = d.locks.find_one({"_id": LOCK_KEY})
+        if doc and doc.get("token") == token:
+            return token
     return None
 
+
 def release_scan_lock(conn):
-    if not conn: return
-    try:
-        with conn.cursor() as cur: cur.execute("SELECT pg_advisory_unlock(%s)",(LOCK_KEY,)); conn.commit()
-    finally: conn.close()
+    if not conn:
+        return
+    _db().locks.delete_one({"_id": LOCK_KEY, "token": conn})
+
 
 def get_setup_stats():
-    """Kleine COUNT-Abfrage für Startup-Log, /healthz und das Dashboard-Banner:
-    verrät auf einen Blick, ob überhaupt ein Scan möglich ist."""
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM profiles WHERE active")
-            active = cur.fetchone()[0]
-            cur.execute("""
-                SELECT COUNT(DISTINCT p.id) FROM profiles p
-                JOIN profile_sources ps ON ps.profile_id = p.id
-                WHERE p.active
-            """)
-            with_sources = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM scan_runs")
-            runs = cur.fetchone()[0]
-            return {
-                "active_profiles": active,
-                "profiles_with_sources": with_sources,
-                "scan_runs": runs,
-            }
+    d = _db()
+    active = d.profiles.count_documents({"active": True})
+    with_sources = d.profiles.count_documents(
+        {"active": True, "sources.0": {"$exists": True}}
+    )
+    runs = d.scan_runs.count_documents({})
+    return {
+        "active_profiles": active,
+        "profiles_with_sources": with_sources,
+        "scan_runs": runs,
+    }
+
+
+def _normalize_profile(p):
+    if p is None:
+        return None
+    p.setdefault("sources", [])
+    p.setdefault("regions", [])
+    p.pop("_id", None)
+    return p
 
 
 def get_active_profiles():
-    with get_connection() as c:
-        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM profiles WHERE active ORDER BY id")
-            return cur.fetchall()
+    docs = list(_db().profiles.find({"active": True}).sort("id", ASCENDING))
+    return [_normalize_profile(p) for p in docs]
+
 
 def get_active_profiles_with_sources():
-    with get_connection() as c:
-        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-              SELECT p.*, COALESCE(array_agg(DISTINCT ps.source) FILTER(WHERE ps.source IS NOT NULL),'{}') sources,
-                     COALESCE(array_agg(DISTINCT pr.region_code) FILTER(WHERE pr.region_code IS NOT NULL),'{}') regions
-              FROM profiles p LEFT JOIN profile_sources ps ON ps.profile_id=p.id LEFT JOIN profile_regions pr ON pr.profile_id=p.id
-              WHERE p.active GROUP BY p.id ORDER BY p.id
-            """)
-            return cur.fetchall()
+    docs = list(_db().profiles.find({"active": True}).sort("id", ASCENDING))
+    return [_normalize_profile(p) for p in docs]
+
 
 def get_profile(profile_id):
-    with get_connection() as c:
-        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM profiles WHERE id=%s",(profile_id,)); p=cur.fetchone()
-            if not p:return None
-            cur.execute("SELECT source FROM profile_sources WHERE profile_id=%s ORDER BY source",(profile_id,)); p['sources']=[r['source'] for r in cur.fetchall()]
-            cur.execute("SELECT region_code FROM profile_regions WHERE profile_id=%s ORDER BY region_code",(profile_id,)); p['regions']=[r['region_code'] for r in cur.fetchall()]
-            return p
+    p = _db().profiles.find_one({"id": profile_id})
+    return _normalize_profile(p)
+
 
 def add_profile(data):
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("INSERT INTO profiles(name,min_price,max_price,min_rooms,max_rooms,min_size,districts,keywords_exclude) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",tuple(data.get(k) for k in ('name','min_price','max_price','min_rooms','max_rooms','min_size','districts','keywords_exclude'))); pid=cur.fetchone()[0]
-        c.commit(); return pid
+    pid = _next_id("profiles")
+    now = _now()
+    doc = {
+        "id": pid,
+        "name": data.get("name"),
+        "min_price": data.get("min_price"),
+        "max_price": data.get("max_price"),
+        "min_rooms": data.get("min_rooms"),
+        "max_rooms": data.get("max_rooms"),
+        "min_size": data.get("min_size"),
+        "districts": data.get("districts"),
+        "keywords_exclude": data.get("keywords_exclude"),
+        "active": True,
+        "sources": [],
+        "regions": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    _db().profiles.insert_one(doc)
+    return pid
 
-def update_profile(pid,data):
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("UPDATE profiles SET name=%s,min_price=%s,max_price=%s,min_rooms=%s,max_rooms=%s,min_size=%s,districts=%s,keywords_exclude=%s,active=%s,updated_at=NOW() WHERE id=%s",tuple(data.get(k) for k in ('name','min_price','max_price','min_rooms','max_rooms','min_size','districts','keywords_exclude','active'))+(pid,)); c.commit()
 
-def set_profile_sources(pid,sources):
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("DELETE FROM profile_sources WHERE profile_id=%s",(pid,))
-            for s in set(sources or []): cur.execute("INSERT INTO profile_sources(profile_id,source) VALUES(%s,%s) ON CONFLICT DO NOTHING",(pid,s))
-        c.commit()
+def update_profile(pid, data):
+    _db().profiles.update_one(
+        {"id": pid},
+        {"$set": {
+            "name": data.get("name"),
+            "min_price": data.get("min_price"),
+            "max_price": data.get("max_price"),
+            "min_rooms": data.get("min_rooms"),
+            "max_rooms": data.get("max_rooms"),
+            "min_size": data.get("min_size"),
+            "districts": data.get("districts"),
+            "keywords_exclude": data.get("keywords_exclude"),
+            "active": data.get("active"),
+            "updated_at": _now(),
+        }},
+    )
 
-def set_profile_regions(pid,regions):
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("DELETE FROM profile_regions WHERE profile_id=%s",(pid,))
-            vals=set(regions or ['DE'])
-            for r in vals: cur.execute("INSERT INTO profile_regions(profile_id,region_code) VALUES(%s,%s) ON CONFLICT DO NOTHING",(pid,r))
-        c.commit()
+
+def set_profile_sources(pid, sources):
+    _db().profiles.update_one(
+        {"id": pid}, {"$set": {"sources": sorted(set(sources or []))}}
+    )
+
+
+def set_profile_regions(pid, regions):
+    vals = sorted(set(regions or ["DE"]))
+    _db().profiles.update_one({"id": pid}, {"$set": {"regions": vals}})
+
 
 def delete_profile(pid):
-    with get_connection() as c:
-        with c.cursor() as cur: cur.execute("DELETE FROM profiles WHERE id=%s",(pid,))
-        c.commit()
+    d = _db()
+    d.profiles.delete_one({"id": pid})
+    d.matches.delete_many({"profile_id": pid})
+
 
 def upsert_listing(item):
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("""INSERT INTO listings(source,external_id,title,description,price,price_total,rooms,size,location,city,postal_code,region_code,url,contact_name,contact_phone,published_at,raw)
-              VALUES(%(source)s,%(external_id)s,%(title)s,%(description)s,%(price)s,%(price_total)s,%(rooms)s,%(size)s,%(address)s,%(city)s,%(postal_code)s,%(region_code)s,%(url)s,%(contact_name)s,%(contact_phone)s,%(published_at)s,%(raw)s)
-              ON CONFLICT(source,external_id) DO UPDATE SET
-                title=EXCLUDED.title,description=EXCLUDED.description,price=EXCLUDED.price,
-                price_total=EXCLUDED.price_total,rooms=EXCLUDED.rooms,size=EXCLUDED.size,
-                location=EXCLUDED.location,city=EXCLUDED.city,postal_code=EXCLUDED.postal_code,
-                region_code=EXCLUDED.region_code,url=EXCLUDED.url,contact_name=EXCLUDED.contact_name,
-                contact_phone=EXCLUDED.contact_phone,
-                published_at=COALESCE(listings.published_at, EXCLUDED.published_at),
-                last_seen=NOW(),raw=EXCLUDED.raw
-              RETURNING id,(xmax=0) AS is_new""",{**item.__dict__,'raw': psycopg2.extras.Json(item.raw or {})}); row=cur.fetchone(); c.commit(); return row[0],row[1]
+    d = _db()
+    now = _now()
+    data = dict(item.__dict__)
+    existing = d.listings.find_one({"source": data["source"], "external_id": data["external_id"]})
+    if existing:
+        update_fields = {
+            "title": data.get("title"),
+            "description": data.get("description"),
+            "price": data.get("price"),
+            "price_total": data.get("price_total"),
+            "rooms": data.get("rooms"),
+            "size": data.get("size"),
+            "location": data.get("address"),
+            "city": data.get("city"),
+            "postal_code": data.get("postal_code"),
+            "region_code": data.get("region_code"),
+            "url": data.get("url"),
+            "contact_name": data.get("contact_name"),
+            "contact_phone": data.get("contact_phone"),
+            "published_at": existing.get("published_at") or data.get("published_at"),
+            "last_seen": now,
+            "raw": data.get("raw") or {},
+        }
+        d.listings.update_one({"id": existing["id"]}, {"$set": update_fields})
+        return existing["id"], False
 
-def save_match(listing_id,profile_id,score,components,reasons):
-    with get_connection() as c:
-        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""INSERT INTO matches(listing_id,profile_id,score,price_score,rooms_score,size_score,location_score,reasons)
-              VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
-              ON CONFLICT(listing_id,profile_id) DO UPDATE SET
-                score=EXCLUDED.score,price_score=EXCLUDED.price_score,rooms_score=EXCLUDED.rooms_score,
-                size_score=EXCLUDED.size_score,location_score=EXCLUDED.location_score,reasons=EXCLUDED.reasons,
-                updated_at=NOW()
-              RETURNING notified,telegram_notified,email_notified""",
-              (listing_id,profile_id,score,*components,psycopg2.extras.Json(reasons)))
-            row=cur.fetchone()
-        c.commit()
-        return dict(row)
+    lid = _next_id("listings")
+    doc = {
+        "id": lid,
+        "source": data.get("source"),
+        "external_id": data.get("external_id"),
+        "title": data.get("title"),
+        "description": data.get("description"),
+        "price": data.get("price"),
+        "price_total": data.get("price_total"),
+        "rooms": data.get("rooms"),
+        "size": data.get("size"),
+        "location": data.get("address"),
+        "city": data.get("city"),
+        "postal_code": data.get("postal_code"),
+        "region_code": data.get("region_code"),
+        "url": data.get("url"),
+        "contact_name": data.get("contact_name"),
+        "contact_phone": data.get("contact_phone"),
+        "published_at": data.get("published_at"),
+        "first_seen": now,
+        "last_seen": now,
+        "raw": data.get("raw") or {},
+    }
+    try:
+        d.listings.insert_one(doc)
+    except DuplicateKeyError:
+        # Race: ein anderer Prozess hat inzwischen denselben (source, external_id) angelegt.
+        existing = d.listings.find_one({"source": doc["source"], "external_id": doc["external_id"]})
+        return existing["id"], False
+    return lid, True
 
-def mark_telegram_notified(listing_id,profile_id):
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("""UPDATE matches SET telegram_notified=TRUE,
-                         notified=(TRUE OR email_notified),updated_at=NOW()
-                         WHERE listing_id=%s AND profile_id=%s""",(listing_id,profile_id))
-        c.commit()
 
-def mark_email_notified(listing_id,profile_id):
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("""UPDATE matches SET email_notified=TRUE,
-                         notified=(TRUE OR telegram_notified),updated_at=NOW()
-                         WHERE listing_id=%s AND profile_id=%s""",(listing_id,profile_id))
-        c.commit()
+def save_match(listing_id, profile_id, score, components, reasons):
+    price_score, rooms_score, size_score, location_score = components
+    now = _now()
+    d = _db()
+    existing = d.matches.find_one({"listing_id": listing_id, "profile_id": profile_id})
+    update_fields = {
+        "score": score,
+        "price_score": price_score,
+        "rooms_score": rooms_score,
+        "size_score": size_score,
+        "location_score": location_score,
+        "reasons": reasons,
+        "updated_at": now,
+    }
+    if existing:
+        d.matches.update_one(
+            {"listing_id": listing_id, "profile_id": profile_id},
+            {"$set": update_fields},
+        )
+        return {
+            "notified": existing.get("notified", False),
+            "telegram_notified": existing.get("telegram_notified", False),
+            "email_notified": existing.get("email_notified", False),
+        }
+    update_fields.update({
+        "listing_id": listing_id,
+        "profile_id": profile_id,
+        "notified": False,
+        "telegram_notified": False,
+        "email_notified": False,
+        "created_at": now,
+    })
+    d.matches.insert_one(update_fields)
+    return {"notified": False, "telegram_notified": False, "email_notified": False}
 
-def mark_notified(listing_id,profile_id):
+
+def mark_telegram_notified(listing_id, profile_id):
+    _db().matches.update_one(
+        {"listing_id": listing_id, "profile_id": profile_id},
+        {"$set": {"telegram_notified": True, "notified": True, "updated_at": _now()}},
+    )
+
+
+def mark_email_notified(listing_id, profile_id):
+    _db().matches.update_one(
+        {"listing_id": listing_id, "profile_id": profile_id},
+        {"$set": {"email_notified": True, "notified": True, "updated_at": _now()}},
+    )
+
+
+def mark_notified(listing_id, profile_id):
     """Backward-compatible helper: mark the overall match as notified."""
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute("UPDATE matches SET notified=TRUE,updated_at=NOW() WHERE listing_id=%s AND profile_id=%s",(listing_id,profile_id))
-        c.commit()
+    _db().matches.update_one(
+        {"listing_id": listing_id, "profile_id": profile_id},
+        {"$set": {"notified": True, "updated_at": _now()}},
+    )
+
 
 def save_scan_run(summary, duration_seconds=None):
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute(
-                "INSERT INTO scan_runs(duration_seconds,summary) VALUES(%s,%s)",
-                (duration_seconds, psycopg2.extras.Json(summary)),
-            )
-        c.commit()
+    sid = _next_id("scan_runs")
+    _db().scan_runs.insert_one({
+        "id": sid,
+        "started_at": _now(),
+        "duration_seconds": duration_seconds,
+        "summary": summary,
+    })
+
 
 def get_last_scan_run():
-    with get_connection() as c:
-        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 1")
-            return cur.fetchone()
+    doc = _db().scan_runs.find_one(sort=[("started_at", DESCENDING)])
+    if doc:
+        doc.pop("_id", None)
+    return doc
+
 
 def record_worker_heartbeat(duration_seconds=None, pid=None, poll_interval_seconds=None):
     """Vom Worker nach JEDEM Zyklus aufzurufen (auch bei Exceptions, auch ohne
-    aktive Profile) – VOR dem sleep. Einzige Zeile (id=1), daher UPSERT."""
-    with get_connection() as c:
-        with c.cursor() as cur:
-            cur.execute(
-                """INSERT INTO worker_heartbeat(id,last_seen_at,last_cycle_duration_seconds,pid,poll_interval_seconds)
-                   VALUES(1,NOW(),%s,%s,%s)
-                   ON CONFLICT(id) DO UPDATE SET last_seen_at=NOW(),
-                     last_cycle_duration_seconds=EXCLUDED.last_cycle_duration_seconds,
-                     pid=EXCLUDED.pid, poll_interval_seconds=EXCLUDED.poll_interval_seconds""",
-                (duration_seconds, pid, poll_interval_seconds),
-            )
-        c.commit()
+    aktive Profile) – VOR dem sleep. Einzige Zeile (id=1), daher Upsert."""
+    _db().worker_heartbeat.update_one(
+        {"_id": 1},
+        {"$set": {
+            "last_seen_at": _now(),
+            "last_cycle_duration_seconds": duration_seconds,
+            "pid": pid,
+            "poll_interval_seconds": poll_interval_seconds,
+        }},
+        upsert=True,
+    )
+
 
 def get_worker_heartbeat():
-    with get_connection() as c:
-        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM worker_heartbeat WHERE id=1")
-            return cur.fetchone()
+    doc = _db().worker_heartbeat.find_one({"_id": 1})
+    if doc:
+        doc.pop("_id", None)
+    return doc
+
 
 DASHBOARD_LIMIT = max(1, int(os.getenv("DASHBOARD_LIMIT", "300")))
 
-def get_dashboard_rows(min_score=0,profile_id=None,limit=None):
+
+def get_dashboard_rows(min_score=0, profile_id=None, limit=None):
     limit = DASHBOARD_LIMIT if limit is None else max(1, int(limit))
-    with get_connection() as c:
-        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            q="""SELECT m.*,l.title,l.price,l.price_total,l.rooms,l.size,l.location,l.url,l.source,l.first_seen,l.last_seen,p.name profile_name FROM matches m JOIN listings l ON l.id=m.listing_id JOIN profiles p ON p.id=m.profile_id WHERE m.score >= %s"""; args=[min_score]
-            if profile_id:q+=" AND p.id=%s"; args.append(profile_id)
-            q+=" ORDER BY m.score DESC,m.created_at DESC LIMIT %s"; args.append(limit); cur.execute(q,args); return cur.fetchall()
+    d = _db()
+    match_filter = {"score": {"$gte": min_score}}
+    if profile_id:
+        match_filter["profile_id"] = profile_id
+
+    pipeline = [
+        {"$match": match_filter},
+        {"$sort": {"score": DESCENDING, "created_at": DESCENDING}},
+        {"$limit": limit},
+        {"$lookup": {
+            "from": "listings", "localField": "listing_id",
+            "foreignField": "id", "as": "listing",
+        }},
+        {"$unwind": "$listing"},
+        {"$lookup": {
+            "from": "profiles", "localField": "profile_id",
+            "foreignField": "id", "as": "profile",
+        }},
+        {"$unwind": "$profile"},
+    ]
+    rows = []
+    for doc in d.matches.aggregate(pipeline):
+        listing = doc["listing"]
+        profile = doc["profile"]
+        rows.append({
+            "listing_id": doc["listing_id"],
+            "profile_id": doc["profile_id"],
+            "score": doc.get("score"),
+            "price_score": doc.get("price_score"),
+            "rooms_score": doc.get("rooms_score"),
+            "size_score": doc.get("size_score"),
+            "location_score": doc.get("location_score"),
+            "reasons": doc.get("reasons"),
+            "notified": doc.get("notified"),
+            "telegram_notified": doc.get("telegram_notified"),
+            "email_notified": doc.get("email_notified"),
+            "created_at": doc.get("created_at"),
+            "updated_at": doc.get("updated_at"),
+            "title": listing.get("title"),
+            "price": listing.get("price"),
+            "price_total": listing.get("price_total"),
+            "rooms": listing.get("rooms"),
+            "size": listing.get("size"),
+            "location": listing.get("location"),
+            "url": listing.get("url"),
+            "source": listing.get("source"),
+            "first_seen": listing.get("first_seen"),
+            "last_seen": listing.get("last_seen"),
+            "profile_name": profile.get("name"),
+        })
+    return rows
