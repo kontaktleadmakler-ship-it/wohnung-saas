@@ -13,9 +13,9 @@
 services:
   - type: web
     name: wohnung-saas-web
-    env: python
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
     healthCheckPath: /healthz
     envVars:
       - key: DATABASE_URL
@@ -42,8 +42,6 @@ services:
         sync: false
       - key: SMTP_USE_TLS
         value: "true"
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
       - key: DASHBOARD_LIMIT
         value: "300"
       - key: POLL_INTERVAL_SECONDS
@@ -86,13 +84,13 @@ services:
 
   - type: cron
     name: wohnung-saas-cron
-    env: python
+    env: docker
+    dockerfilePath: ./Dockerfile
     # Alle 10 Minuten. In POLL_INTERVAL_SECONDS-Größenordnung, aber als
     # echter, vom Web-Traffic unabhängiger Render-Zeitplan statt eines
     # Dauer-Threads im Webprozess.
     schedule: "*/10 * * * *"
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
-    startCommand: python scraper.py --once
+    dockerCommand: python scraper.py --once
     envVars:
       - key: DATABASE_URL
         sync: false
@@ -114,8 +112,6 @@ services:
         sync: false
       - key: SMTP_USE_TLS
         value: "true"
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
       - key: POLL_INTERVAL_SECONDS
         value: "300"
       - key: MIN_NOTIFY_SCORE
