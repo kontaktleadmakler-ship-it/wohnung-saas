@@ -114,14 +114,24 @@ def _run_scan_once_embedded():
         return 1
 
 def _background_scanner():
-    """Läuft als Daemon-Thread im Web-Prozess und stößt periodisch einen
-    Scan im selben Python-Prozess an."""
+    """Periodisch einen isolierten Scrapy/Playwright-Scan starten.
+
+    Der Webprozess bleibt dabei der Supervisor; Scrapy/Twisted lebt nur im
+    kurzlebigen Kindprozess. So ist der Render-Startpfad deterministisch und
+    ein Browserfehler kann Gunicorn nicht mitreißen.
+    """
     poll_interval = worker.POLL_INTERVAL_SECONDS
+    initial_delay = max(0, int(os.getenv("INITIAL_SCAN_DELAY_SECONDS", "30")))
     log.info(
-        "Eingebetteter Scan-Thread gestartet (pid=%s): poll_interval=%ss",
-        os.getpid(), poll_interval,
+        "AUTO-SCAN: thread started (pid=%s, poll_interval=%ss, initial_delay=%ss)",
+        os.getpid(), poll_interval, initial_delay,
     )
+    if initial_delay:
+        log.info("AUTO-SCAN: waiting %ss before first scan", initial_delay)
+        time.sleep(initial_delay)
+
     while True:
+        log.info("AUTO-SCAN: launching scraper.py --once")
         started = time.monotonic()
         with scan_lock:
             already_running = bool(scan_thread and scan_thread.is_alive())
@@ -129,7 +139,7 @@ def _background_scanner():
             log.info("Eingebetteter Scan übersprungen: manueller Scan läuft bereits")
         else:
             returncode = _run_scan_once_embedded()
-            log.info("Eingebetteter Scan fertig (exit=%s)", returncode)
+            log.info("AUTO-SCAN: scraper.py finished (exit=%s)", returncode)
 
         # Fallback-Heartbeat: unabhängig vom Exit-Code des Subprozesses,
         # damit /healthz auch dann aktuell bleibt, wenn scraper.py --once
@@ -166,10 +176,14 @@ def _maybe_start_background_scanner():
     """
     enabled = os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}
     if enabled:
-        _ensure_db_initialized()
-        _start_background_scanner_once()
+        log.info("AUTO-SCAN: enabled during app import (pid=%s)", os.getpid())
+        if _ensure_db_initialized():
+            _start_background_scanner_once()
+            log.info("AUTO-SCAN: background thread launch requested")
+        else:
+            log.error("AUTO-SCAN: DB initialization failed; scanner NOT started")
     else:
-        log.info("Automatischer Scan deaktiviert (ENABLE_AUTO_SCAN=false)")
+        log.info("AUTO-SCAN: disabled (ENABLE_AUTO_SCAN=false)")
 
 
 def _heartbeat_status():

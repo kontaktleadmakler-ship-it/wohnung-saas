@@ -381,10 +381,14 @@ def run_once_and_heartbeat(profile_id=None):
     Fallback-Heartbeat in app.py::_background_scanner().
     """
     started = time.monotonic()
-    log.info("Einzelscan (--once) gestartet (pid=%s)", os.getpid())
+    log.info("SCRAPER: --once started (pid=%s, profile_id=%s)", os.getpid(), profile_id)
     try:
         db.init_db()
+        log.info("SCRAPER: DB initialized")
+        profiles = db.get_active_profiles_with_sources()
+        log.info("SCRAPER: active profiles with sources=%d", len(profiles))
         result = run_once(profile_id=profile_id)
+        log.info("SCRAPER: --once completed: %s", result)
         return result
     finally:
         elapsed = time.monotonic() - started
@@ -394,7 +398,7 @@ def run_once_and_heartbeat(profile_id=None):
                 pid=os.getpid(),
                 poll_interval_seconds=POLL_INTERVAL_SECONDS,
             )
-            log.info("Heartbeat geschrieben (Einzelscan, %.1fs)", elapsed)
+            log.info("SCRAPER: heartbeat written (%.1fs)", elapsed)
         except Exception:
             log.exception("Heartbeat konnte nicht gespeichert werden (Einzelscan)")
 
