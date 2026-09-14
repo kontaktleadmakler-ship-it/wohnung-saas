@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import logging
+import os
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import db
+from logging_setup import configure_logging
+from matching import listing_fingerprint, score_listing
+from telegram import send_telegram, format_match_message
+from email_notifier import send_email, format_match_email, is_configured as email_configured
+from scrapers.registry import get_scraper
+from wohnungsradar_scrapy.adapters import run_scrapy_jobs, get_last_run_status
+from scrapers.models import SearchParams
+from scrapers.regions import STATE_CITY_SAMPLES
+
+configure_logging()
+log = logging.getLogger("worker")
+
+POLL_INTERVAL_SECONDS = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
+# Beeinflusst nur, ob eine Telegram-Benachrichtigung verschickt wird - nicht,
+# ob ein Match in der DB gespeichert wird. Ein Match mit Score < MIN_NOTIFY_SCORE
+# landet trotzdem in `matches` und erscheint im Dashboard (Default min_score=0
+# dort zeigt alle). "Keine Treffer" im Dashboard trotz gesetzter MIN_NOTIFY_SCORE
+# deutet daher eher auf einen leeren Scan als auf diese Schwelle hin.
+MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
+# Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
+# aus einem Portal auf einmal in Playwright/Python weiterreichen.
+MAX_CANDIDATES_PER_SOURCE = max(0, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "0")))
+# TODO: Ein geteilter Browser mit ausgeliehenen Contexts könnte später mehr Parallelität
+# erlauben; auf kleinen Render-Instanzen ist ein Browser pro Job sonst zu speicherintensiv.
+
+REASON_LABELS = {
+    "excluded_keyword": "Ausschlussbegriff im Text",
+    "over_budget": "über dem Mietbudget",
+    "too_small": "zu klein",
+    "too_few_rooms": "zu wenig Zimmer",
+    "too_many_rooms": "zu viele Zimmer",
+}
+
+
+def _locations(profile):
+    raw = profile.get("districts") or ""
+    vals = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+    if vals:
+        return vals
+    regions = [str(code).strip().upper() for code in (profile.get("regions") or []) if str(code).strip()]
+    if not regions or "DE" in regions:
+        # Bei DE bleibt der Standort leer; _run_job setzt nationwide=True und die
+        # jeweiligen Scraper wählen dafür ihre deutschlandweiten Portal-URLs.
+        return []
+
+    locations = []
+    seen = set()
+    for code in regions:
+        for city in STATE_CITY_SAMPLES.get(code, []):
+            if city not in seen:
+                seen.add(city)
+                locations.append(city)
+    return locations
+
+
+def build_jobs(profiles):
+    """Build exactly the jobs selected in the dashboard.
+
+    profile_sources is the source of truth. No hard-coded portal allowlist is
+    applied here, so every source selected by the user is scanned.
+    """
+    jobs = {}
+    for p in profiles:
+        regions = tuple(sorted(p.get("regions") or ["DE"]))
+        locations = tuple(sorted(_locations(p)))
+        for source in p.get("sources") or []:
+            key = (source, regions, locations)
+            jobs.setdefault(key, set()).add(p["id"])
+    return jobs
+
+def _run_job(job):
+    source, regions, locations, profile_ids = job
+    log.info("[%s] Scan startet: Profile=%s, Regionen=%s, Orte=%s", source, sorted(profile_ids), sorted(regions), sorted(locations))
+    scraper = get_scraper(source)
+    params = SearchParams(
+        nationwide=("DE" in regions and not locations),
+        region_codes=[] if "DE" in regions else list(regions),
+        locations=list(locations),
+    )
+    listings = scraper.run(params)
+    return source, profile_ids, listings
+
+
+def process_listing(item, profiles_by_id, profile_ids, profile_stats):
+    listing_id, _is_new = db.upsert_listing(item)
+
+    for pid in profile_ids:
+        stats = profile_stats[pid]
+        stats["seen"] += 1
+
+        profile = profiles_by_id[pid]
+        payload = dict(item.__dict__)
+        result = score_listing(payload, profile)
+        if result is None:
+            reason = payload.get("_exclude_reason", "other")
+            stats["excluded"][reason] += 1
+            continue
+
+        stats["matched"] += 1
+        score, components, reasons = result
+        notification_state = db.save_match(listing_id, pid, score, components, reasons)
+
+        if score >= MIN_NOTIFY_SCORE:
+            msg = format_match_message(
+                profile["name"],
+                score,
+                item.title,
+                item.price_total or item.price,
+                item.rooms,
+                item.size,
+                item.address,
+                item.url,
+                item.source,
+                price_total=item.price_total,
+            )
+
+            # Telegram and e-mail are tracked independently. A temporary
+            # failure of one channel therefore does not suppress retries for
+            # that channel on the next scan.
+            if not notification_state.get("telegram_notified"):
+                if send_telegram(msg):
+                    db.mark_telegram_notified(listing_id, pid)
+
+            if email_configured() and not notification_state.get("email_notified"):
+                subject, text, html_body = format_match_email(
+                    profile["name"], score, item.title,
+                    item.price_total or item.price, item.rooms,
+                    item.size, item.address, item.url, item.source,
+                    price_total=item.price_total,
+                )
+                if send_email(subject, text, html_body):
+                    db.mark_email_notified(listing_id, pid)
+
+
+def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
+    """Turn the raw per-profile counters into the human-readable funnel the
+    dashboard shows, and log it, so a profile that ends up with zero matches
+    can be explained (missing scraper results vs. a filter being too
+    strict) instead of just showing an empty list."""
+    funnel = {}
+    for pid, stats in profile_stats.items():
+        name = profiles_by_id.get(pid, {}).get("name", f"Profil {pid}")
+        excluded_total = sum(stats["excluded"].values())
+        by_reason = {
+            REASON_LABELS.get(reason, reason): count
+            for reason, count in stats["excluded"].items()
+            if count
+        }
+        funnel[pid] = {
+            "profile_name": name,
+            "candidates_seen": stats["seen"],
+            "excluded_total": excluded_total,
+            "excluded_by_reason": by_reason,
+            "matched": stats["matched"],
+        }
+        log.info(
+            "[FUNNEL] Profil '%s': %d Kandidaten -> %d ausgeschlossen (%s) -> %d passend",
+            name,
+            stats["seen"],
+            excluded_total,
+            ", ".join(f"{v} {k}" for k, v in by_reason.items()) or "-",
+            stats["matched"],
+        )
+    return {"per_source": source_counts, "per_profile": funnel}
+
+
+def run_once(profile_id=None):
+    """Run one scan, optionally restricted to exactly one dashboard-selected profile."""
+    if profile_id is not None:
+        try:
+            profile_id = int(profile_id)
+        except (TypeError, ValueError):
+            log.warning("Ungültige Profil-ID %r - Scan abgebrochen", profile_id)
+            return {"jobs": 0, "listings": 0, "error": "invalid_profile_id"}
+        profile = db.get_profile(profile_id)
+        profiles = [profile] if profile and profile.get("active") else []
+        log.info("run_once: gezieltes Profil %s geladen: %s",
+                 profile_id, profile.get("name") if profile else "NICHT GEFUNDEN")
+    else:
+        profiles = db.get_active_profiles_with_sources()
+        log.info("run_once: %d aktive Profile geladen", len(profiles))
+    if not profiles:
+        log.warning(
+            "Keine aktiven Profile - nichts zu tun. Bitte im Dashboard "
+            "mindestens ein Profil anlegen und ihm Quellen zuweisen."
+        )
+        return {"jobs": 0, "listings": 0}
+
+    lock = db.try_scan_lock()
+    if not lock:
+        log.warning(
+            "Scan bereits durch einen anderen Prozess gesperrt (Web- und "
+            "Worker-Service teilen sich denselben Advisory-Lock)"
+        )
+        return {"jobs": 0, "listings": 0, "locked": True}
+    log.info("Advisory-Lock erworben")
+
+    started = time.monotonic()
+    total = 0
+
+    try:
+        profiles_by_id = {p["id"]: p for p in profiles}
+        for p in profiles:
+            log.info(
+                "Profil %s '%s': Quellen=%s Regionen=%s Orte=%s Filter=%s-%s EUR, %s-%s Zimmer, ab %s m²",
+                p["id"], p.get("name", ""), sorted(p.get("sources") or []),
+                sorted(p.get("regions") or []), _locations(p),
+                p.get("min_price"), p.get("max_price"), p.get("min_rooms"),
+                p.get("max_rooms"), p.get("min_size"),
+            )
+        jobs = build_jobs(profiles)
+        log.info(
+            "Scan-Kontext: Profile=%s, Quellen=%s",
+            sorted(profiles_by_id),
+            sorted({src for (src, _regions, _locations) in jobs}) if jobs else [],
+        )
+
+        # One job per unique source + search scope. Profiles sharing the same
+        # scope reuse the same scrape result instead of hitting the portal again.
+        work = [
+            (source, regions, locations, frozenset(profile_ids))
+            for (source, regions, locations), profile_ids in jobs.items()
+        ]
+
+        log.info(
+            "Geplante Jobs: %d (%s)",
+            len(work),
+            ", ".join(sorted({job[0] for job in work})) or "keine",
+        )
+        if not work:
+            log.warning(
+                "Keine Scraper-Jobs: Profile existieren, aber ihnen sind keine "
+                "Quellen zugewiesen (profile_sources leer)."
+            )
+            return {"jobs": 0, "listings": 0}
+
+        all_results = []
+        source_counts = defaultdict(int)
+        source_errors = []
+        source_empty = []
+        source_unavailable = []
+
+        # Ein Scrapy-Prozess pro kompletter Scan. Alle Portal-Spider laufen
+        # darin, damit der Twisted-Reactor nicht mehrfach gestartet werden muss.
+        try:
+            all_results = run_scrapy_jobs(work)
+            runner_status = get_last_run_status()
+            for status in runner_status:
+                if status.get("status") == "source unavailable":
+                    source_unavailable.append(status.get("source"))
+                else:
+                    source_errors.append(status.get("source"))
+            for job, (profile_ids, listings) in zip(work, all_results):
+                source = job[0]
+                log.info(
+                    "[%s] Scrapy-Portal OK: %d Listings, Profile: %s",
+                    source, len(listings), sorted(profile_ids),
+                )
+                if not listings:
+                    source_empty.append(source)
+                total += len(listings)
+                source_counts[source] += len(listings)
+        except Exception:
+            log.exception("Scrapy-Gesamtlauf fehlgeschlagen")
+            source_errors.extend(sorted({job[0] for job in work}))
+            all_results = []
+
+        # Cross-source in-memory dedupe. DB uniqueness remains the final guard.
+        seen = set()
+        processed = 0
+        profile_stats = defaultdict(
+            lambda: {"seen": 0, "matched": 0, "excluded": defaultdict(int)}
+        )
+        for profile_ids, listings in all_results:
+            for item in listings:
+                key = listing_fingerprint(item.__dict__)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    process_listing(item, profiles_by_id, profile_ids, profile_stats)
+                    processed += 1
+                except Exception:
+                    log.exception(
+                        "Listing-Verarbeitung fehlgeschlagen: %s", item.url
+                    )
+
+        funnel = _log_and_build_funnel(profiles_by_id, profile_stats, dict(source_counts))
+        funnel["source_errors"] = sorted(set(source_errors))
+        funnel["source_empty"] = sorted(set(source_empty))
+        funnel["source_unavailable"] = sorted(set(source_unavailable))
+        funnel["scraped_total"] = total
+        funnel["unique_total"] = processed
+        funnel["profiles_count"] = len(profiles)
+        funnel["jobs_count"] = len(work)
+
+        log.info(
+            "Quellen-Ergebnis: %s",
+            ", ".join(f"{src}={cnt}" for src, cnt in sorted(source_counts.items()))
+            or "keine Quellen haben Daten geliefert",
+        )
+
+        elapsed = time.monotonic() - started
+        log.info(
+            "Scan beendet: jobs=%d, scraped=%d, unique=%d, duration=%.1fs, "
+            "fehlerhafte_quellen=%s, leere_quellen=%s",
+            len(work), total, processed, elapsed,
+            source_errors or "-", source_empty or "-",
+        )
+        try:
+            db.save_scan_run(funnel, elapsed)
+        except Exception:
+            log.exception("Scan-Zusammenfassung konnte nicht gespeichert werden")
+
+        return {"jobs": len(work), "listings": total, "unique": processed}
+    finally:
+        db.release_scan_lock(lock)
+
+
+def worker_loop():
+    log.info(
+        "Konfiguration: DATABASE_URL=%s, TELEGRAM=%s, POLL=%ss, MIN_NOTIFY_SCORE=%s",
+        "gesetzt" if os.getenv("DATABASE_URL") else "FEHLT",
+        "gesetzt" if os.getenv("TELEGRAM_BOT_TOKEN") else "nicht gesetzt",
+        "gesetzt" if email_configured() else "nicht gesetzt",
+        POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
+    )
+    log.info(
+        "Worker gestartet (pid=%s): poll_interval=%ss, min_notify_score=%s, log_level=%s",
+        os.getpid(), POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
+        os.getenv("LOG_LEVEL", "INFO"),
+    )
+    db.init_db()
+    db.cleanup_scan_runs()
+    log.info("DB initialisiert, Retention aufgeräumt - erster Scan startet in Kürze")
+    while True:
+        started = time.monotonic()
+        log.info("Scan-Zyklus startet")
+        try:
+            run_once()
+        except Exception:
+            log.exception("Gesamtlauf fehlgeschlagen")
+
+        elapsed = time.monotonic() - started
+        log.info(
+            "Scan-Zyklus beendet in %.1fs, schlafe %.0fs bis zum nächsten Lauf",
+            elapsed, max(0, POLL_INTERVAL_SECONDS - elapsed),
+        )
+        try:
+            db.record_worker_heartbeat(
+                duration_seconds=elapsed,
+                pid=os.getpid(),
+                poll_interval_seconds=POLL_INTERVAL_SECONDS,
+            )
+        except Exception:
+            log.exception("Heartbeat konnte nicht gespeichert werden")
+
+        time.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
+
+
+def run_once_and_heartbeat(profile_id=None):
+    """Ein einzelner Scan-Zyklus für den `--once`-Modus (Subprozess, der vom
+    Web-Prozess periodisch gestartet wird).
+
+    Der Heartbeat wird bewusst in einem `finally`-Block geschrieben: läuft
+    `run_once()` sauber durch, läuft in einen Fehler oder wird der Prozess
+    mitten im Scan gekillt (OOM etc.) und die Exception läuft bis hierhin
+    hoch, soll `worker_last_seen_seconds_ago` in /healthz trotzdem aktuell
+    bleiben - andernfalls bleibt es dauerhaft `null`, obwohl der Subprozess
+    ja tatsächlich lief. Ein harter SIGKILL (exit=-9) kann diesen
+    finally-Block selbst nicht mehr erreichen; dafür gibt es den
+    Fallback-Heartbeat in app.py::_background_scanner().
+    """
+    started = time.monotonic()
+    log.info("Einzelscan (--once) gestartet (pid=%s)", os.getpid())
+    try:
+        db.init_db()
+        result = run_once(profile_id=profile_id)
+        return result
+    finally:
+        elapsed = time.monotonic() - started
+        try:
+            db.record_worker_heartbeat(
+                duration_seconds=elapsed,
+                pid=os.getpid(),
+                poll_interval_seconds=POLL_INTERVAL_SECONDS,
+            )
+            log.info("Heartbeat geschrieben (Einzelscan, %.1fs)", elapsed)
+        except Exception:
+            log.exception("Heartbeat konnte nicht gespeichert werden (Einzelscan)")
+
+
+def _dry_run():
+    """Loggt aktive Profile und die daraus gebauten Jobs + Such-URLs, ohne
+    Playwright oder Portal-Requests zu starten. Schnellster Weg zu prüfen:
+    "Welche Such-URLs würden überhaupt gebaut?" (python scraper.py --dry-run)."""
+    profiles = db.get_active_profiles_with_sources()
+    log.info("Dry-Run: %d aktive Profile geladen", len(profiles))
+    if not profiles:
+        log.warning("Dry-Run: keine aktiven Profile - nichts zu tun.")
+        return
+    jobs = build_jobs(profiles)
+    if not jobs:
+        log.warning("Dry-Run: Profile existieren, aber ohne zugewiesene Quellen.")
+        return
+    for (source, regions, locations), profile_ids in jobs.items():
+        scraper = get_scraper(source)
+        params = SearchParams(
+            nationwide=("DE" in regions and not locations),
+            region_codes=[] if "DE" in regions else list(regions),
+            locations=list(locations),
+        )
+        urls = scraper.build_search_urls(params)
+        log.info(
+            "[%s] Profile=%s Regionen=%s Orte=%s -> %d Such-URL(s)",
+            source, sorted(profile_ids), regions, locations, len(urls),
+        )
+        for url in urls:
+            log.info("  URL: %s", url)
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--dry-run" in sys.argv:
+        _dry_run()
+    elif "--once" in sys.argv:
+        profile_id = None
+        if "--profile-id" in sys.argv:
+            try:
+                idx = sys.argv.index("--profile-id")
+                profile_id = int(sys.argv[idx + 1])
+            except (ValueError, IndexError):
+                log.error("--profile-id benötigt eine gültige ID")
+                raise SystemExit(2)
+        run_once_and_heartbeat(profile_id=profile_id)
+    else:
+        worker_loop()

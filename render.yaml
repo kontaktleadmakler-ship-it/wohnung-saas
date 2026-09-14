@@ -1,0 +1,74 @@
+# Nur EIN Web-Service; der Scan läuft eingebettet und seriell
+# (`python scraper.py --once`) innerhalb des Web-Prozesses (siehe
+# app.py::_background_scanner). Der frühere separate `wohnung-saas-worker`
+# Service ist entfallen - falls er in Render noch existiert, kann er
+# gelöscht werden, sonst läuft der Scan doppelt (zwei Prozesse teilen sich
+# zwar denselben Advisory-Lock, verbrauchen aber unnötig einen zweiten
+# Free-Tier-Slot).
+services:
+  - type: web
+    name: wohnung-saas-web
+    env: python
+    buildCommand: pip install -r requirements.txt && playwright install chromium
+    startCommand: python app.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_TO
+        sync: false
+      - key: SMTP_USE_TLS
+        value: "true"
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
+      - key: DASHBOARD_LIMIT
+        value: "300"
+      - key: POLL_INTERVAL_SECONDS
+        value: "300"
+      - key: INITIAL_SCAN_DELAY_SECONDS
+        value: "30"
+      - key: MIN_NOTIFY_SCORE
+        value: "75"
+      - key: SCRAPE_MAX_PAGES
+        value: "3"
+      - key: MAX_CANDIDATES_PER_SOURCE
+        value: "0"
+      - key: SCRAPE_DELAY_MIN
+        value: "0.8"
+      - key: SCRAPE_DELAY_MAX
+        value: "1.8"
+      - key: SCRAPE_WAIT_MS
+        value: "1800"
+      - key: SCRAPE_PAGE_TIMEOUT_MS
+        value: "30000"
+      - key: SCRAPE_RETRIES
+        value: "3"
+      - key: SCRAPE_BACKOFF_BASE
+        value: "1.5"
+      - key: LOG_LEVEL
+        value: "INFO"
+      # PYTHONUNBUFFERED=1 zusammen mit dem Flushing-Handler in
+      # logging_setup.py, damit bei einem harten Kill (OOM,
+      # Health-Check-Timeout) keine Log-Zeilen im Puffer verloren gehen.
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+# Auto-Scan bleibt beim Boot bewusst deaktiviert; Scans über das Dashboard starten.
