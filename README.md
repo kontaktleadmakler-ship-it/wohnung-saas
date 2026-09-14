@@ -1,3 +1,9 @@
+# WohnungsRadar V13
+
+Production hardening focused on Scrapy request lifecycle telemetry, per-job feeds, failure classification, scan supervision, lock/timeout diagnostics, and current-vs-last scan state.
+
+See `V13_FIXES.md` for the complete change log and deployment/test status.
+
 # Wohnungsradar – deutsche Immobilien-Scraping-Anwendung
 
 Flask-Dashboard + MongoDB + Playwright/BeautifulSoup + periodischer Scan + Telegram- und E-Mail-Benachrichtigungen.

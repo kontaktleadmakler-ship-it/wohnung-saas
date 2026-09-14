@@ -8,8 +8,10 @@ CONCURRENT_REQUESTS = 1
 CONCURRENT_REQUESTS_PER_DOMAIN = 1
 DOWNLOAD_TIMEOUT = 30
 RETRY_ENABLED = True
-RETRY_TIMES = 3
-RETRY_HTTP_CODES = [403, 408, 425, 429, 500, 502, 503, 504]
+RETRY_TIMES = max(0, int(os.getenv("SCRAPE_RETRIES", "3")))
+# 403 is a portal/blocking signal, not a transient error. Retrying it only
+# wastes time and can make a block worse. 429 is still retried in a bounded way.
+RETRY_HTTP_CODES = [408, 425, 429, 500, 502, 503, 504]
 DOWNLOAD_DELAY = 1.0
 RANDOMIZE_DOWNLOAD_DELAY = True
 AUTOTHROTTLE_ENABLED = True
@@ -60,6 +62,7 @@ PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 30000
 
 ITEM_PIPELINES = {
     "wohnungsradar_scrapy.pipelines.NormalizePipeline": 100,
+    "wohnungsradar_scrapy.pipelines.JobFeedPipeline": 200,
 }
 FEED_EXPORT_ENCODING = "utf-8"
 LOG_LEVEL = "INFO"

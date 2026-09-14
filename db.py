@@ -91,6 +91,7 @@ def init_db():
     d.matches.create_index([("profile_id", ASCENDING), ("created_at", DESCENDING)])
     d.matches.create_index([("notified", ASCENDING)])
     d.scan_runs.create_index([("started_at", DESCENDING)])
+    d.scan_state.create_index([("updated_at", DESCENDING)])
 
 
 def cleanup_old_listings(days=60):
@@ -199,6 +200,64 @@ def release_scan_lock(conn):
         return
     _db().locks.delete_one({"_id": LOCK_KEY, "token": conn})
 
+
+
+def set_current_scan(run_id, *, pid=None, status="running", started_at=None,
+                     jobs=None, mode="auto", progress=None, exit_code=None,
+                     ended_at=None, error=None):
+    """Persist the scan currently owned by the supervisor.
+
+    This is deliberately a single MongoDB document so the dashboard can
+    distinguish a running child process from the previous completed scan.
+    """
+    now = _now()
+    doc = {
+        "_id": "current",
+        "run_id": str(run_id),
+        "pid": pid,
+        "status": status,
+        "started_at": started_at or now,
+        "updated_at": now,
+        "jobs": jobs or [],
+        "mode": mode,
+        "progress": progress or {},
+        "exit_code": exit_code,
+        "ended_at": ended_at,
+        "error": error,
+    }
+    _db().scan_state.replace_one({"_id": "current"}, doc, upsert=True)
+    return doc
+
+
+def update_current_scan(run_id, **fields):
+    """Atomically update the current scan only when the run id still matches."""
+    fields["updated_at"] = _now()
+    result = _db().scan_state.update_one(
+        {"_id": "current", "run_id": str(run_id)},
+        {"$set": fields},
+    )
+    return result.matched_count == 1
+
+
+def get_current_scan():
+    doc = _db().scan_state.find_one({"_id": "current"}, {"_id": 0})
+    return doc
+
+
+def clear_current_scan(run_id, *, status="finished", exit_code=0, error=None):
+    """Mark the current scan terminally; do not delete history."""
+    now = _now()
+    result = _db().scan_state.update_one(
+        {"_id": "current", "run_id": str(run_id)},
+        {"$set": {
+            "status": status,
+            "exit_code": exit_code,
+            "ended_at": now,
+            "updated_at": now,
+            "error": error,
+        }},
+    )
+    return result.matched_count == 1
 
 def get_setup_stats():
     d = _db()
@@ -416,11 +475,11 @@ def mark_notified(listing_id, profile_id):
     )
 
 
-def save_scan_run(summary, duration_seconds=None):
+def save_scan_run(summary, duration_seconds=None, started_at=None):
     sid = _next_id("scan_runs")
     _db().scan_runs.insert_one({
         "id": sid,
-        "started_at": _now(),
+        "started_at": started_at or _now(),
         "duration_seconds": duration_seconds,
         "summary": summary,
     })

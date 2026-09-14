@@ -77,6 +77,14 @@ def build_jobs(profiles):
             jobs.setdefault(key, set()).add(p["id"])
     return jobs
 
+def _update_scan_state(run_id, **fields):
+    if not run_id:
+        return
+    try:
+        db.update_current_scan(run_id, **fields)
+    except Exception:
+        log.exception("Scan-State konnte nicht aktualisiert werden")
+
 def _run_job(job):
     source, regions, locations, profile_ids = job
     log.info("[%s] Scan startet: Profile=%s, Regionen=%s, Orte=%s", source, sorted(profile_ids), sorted(regions), sorted(locations))
@@ -174,38 +182,38 @@ def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
 
 
 def run_once(profile_id=None):
-    """Run one scan, optionally restricted to exactly one dashboard-selected profile."""
+    """Run one scan, optionally restricted to one dashboard-selected profile."""
+    scan_run_id = os.getenv("SCAN_RUN_ID", "").strip()
+    scan_started_at = None
+    if os.getenv("SCAN_STARTED_AT"):
+        try:
+            from datetime import datetime
+            scan_started_at = datetime.fromisoformat(os.getenv("SCAN_STARTED_AT").replace("Z", "+00:00"))
+        except Exception:
+            log.warning("SCAN_STARTED_AT konnte nicht gelesen werden")
+
     if profile_id is not None:
         try:
             profile_id = int(profile_id)
         except (TypeError, ValueError):
-            log.warning("Ungültige Profil-ID %r - Scan abgebrochen", profile_id)
             return {"jobs": 0, "listings": 0, "error": "invalid_profile_id"}
         profile = db.get_profile(profile_id)
         profiles = [profile] if profile and profile.get("active") else []
-        log.info("run_once: gezieltes Profil %s geladen: %s",
-                 profile_id, profile.get("name") if profile else "NICHT GEFUNDEN")
     else:
         profiles = db.get_active_profiles_with_sources()
-        log.info("run_once: %d aktive Profile geladen", len(profiles))
+
     if not profiles:
-        log.warning(
-            "Keine aktiven Profile - nichts zu tun. Bitte im Dashboard "
-            "mindestens ein Profil anlegen und ihm Quellen zuweisen."
-        )
+        log.warning("Keine aktiven Profile - nichts zu tun.")
+        _update_scan_state(scan_run_id, progress={"jobs_total": 0, "jobs_completed": 0})
         return {"jobs": 0, "listings": 0}
 
     lock = db.try_scan_lock()
     if not lock:
-        log.warning(
-            "Scan bereits durch einen anderen Prozess gesperrt (Web- und "
-            "Worker-Service teilen sich denselben Advisory-Lock)"
-        )
+        log.warning("Scan bereits durch einen anderen Prozess gesperrt")
         return {"jobs": 0, "listings": 0, "locked": True}
     log.info("Scan-Lock erworben (Lease=%ss)", db.LOCK_LEASE_SECONDS)
 
     started = time.monotonic()
-    total = 0
     stop_lock_renewer = threading.Event()
     lock_lost = threading.Event()
 
@@ -216,90 +224,88 @@ def run_once(profile_id=None):
                     lock_lost.set()
                     log.error("Scan-Lock konnte nicht erneuert werden; Lease könnte verloren sein")
                     return
-                log.debug("Scan-Lock erneuert (Lease=%ss)", db.LOCK_LEASE_SECONDS)
             except Exception:
-                # A transient MongoDB error should not immediately abort a
-                # running crawl; the next renewal attempt gets another chance.
                 log.exception("Scan-Lock-Erneuerung fehlgeschlagen")
 
-    lock_renewer = threading.Thread(
-        target=_renew_lock_loop, daemon=True, name="scan-lock-renewer"
-    )
+    lock_renewer = threading.Thread(target=_renew_lock_loop, daemon=True, name="scan-lock-renewer")
     lock_renewer.start()
 
     try:
         profiles_by_id = {p["id"]: p for p in profiles}
-        for p in profiles:
-            log.info(
-                "Profil %s '%s': Quellen=%s Regionen=%s Orte=%s Filter=%s-%s EUR, %s-%s Zimmer, ab %s m²",
-                p["id"], p.get("name", ""), sorted(p.get("sources") or []),
-                sorted(p.get("regions") or []), _locations(p),
-                p.get("min_price"), p.get("max_price"), p.get("min_rooms"),
-                p.get("max_rooms"), p.get("min_size"),
-            )
         jobs = build_jobs(profiles)
-        log.info(
-            "Scan-Kontext: Profile=%s, Quellen=%s",
-            sorted(profiles_by_id),
-            sorted({src for (src, _regions, _locations) in jobs}) if jobs else [],
-        )
-
-        # One job per unique source + search scope. Profiles sharing the same
-        # scope reuse the same scrape result instead of hitting the portal again.
         work = [
             (source, regions, locations, frozenset(profile_ids))
             for (source, regions, locations), profile_ids in jobs.items()
         ]
+        job_snapshot = []
+        for idx, (source, regions, locations, profile_ids) in enumerate(work):
+            job_snapshot.append({
+                "job_id": str(idx), "source": source, "profile_ids": sorted(profile_ids),
+                "regions": list(regions), "locations": list(locations), "status": "pending",
+            })
+        _update_scan_state(scan_run_id, progress={"jobs_total": len(work), "jobs_completed": 0, "jobs": job_snapshot})
 
-        log.info(
-            "Geplante Jobs: %d (%s)",
-            len(work),
-            ", ".join(sorted({job[0] for job in work})) or "keine",
-        )
         if not work:
-            log.warning(
-                "Keine Scraper-Jobs: Profile existieren, aber ihnen sind keine "
-                "Quellen zugewiesen (profile_sources leer)."
-            )
+            funnel = {"per_source": {}, "per_profile": {}, "source_errors": [],
+                      "source_empty": [], "source_unavailable": [], "scraped_total": 0,
+                      "unique_total": 0, "stored_items": 0, "storage_errors": 0,
+                      "profiles_count": len(profiles), "jobs_count": 0, "scrapy_debug": []}
+            db.save_scan_run(funnel, time.monotonic() - started, started_at=scan_started_at)
             return {"jobs": 0, "listings": 0}
 
-        all_results = []
         source_counts = defaultdict(int)
         source_errors = []
         source_empty = []
         source_unavailable = []
+        all_results = []
 
-        # Ein Scrapy-Prozess pro kompletter Scan. Alle Portal-Spider laufen
-        # darin, damit der Twisted-Reactor nicht mehrfach gestartet werden muss.
         try:
             all_results = run_scrapy_jobs(work)
-            runner_status = get_last_run_status()
-            for status in runner_status:
+            statuses = get_last_run_status()
+            debug_by_job = {str(x.get("job_id")): x for x in statuses if x.get("job_id") is not None}
+            for status in statuses:
+                failure = status.get("failure_class")
                 if status.get("status") == "source unavailable":
                     source_unavailable.append(status.get("source"))
-                else:
-                    source_errors.append(status.get("source"))
-            for job, (profile_ids, listings) in zip(work, all_results):
-                source = job[0]
-                log.info(
-                    "[%s] Scrapy-Portal OK: %d Listings, Profile: %s",
-                    source, len(listings), sorted(profile_ids),
-                )
-                if not listings:
+                elif failure:
+                    source_errors.append({
+                        "source": status.get("source"), "job_id": status.get("job_id"),
+                        "failure_class": failure,
+                    })
+
+            for idx, (profile_ids, listings) in enumerate(all_results):
+                source = work[idx][0]
+                debug = debug_by_job.get(str(idx), {})
+                failure = debug.get("failure_class")
+                log.info("[SCAN-DEBUG][%s] RESULT listings=%d failure_class=%s",
+                         source, len(listings), failure)
+                if not listings and not failure:
                     source_empty.append(source)
-                total += len(listings)
-                source_counts[source] += len(listings)
+                total_for_source = len(listings)
+                source_counts[source] += total_for_source
+
+            job_snapshot = [
+                {**x, "status": "failed" if any(str(e.get("job_id")) == x["job_id"] for e in source_errors)
+                 else "finished"}
+                for x in job_snapshot
+            ]
+            _update_scan_state(scan_run_id, progress={"jobs_total": len(work),
+                                                       "jobs_completed": len(work),
+                                                       "jobs": job_snapshot})
         except Exception:
             log.exception("Scrapy-Gesamtlauf fehlgeschlagen")
-            source_errors.extend(sorted({job[0] for job in work}))
+            source_errors.extend(
+                {"source": job[0], "job_id": str(i), "failure_class": "UNKNOWN_FAILURE"}
+                for i, job in enumerate(work)
+            )
             all_results = []
 
-        # Cross-source in-memory dedupe. DB uniqueness remains the final guard.
+        total = sum(len(listings) for _profile_ids, listings in all_results)
         seen = set()
         processed = 0
-        profile_stats = defaultdict(
-            lambda: {"seen": 0, "matched": 0, "excluded": defaultdict(int)}
-        )
+        storage_errors = 0
+        profile_stats = defaultdict(lambda: {"seen": 0, "matched": 0, "excluded": defaultdict(int)})
+
         for profile_ids, listings in all_results:
             for item in listings:
                 key = listing_fingerprint(item.__dict__)
@@ -310,40 +316,33 @@ def run_once(profile_id=None):
                     process_listing(item, profiles_by_id, profile_ids, profile_stats)
                     processed += 1
                 except Exception:
-                    log.exception(
-                        "Listing-Verarbeitung fehlgeschlagen: %s", item.url
-                    )
+                    storage_errors += 1
+                    log.exception("Listing-Verarbeitung/DB-Schreiben fehlgeschlagen: %s", item.url)
+
+        if storage_errors:
+            source_errors.append({"source": "storage", "job_id": None, "failure_class": "STORAGE_FAILURE"})
 
         funnel = _log_and_build_funnel(profiles_by_id, profile_stats, dict(source_counts))
-        funnel["source_errors"] = sorted(set(source_errors))
-        funnel["source_empty"] = sorted(set(source_empty))
-        funnel["source_unavailable"] = sorted(set(source_unavailable))
-        funnel["scraped_total"] = total
-        funnel["unique_total"] = processed
-        funnel["profiles_count"] = len(profiles)
-        funnel["jobs_count"] = len(work)
-        # Persist per-source Scrapy lifecycle telemetry so /scan/diagnostics
-        # can inspect the last real crawl even though Scrapy runs in a child process.
-        funnel["scrapy_debug"] = [dict(x) for x in get_last_run_status() if x.get("job_id") is not None]
-
-        log.info(
-            "Quellen-Ergebnis: %s",
-            ", ".join(f"{src}={cnt}" for src, cnt in sorted(source_counts.items()))
-            or "keine Quellen haben Daten geliefert",
-        )
-
+        funnel.update({
+            "source_errors": sorted(source_errors, key=lambda x: (str(x.get("source")), str(x.get("job_id")))),
+            "source_empty": sorted(set(source_empty)),
+            "source_unavailable": sorted(set(source_unavailable)),
+            "scraped_total": total,
+            "unique_total": processed,
+            "stored_items": processed - storage_errors,
+            "storage_errors": storage_errors,
+            "profiles_count": len(profiles),
+            "jobs_count": len(work),
+            "scrapy_debug": [dict(x) for x in get_last_run_status() if x.get("job_id") is not None],
+        })
         elapsed = time.monotonic() - started
-        log.info(
-            "Scan beendet: jobs=%d, scraped=%d, unique=%d, duration=%.1fs, "
-            "fehlerhafte_quellen=%s, leere_quellen=%s",
-            len(work), total, processed, elapsed,
-            source_errors or "-", source_empty or "-",
-        )
-        try:
-            db.save_scan_run(funnel, elapsed)
-        except Exception:
-            log.exception("Scan-Zusammenfassung konnte nicht gespeichert werden")
-
+        db.save_scan_run(funnel, elapsed, started_at=scan_started_at)
+        _update_scan_state(scan_run_id, progress={"jobs_total": len(work),
+                                                   "jobs_completed": len(work),
+                                                   "jobs": job_snapshot},
+                           last_debug=funnel["scrapy_debug"])
+        log.info("Scan beendet: jobs=%d, scraped=%d, unique=%d, stored=%d, duration=%.1fs",
+                 len(work), total, processed, funnel["stored_items"], elapsed)
         return {"jobs": len(work), "listings": total, "unique": processed}
     finally:
         stop_lock_renewer.set()
@@ -351,7 +350,6 @@ def run_once(profile_id=None):
         if lock_lost.is_set():
             log.error("Scan beendet, nachdem der Scan-Lock verloren ging")
         db.release_scan_lock(lock)
-
 
 def worker_loop():
     log.info(

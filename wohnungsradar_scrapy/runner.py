@@ -1,157 +1,296 @@
 from __future__ import annotations
-import json, logging, os, tempfile
+
+import json
+import logging
+import os
+import tempfile
+import uuid
 from pathlib import Path
+
 from scrapy.crawler import CrawlerProcess
+
 from .settings import *
 from .spiders.portals import SPIDER_CLASSES
 
-log=logging.getLogger("wohnungsradar.scrapy")
-LAST_RUN_DEBUG=[]
+log = logging.getLogger("wohnungsradar.scrapy")
+LAST_RUN_DEBUG = []
+
+FAILURE_CLASSES = {
+    "CONFIG_ERROR",
+    "NO_START_URLS",
+    "REQUEST_PIPELINE_FAILURE",
+    "DOWNLOAD_FAILURE",
+    "HTTP_403",
+    "HTTP_429",
+    "HTTP_5XX",
+    "PLAYWRIGHT_FAILURE",
+    "PARSER_FAILURE",
+    "STORAGE_FAILURE",
+    "TIMEOUT",
+    "UNKNOWN_FAILURE",
+}
+
 
 def get_last_run_debug():
     return [dict(x) for x in LAST_RUN_DEBUG]
 
+
+def _failure_class(debug):
+    """Classify a crawl from lifecycle telemetry, never from item count alone."""
+    if debug.get("config_error"):
+        return "CONFIG_ERROR"
+    if debug.get("start_url_count", 0) == 0:
+        return "NO_START_URLS"
+    if not debug.get("start_entered"):
+        return "REQUEST_PIPELINE_FAILURE"
+    if debug.get("start_yielded", 0) == 0 or debug.get("requests_scheduled", 0) == 0:
+        return "REQUEST_PIPELINE_FAILURE"
+    statuses = {int(k): int(v) for k, v in (debug.get("http_statuses") or {}).items()}
+    if statuses.get(403, 0):
+        return "HTTP_403"
+    if statuses.get(429, 0):
+        return "HTTP_429"
+    if any(code >= 500 for code in statuses):
+        return "HTTP_5XX"
+    if debug.get("playwright_failures", 0):
+        return "PLAYWRIGHT_FAILURE"
+    if debug.get("responses_received", 0) == 0:
+        return "DOWNLOAD_FAILURE"
+    if debug.get("spider_errors", 0) or debug.get("downloader_exceptions", 0):
+        return "DOWNLOAD_FAILURE"
+    if debug.get("responses_received", 0) > 0 and debug.get("items_scraped", 0) == 0:
+        return "PARSER_FAILURE"
+    if debug.get("finish_reason") not in (None, "finished"):
+        return "UNKNOWN_FAILURE"
+    return None
+
+
+def _build_debug(job, crawler, process_start_error=None):
+    stats = crawler.stats.get_stats()
+    spider = getattr(crawler, "spider", None)
+
+    start = stats.get("start_time")
+    end = stats.get("finish_time")
+    duration = None
+    if start and end:
+        try:
+            duration = (end - start).total_seconds()
+        except Exception:
+            pass
+
+    statuses = {}
+    for key, value in stats.items():
+        prefix = "downloader/response_status_count/"
+        if str(key).startswith(prefix):
+            statuses[str(key)[len(prefix):]] = int(value)
+
+    start_entered = bool(getattr(spider, "_start_entered", False))
+    start_yielded = int(getattr(spider, "_start_yielded", 0))
+    scheduled = int(getattr(spider, "_requests_scheduled", stats.get("scheduler/enqueued", 0)))
+    dropped = int(getattr(spider, "_requests_dropped", 0))
+    responses = int(getattr(spider, "_responses_received", stats.get("response_received_count", 0)))
+    items = int(stats.get("item_scraped_count", 0))
+    spider_errors = int(getattr(spider, "_spider_errors", 0) + getattr(spider, "page_errors", 0))
+    downloader_exceptions = int(getattr(spider, "_downloader_exceptions", stats.get("downloader/exception_count", 0)))
+    retries = int(stats.get("retry/count", 0))
+
+    debug = {
+        "source": job["source"],
+        "job_id": str(job.get("job_id", "")),
+        "status": "finished",
+        "start_urls": int(len(job.get("urls") or [])),
+        "start_url_count": int(len(job.get("urls") or [])),
+        "start_entered": start_entered,
+        "start_yielded": start_yielded,
+        "requests_scheduled": scheduled,
+        "requests_dropped": dropped,
+        "requests_sent": int(stats.get("downloader/request_count", 0)),
+        "responses_received": responses,
+        "responses_2xx": int(getattr(spider, "_responses_2xx", 0)),
+        "responses_3xx": int(getattr(spider, "_responses_3xx", 0)),
+        "responses_4xx": int(getattr(spider, "_responses_4xx", 0)),
+        "responses_5xx": int(getattr(spider, "_responses_5xx", 0)),
+        "http_statuses": statuses,
+        "items_scraped": items,
+        "spider_errors": spider_errors,
+        "downloader_exceptions": downloader_exceptions,
+        "retries": retries,
+        "download_errors": int(stats.get("downloader/exception_count", 0)),
+        "blocked_pages": int(getattr(spider, "blocked_pages", 0)),
+        "pages_seen": int(getattr(spider, "pages_seen", 0)),
+        "finish_reason": stats.get("finish_reason"),
+        "duration_seconds": duration,
+        "runner_error": str(process_start_error) if process_start_error else None,
+        "error_messages": list(getattr(spider, "_error_messages", []))[-10:],
+        "playwright_failures": sum(
+            1 for m in getattr(spider, "_error_messages", [])
+            if "playwright" in str(m).casefold() or "browser" in str(m).casefold()
+        ),
+    }
+    debug["failure_class"] = _failure_class(debug)
+    if process_start_error and debug["failure_class"] is None:
+        debug["failure_class"] = "UNKNOWN_FAILURE"
+    if debug["failure_class"]:
+        debug["status"] = "error"
+    return debug
+
+
 def run_jobs(jobs):
+    """Run all requested spiders in one CrawlerProcess.
+
+    Each job gets its own JSONL feed. A missing feed is a diagnostic error,
+    while an existing empty feed is a legitimate zero-item result.
+    """
     global LAST_RUN_DEBUG
-    LAST_RUN_DEBUG=[]
-    jobs=[j for j in (jobs or []) if j.get("source") in SPIDER_CLASSES and j.get("urls")]
-    if not jobs: return []
+    LAST_RUN_DEBUG = []
+
+    normalized = []
+    for idx, raw_job in enumerate(jobs or []):
+        source = raw_job.get("source")
+        if source not in SPIDER_CLASSES:
+            LAST_RUN_DEBUG.append({
+                "source": source,
+                "job_id": str(raw_job.get("job_id", idx)),
+                "status": "error",
+                "failure_class": "CONFIG_ERROR",
+                "config_error": True,
+                "error_messages": [f"Unbekannte Spider-Quelle: {source}"],
+            })
+            continue
+        normalized.append({
+            "job_id": str(raw_job.get("job_id", idx)),
+            "source": source,
+            "urls": list(raw_job.get("urls") or []),
+            "max_pages": raw_job.get("max_pages"),
+        })
+
+    if not normalized:
+        return []
+
     with tempfile.TemporaryDirectory(prefix="wohnungsradar-scrapy-") as tmp:
-        feed=Path(tmp)/"items.json"
-        settings={
-            "BOT_NAME":BOT_NAME,"SPIDER_MODULES":SPIDER_MODULES,"NEWSPIDER_MODULE":NEWSPIDER_MODULE,
-            "ROBOTSTXT_OBEY":ROBOTSTXT_OBEY,"COOKIES_ENABLED":COOKIES_ENABLED,
-            "CONCURRENT_REQUESTS":1,"CONCURRENT_REQUESTS_PER_DOMAIN":1,
-            "DOWNLOAD_TIMEOUT":DOWNLOAD_TIMEOUT,"RETRY_ENABLED":RETRY_ENABLED,
-            "RETRY_TIMES":RETRY_TIMES,"RETRY_HTTP_CODES":RETRY_HTTP_CODES,
-            "DOWNLOAD_DELAY":float(os.getenv("SCRAPE_DELAY_MIN",DOWNLOAD_DELAY)),
-            "RANDOMIZE_DOWNLOAD_DELAY":RANDOMIZE_DOWNLOAD_DELAY,
-            "AUTOTHROTTLE_ENABLED":AUTOTHROTTLE_ENABLED,
-            "AUTOTHROTTLE_START_DELAY":AUTOTHROTTLE_START_DELAY,
-            "AUTOTHROTTLE_MAX_DELAY":AUTOTHROTTLE_MAX_DELAY,
-            "AUTOTHROTTLE_TARGET_CONCURRENCY":AUTOTHROTTLE_TARGET_CONCURRENCY,
-            "USER_AGENT":USER_AGENT,"USER_AGENT_POOL":USER_AGENT_POOL,"DOWNLOAD_HANDLERS":DOWNLOAD_HANDLERS,
-            "TWISTED_REACTOR":TWISTED_REACTOR,"PLAYWRIGHT_BROWSER_TYPE":PLAYWRIGHT_BROWSER_TYPE,
-            "PLAYWRIGHT_LAUNCH_OPTIONS":PLAYWRIGHT_LAUNCH_OPTIONS,
-            "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT":PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT,
-            "PLAYWRIGHT_MAX_CONTEXTS":1,"PLAYWRIGHT_MAX_PAGES_PER_CONTEXT":1,
-            "ITEM_PIPELINES":ITEM_PIPELINES,"FEED_EXPORT_ENCODING":FEED_EXPORT_ENCODING,
-            "FEEDS":{str(feed):{"format":"json","overwrite":True}},
-            "LOG_LEVEL":os.getenv("SCRAPY_LOG_LEVEL",LOG_LEVEL),
-            "TELNETCONSOLE_ENABLED":False,"REQUEST_FINGERPRINTER_IMPLEMENTATION":REQUEST_FINGERPRINTER_IMPLEMENTATION,
+        tmp_path = Path(tmp)
+        settings = {
+            "BOT_NAME": BOT_NAME,
+            "SPIDER_MODULES": SPIDER_MODULES,
+            "NEWSPIDER_MODULE": NEWSPIDER_MODULE,
+            "ROBOTSTXT_OBEY": ROBOTSTXT_OBEY,
+            "COOKIES_ENABLED": COOKIES_ENABLED,
+            "CONCURRENT_REQUESTS": 1,
+            "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+            "DOWNLOAD_TIMEOUT": DOWNLOAD_TIMEOUT,
+            "RETRY_ENABLED": RETRY_ENABLED,
+            "RETRY_TIMES": RETRY_TIMES,
+            "RETRY_HTTP_CODES": RETRY_HTTP_CODES,
+            "DOWNLOAD_DELAY": float(os.getenv("SCRAPE_DELAY_MIN", DOWNLOAD_DELAY)),
+            "RANDOMIZE_DOWNLOAD_DELAY": RANDOMIZE_DOWNLOAD_DELAY,
+            "AUTOTHROTTLE_ENABLED": AUTOTHROTTLE_ENABLED,
+            "AUTOTHROTTLE_START_DELAY": AUTOTHROTTLE_START_DELAY,
+            "AUTOTHROTTLE_MAX_DELAY": AUTOTHROTTLE_MAX_DELAY,
+            "AUTOTHROTTLE_TARGET_CONCURRENCY": AUTOTHROTTLE_TARGET_CONCURRENCY,
+            "USER_AGENT": USER_AGENT,
+            "USER_AGENT_POOL": USER_AGENT_POOL,
+            "DOWNLOAD_HANDLERS": DOWNLOAD_HANDLERS,
+            "TWISTED_REACTOR": TWISTED_REACTOR,
+            "PLAYWRIGHT_BROWSER_TYPE": PLAYWRIGHT_BROWSER_TYPE,
+            "PLAYWRIGHT_LAUNCH_OPTIONS": PLAYWRIGHT_LAUNCH_OPTIONS,
+            "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT,
+            "PLAYWRIGHT_MAX_CONTEXTS": 1,
+            "PLAYWRIGHT_MAX_PAGES_PER_CONTEXT": 1,
+            "ITEM_PIPELINES": ITEM_PIPELINES,
+            "FEED_EXPORT_ENCODING": FEED_EXPORT_ENCODING,
+            "LOG_LEVEL": os.getenv("SCRAPY_LOG_LEVEL", LOG_LEVEL),
+            "TELNETCONSOLE_ENABLED": False,
+            "REQUEST_FINGERPRINTER_IMPLEMENTATION": REQUEST_FINGERPRINTER_IMPLEMENTATION,
         }
-        process=CrawlerProcess(settings=settings)
-        # CrawlerProcess.crawl(...) returns a Twisted Deferred, not the
-        # Crawler instance. Keep the real crawler so stats/spider state can
-        # be inspected after process.start(). This also prevents a successful
-        # crawl from being reported as a source failure.
-        crawlers=[]
-        for job in jobs:
-            cls=SPIDER_CLASSES[job["source"]]
-            crawler=process.create_crawler(cls)
-            crawlers.append((job,crawler))
-            process.crawl(crawler,start_urls=job.get("urls",[]),
-                          max_pages=job.get("max_pages"),
-                          job_id=job.get("job_id"))
+
+        log.info("[SCAN-DEBUG] SCRAPY_PROCESS_CREATE jobs=%d", len(normalized))
+        process = CrawlerProcess(settings=settings)
+        crawlers = []
+
+        for idx, job in enumerate(normalized):
+            cls = SPIDER_CLASSES[job["source"]]
+            crawler = process.create_crawler(cls)
+            crawlers.append((job, crawler))
+            feed = tmp_path / f"items_job_{idx}_{uuid.uuid4().hex}.jsonl"
+            job["feed_path"] = str(feed)
+            log.info("[SCAN-DEBUG][%s] CRAWLER_CREATED job_id=%s feed=%s",
+                     job["source"], job["job_id"], feed)
+            process.crawl(
+                crawler,
+                start_urls=job["urls"],
+                max_pages=job.get("max_pages"),
+                job_id=job["job_id"],
+                feed_path=str(feed),
+            )
+            log.info("[SCAN-DEBUG][%s] CRAWL_REGISTERED job_id=%s urls=%d",
+                     job["source"], job["job_id"], len(job["urls"]))
+
+        log.info("[SCAN-DEBUG] CRAWL_QUEUE_READY jobs=%d", len(crawlers))
         process_start_error = None
         try:
-            # Scrapy 2.19 uses the snake_case keyword. The scraper runs in
-            # its own short-lived subprocess, so we explicitly disable
-            # Twisted/Scrapy signal handlers here and let the parent worker
-            # process control the subprocess lifetime.
+            log.info("[SCAN-DEBUG] PROCESS_START")
             process.start(stop_after_crawl=True, install_signal_handlers=False)
+            log.info("[SCAN-DEBUG] PROCESS_STOP")
         except Exception as exc:
             process_start_error = exc
-            log.exception("Scrapy-Lauf fehlgeschlagen")
-            # Feed may still contain items from successfully completed spiders.
-        for job,crawler in crawlers:
-            stats=crawler.stats.get_stats()
-            reason=stats.get("finish_reason")
-            pages=stats.get("response_received_count",0)
-            errors=stats.get("log_count/ERROR",0)
-            spider=getattr(crawler, "spider", None)
-            spider_errors=getattr(spider, "page_errors", 0)
-            blocked_pages=getattr(spider, "blocked_pages", 0)
-            pages_seen=getattr(spider, "pages_seen", 0)
-            status_codes={}
-            for key,value in stats.items():
-                prefix="downloader/response_status_count/"
-                if str(key).startswith(prefix):
-                    status_codes[str(key)[len(prefix):]]=value
-            start=stats.get("start_time")
-            end=stats.get("finish_time")
-            duration=None
-            if start and end:
-                try: duration=(end-start).total_seconds()
-                except Exception: pass
-            requests_scheduled = stats.get("scheduler/enqueued", 0)
-            requests_sent = stats.get("downloader/request_count", 0)
-            no_request_failure = bool(job.get("urls")) and requests_sent == 0
-            effective_error = bool(spider_errors) or no_request_failure or (
-                process_start_error is not None and not pages
-            )
-            debug={
-                "source":job["source"], "job_id":str(job.get("job_id","")),
-                "status":"error" if effective_error else "finished",
-                "lifecycle": ["JOB_CREATED", "CRAWLER_CREATED", "CRAWLER_STARTED",
-                              "REQUEST_SCHEDULED" if requests_scheduled else "REQUEST_NOT_SCHEDULED",
-                              "REQUEST_SENT" if requests_sent else "REQUEST_NOT_SENT",
-                              "RESPONSE_RECEIVED" if pages else "NO_RESPONSE",
-                              "JOB_FINISHED" if reason == "finished" else "JOB_FAILED"],
-                "start_url_count":len(job.get("urls") or []),
-                "requests_scheduled":requests_scheduled,
-                "requests_sent":requests_sent,
-                "responses_received":pages,
-                "http_statuses":status_codes,
-                "retries":stats.get("retry/count",0),
-                "download_errors":stats.get("downloader/exception_count",0),
-                "log_errors":errors, "page_errors":spider_errors,
-                "blocked_pages":blocked_pages, "pages_seen":pages_seen,
-                "items_scraped":stats.get("item_scraped_count",0),
-                "finish_reason":reason, "duration_seconds":duration,
-                "runner_error":str(process_start_error) if process_start_error else None,
-                "failure_reason": ("no_requests_sent" if no_request_failure else None),
-            }
-            LAST_RUN_DEBUG.append(debug)
-            log.info("[SCAN-DEBUG][%s] %s",job["source"],json.dumps(debug,ensure_ascii=False,default=str))
-            if reason not in (None,"finished") or effective_error:
-                log.error("[%s] Crawl nicht vollständig: reason=%s responses=%s requests=%s request_errors=%s log_errors=%s failure=%s",
-                          job["source"],reason,pages,requests_sent,spider_errors,errors,
-                          "no_requests_sent" if no_request_failure else None)
+            log.exception("[SCAN-DEBUG] PROCESS_START_ERROR")
+
+        all_items = []
+        for job, crawler in crawlers:
+            debug = _build_debug(job, crawler, process_start_error)
+            feed = Path(job["feed_path"])
+            feed_missing = not feed.exists()
+            debug["feed_path"] = str(feed)
+            debug["feed_exists"] = not feed_missing
+            debug["feed_missing"] = feed_missing
+
+            if feed_missing:
+                if debug["failure_class"] is None:
+                    debug["failure_class"] = "UNKNOWN_FAILURE"
+                debug["status"] = "error"
+                debug["error_messages"].append("feed_missing")
             else:
-                log.info("[%s] Crawl beendet: Responses=%s Requests=%s HTTP=%s Items=%s",
-                         job["source"],pages,stats.get("downloader/request_count",0),status_codes,stats.get("item_scraped_count",0))
-        if not feed.exists(): return []
-        try:
-            items=json.loads(feed.read_text(encoding="utf-8"))
-        except Exception:
-            log.exception("Scrapy-Feed konnte nicht gelesen werden: %s",feed); return []
-        for job,crawler in crawlers:
-            reason=crawler.stats.get_stats().get("finish_reason")
-            response_count=crawler.stats.get_stats().get("response_received_count",0)
-            request_errors=getattr(getattr(crawler, "spider", None), "page_errors", 0)
-            # A runner-level failure before the crawl starts must not be
-            # misreported as a healthy source with zero listings. Only mark
-            # crawlers that never received a response and never got a finish
-            # reason; completed crawlers keep their normal result status.
-            requests_sent = crawler.stats.get_stats().get("downloader/request_count", 0)
-            runner_failed = process_start_error is not None and reason is None and not response_count
-            no_request_failure = bool(job.get("urls")) and requests_sent == 0
-            if runner_failed or no_request_failure or reason not in (None,"finished") or request_errors:
-                items.append({"_runner_status":"error","source":job["source"],"job_id":str(job.get("job_id","")),
-                              "reason":(
-                                  "crawler_process_start_failed" if runner_failed
-                                  else "no_requests_sent" if no_request_failure
-                                  else (reason or "request_error")
-                              ),
-                              "request_errors":request_errors,
-                              "requests_sent":requests_sent,
-                              "runner_error":str(process_start_error) if runner_failed else None})
-        return items
+                try:
+                    for line in feed.read_text(encoding="utf-8").splitlines():
+                        if line.strip():
+                            all_items.append(json.loads(line))
+                except Exception as exc:
+                    debug["status"] = "error"
+                    debug["failure_class"] = "UNKNOWN_FAILURE"
+                    debug["error_messages"].append(f"feed_read_error: {type(exc).__name__}: {exc}")
+                    log.exception("[%s] Feed konnte nicht gelesen werden: %s", job["source"], feed)
+
+            LAST_RUN_DEBUG.append(debug)
+            log.info("[SCAN-DEBUG][%s] DEBUG_REPORT %s",
+                     job["source"], json.dumps(debug, ensure_ascii=False, default=str))
+
+        # Attach explicit runner errors only when a crawler itself has failed.
+        # This keeps valid items from one crawler usable if another crawler dies.
+        for debug in LAST_RUN_DEBUG:
+            if debug.get("job_id") in {j["job_id"] for j, _ in crawlers}:
+                if debug.get("failure_class"):
+                    all_items.append({
+                        "_runner_status": "error",
+                        "source": debug["source"],
+                        "job_id": debug["job_id"],
+                        "reason": debug["failure_class"],
+                        "failure_class": debug["failure_class"],
+                        "requests_sent": debug["requests_sent"],
+                        "responses_received": debug["responses_received"],
+                        "items_scraped": debug["items_scraped"],
+                        "runner_error": debug["runner_error"],
+                    })
+
+        return all_items
+
 
 def main():
     import argparse
-    parser=argparse.ArgumentParser(); parser.add_argument("--jobs",required=True)
-    args=parser.parse_args(); print(json.dumps(run_jobs(json.loads(args.jobs)),ensure_ascii=False))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--jobs", required=True)
+    args = parser.parse_args()
+    print(json.dumps(run_jobs(json.loads(args.jobs)), ensure_ascii=False, default=str))
 
-if __name__=="__main__": main()
+
+if __name__ == "__main__":
+    main()

@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging, os, random, re
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 import scrapy
+from scrapy import signals
 from scrapy_playwright.page import PageMethod
 from ..items import ApartmentItem
 from ..parsing import node_text, clean_text, canonical_url, external_id_from_url, parse_rents, parse_rooms, parse_size, parse_location, parse_number, jsonld_objects, jsonld_to_raw
@@ -52,29 +53,154 @@ class PortalSpider(scrapy.Spider):
         self.page_errors=0; self.pages_seen=0
         self.blocked_pages=0
         self._first_page_url_set=None
+        self.feed_path = None
+        self._start_entered = False
+        self._start_yielded = 0
+        self._requests_scheduled = 0
+        self._requests_dropped = 0
+        self._responses_received = 0
+        self._responses_2xx = 0
+        self._responses_3xx = 0
+        self._responses_4xx = 0
+        self._responses_5xx = 0
+        self._spider_errors = 0
+        self._downloader_exceptions = 0
+        self._http_statuses = {}
+        self._error_messages = []
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        spider.feed_path = kwargs.get("feed_path")
+        spider._connect_signals(crawler)
+        return spider
+
+    def _connect_signals(self, crawler):
+        crawler.signals.connect(self._on_spider_opened, signal=signals.spider_opened)
+        crawler.signals.connect(self._on_spider_closed, signal=signals.spider_closed)
+        crawler.signals.connect(self._on_request_scheduled, signal=signals.request_scheduled)
+        crawler.signals.connect(self._on_request_dropped, signal=signals.request_dropped)
+        crawler.signals.connect(self._on_response_received, signal=signals.response_received)
+        crawler.signals.connect(self._on_spider_error, signal=signals.spider_error)
+        crawler.signals.connect(self._on_downloader_exception, signal=signals.downloader_exception)
+
+    def _on_spider_opened(self, spider):
+        if spider is not self:
+            return
+        self.logger.info("[SCAN-DEBUG][%s] SPIDER_OPENED job_id=%s urls=%d",
+                         self.source_key, self.job_id, len(self.start_urls))
+
+    def _on_spider_closed(self, spider, reason):
+        if spider is not self:
+            return
+        self.logger.info(
+            "[SCAN-DEBUG][%s] SPIDER_CLOSED job_id=%s reason=%s "
+            "start_urls=%d start_entered=%s start_yielded=%d "
+            "requests_scheduled=%d dropped=%d responses=%d items=%d",
+            self.source_key, self.job_id, reason, len(self.start_urls),
+            self._start_entered, self._start_yielded,
+            self._requests_scheduled, self._requests_dropped,
+            self._responses_received, self.crawler.stats.get_value("item_scraped_count", 0),
+        )
+
+    def _on_request_scheduled(self, request, spider):
+        if spider is not self:
+            return
+        self._requests_scheduled += 1
+        self.logger.info("[SCAN-DEBUG][%s] REQUEST_SCHEDULED job_id=%s url=%s",
+                         self.source_key, self.job_id, request.url)
+
+    def _on_request_dropped(self, request, spider):
+        if spider is not self:
+            return
+        self._requests_dropped += 1
+        self.logger.error("[SCAN-DEBUG][%s] REQUEST_DROPPED job_id=%s url=%s",
+                          self.source_key, self.job_id, request.url)
+
+    def _on_response_received(self, response, request, spider):
+        if spider is not self:
+            return
+        status = int(getattr(response, "status", 0) or 0)
+        self._responses_received += 1
+        self._http_statuses[str(status)] = self._http_statuses.get(str(status), 0) + 1
+        if 200 <= status < 300:
+            self._responses_2xx += 1
+        elif 300 <= status < 400:
+            self._responses_3xx += 1
+        elif 400 <= status < 500:
+            self._responses_4xx += 1
+        elif status >= 500:
+            self._responses_5xx += 1
+        self.logger.info("[SCAN-DEBUG][%s] RESPONSE_RECEIVED job_id=%s status=%s url=%s",
+                         self.source_key, self.job_id, status, response.url)
+
+    def _on_spider_error(self, failure, response, spider):
+        if spider is not self:
+            return
+        self._spider_errors += 1
+        msg = failure.getErrorMessage() if hasattr(failure, "getErrorMessage") else str(failure)
+        self._error_messages.append(msg)
+        self.logger.error("[SCAN-DEBUG][%s] SPIDER_ERROR job_id=%s url=%s error=%s",
+                          self.source_key, self.job_id, getattr(response, "url", None), msg)
+
+    def _on_downloader_exception(self, request, exception, spider):
+        if spider is not self:
+            return
+        self._downloader_exceptions += 1
+        msg = f"{type(exception).__name__}: {exception}"
+        self._error_messages.append(msg)
+        self.logger.error("[SCAN-DEBUG][%s] DOWNLOADER_EXCEPTION job_id=%s url=%s error=%s",
+                          self.source_key, self.job_id, request.url, msg)
 
     async def start(self):
-        """Scrapy 2.19+ entrypoint.
+        """Scrapy 2.19+ async-generator entrypoint.
 
-        ``start_requests()`` was removed from the modern spider lifecycle.
-        Keeping request creation here is critical: without it the spider can
-        open successfully while scheduling zero requests.
+        This is the single source of truth on modern Scrapy. ``start_requests``
+        remains only as a guarded compatibility fallback for older Scrapy.
         """
-        self.logger.info(
-            "[SCAN-DEBUG][%s] START: %d start URL(s): %s",
-            self.source_key, len(self.start_urls), self.start_urls,
-        )
+        self._start_entered = True
+        self.logger.info("[SCAN-DEBUG][%s] START_ENTERED job_id=%s",
+                         self.source_key, self.job_id)
+        self.logger.info("[SCAN-DEBUG][%s] START_URLS count=%d urls=%s",
+                         self.source_key, len(self.start_urls), self.start_urls)
         if not self.start_urls:
-            self.logger.error("[%s] Keine start_urls vorhanden", self.source_key)
+            self.logger.error("[SCAN-DEBUG][%s] NO_START_URLS job_id=%s",
+                              self.source_key, self.job_id)
             return
         for u in self.start_urls:
-            self.logger.info("[SCAN-DEBUG][%s] REQUEST_SCHEDULE: %s", self.source_key, u)
-            yield self._request(u, 1)
+            try:
+                request = self._request(u, 1)
+                self._start_yielded += 1
+                self.logger.info("[SCAN-DEBUG][%s] START_YIELD job_id=%s url=%s",
+                                 self.source_key, self.job_id, u)
+                yield request
+            except Exception:
+                self.logger.exception("[SCAN-DEBUG][%s] REQUEST_BUILD_ERROR job_id=%s url=%s",
+                                      self.source_key, self.job_id, u)
 
-    # Compatibility for older Scrapy versions. Scrapy 2.19 uses ``start``.
     def start_requests(self):
+        """Compatibility fallback for pre-2.13 Scrapy."""
+        if self._start_entered:
+            return
+        self._start_entered = True
+        self.logger.info("[SCAN-DEBUG][%s] START_ENTERED_LEGACY job_id=%s",
+                         self.source_key, self.job_id)
+        self.logger.info("[SCAN-DEBUG][%s] START_URLS count=%d urls=%s",
+                         self.source_key, len(self.start_urls), self.start_urls)
+        if not self.start_urls:
+            self.logger.error("[SCAN-DEBUG][%s] NO_START_URLS job_id=%s",
+                              self.source_key, self.job_id)
+            return
         for u in self.start_urls:
-            yield self._request(u, 1)
+            try:
+                request = self._request(u, 1)
+                self._start_yielded += 1
+                self.logger.info("[SCAN-DEBUG][%s] START_YIELD job_id=%s url=%s",
+                                 self.source_key, self.job_id, u)
+                yield request
+            except Exception:
+                self.logger.exception("[SCAN-DEBUG][%s] REQUEST_BUILD_ERROR job_id=%s url=%s",
+                                      self.source_key, self.job_id, u)
 
     def _pick_user_agent(self):
         pool=list(getattr(self,"settings",None).get("USER_AGENT_POOL") or []) if getattr(self,"settings",None) else []
@@ -306,9 +432,13 @@ class PortalSpider(scrapy.Spider):
             region_code=None,contact_name=None,contact_phone=None,published_at=raw.get("published_at"),raw=dict(raw),
         )
 
-    def errback(self,failure):
+    def errback(self, failure):
         self.page_errors += 1
-        self.logger.error("[%s] Request fehlgeschlagen: %s",self.source_key,failure.getErrorMessage())
+        msg = failure.getErrorMessage()
+        self._error_messages.append(msg)
+        self.logger.error("[SCAN-DEBUG][%s] DOWNLOAD_FAILURE job_id=%s url=%s error=%s",
+                          self.source_key, self.job_id,
+                          getattr(failure.request, "url", None), msg)
 
 def cards_continue(card_count,new_count):
     return card_count>0 and new_count>0

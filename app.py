@@ -7,6 +7,7 @@ import secrets
 import sys
 import threading
 import time
+import uuid
 from functools import wraps
 
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
@@ -96,38 +97,156 @@ def _ensure_db_initialized():
             return False
 
 
-def _run_scan_once_embedded():
-    """Run one scan in a short-lived child process.
-
-    Scrapy/Twisted reactors are not restartable. A persistent Flask process
-    therefore must not create a new CrawlerProcess for every poll cycle.
-    The child owns Scrapy + Playwright and is fully cleaned up after one scan;
-    Flask stays responsive and survives a browser OOM.
-    """
-    import subprocess
+def _scan_job_snapshot(profile_id=None):
+    """Build the dashboard-visible job list before starting the child."""
     try:
-        env = os.environ.copy()
-        env.setdefault("PYTHONUNBUFFERED", "1")
-        result = subprocess.run(
-            [sys.executable, os.path.join(os.path.dirname(__file__), "scraper.py"), "--once"],
+        if profile_id is not None:
+            profile = db.get_profile(int(profile_id))
+            profiles = [profile] if profile and profile.get("active") else []
+        else:
+            profiles = db.get_active_profiles_with_sources()
+        jobs = worker.build_jobs(profiles) if profiles else {}
+        snapshot = []
+        for idx, ((source, regions, locations), profile_ids) in enumerate(jobs.items()):
+            try:
+                adapter = get_scraper(source)
+                params = SearchParams(
+                    nationwide=("DE" in regions and not locations),
+                    region_codes=[] if "DE" in regions else list(regions),
+                    locations=list(locations),
+                )
+                urls = adapter.build_search_urls(params)
+                url_error = None
+            except Exception as exc:
+                urls = []
+                url_error = f"{type(exc).__name__}: {exc}"
+            snapshot.append({
+                "job_id": str(idx), "source": source,
+                "profile_ids": sorted(profile_ids),
+                "regions": list(regions), "locations": list(locations),
+                "url_count": len(urls), "urls": urls,
+                "url_error": url_error, "status": "pending",
+            })
+        return snapshot
+    except Exception:
+        log.exception("Scan-Jobs konnten für den Current-Scan nicht aufgebaut werden")
+        return []
+
+
+def _terminate_process_tree(proc):
+    """Best-effort process-tree cleanup for Render/Linux child scans."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        import signal
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _run_scan_once_embedded(profile_id=None, mode="auto"):
+    """Run one scan in a short-lived child process and persist its state."""
+    import subprocess
+
+    run_id = uuid.uuid4().hex
+    started_at = time.time()
+    jobs = _scan_job_snapshot(profile_id)
+    job_progress = {
+        "jobs_total": len(jobs),
+        "jobs_completed": 0,
+        "jobs": jobs,
+    }
+    from datetime import datetime, timezone
+    started_iso = datetime.now(timezone.utc).isoformat()
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env["SCAN_RUN_ID"] = run_id
+    env["SCAN_STARTED_AT"] = started_iso
+
+    proc = None
+    returncode = 1
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "scraper.py"), "--once"]
+            + (["--profile-id", str(profile_id)] if profile_id is not None else []),
             cwd=os.path.dirname(__file__),
             env=env,
-            timeout=max(300, int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800"))),
-            check=False,
+            start_new_session=True,
         )
-        if result.returncode == 3:
-            log.warning("Scan-Kindprozess nicht gestartet: gemeinsamer Scan-Lock ist bereits belegt")
-        elif result.returncode:
-            log.error("Scan-Kindprozess beendet mit Exit-Code %s", result.returncode)
+        try:
+            db.set_current_scan(
+                run_id, pid=proc.pid, status="running",
+                started_at=datetime.fromisoformat(started_iso),
+                jobs=jobs, mode=mode, progress=job_progress,
+            )
+        except Exception:
+            log.exception("Current-Scan konnte nicht in MongoDB geschrieben werden")
+
+        log.info("[SCAN-DEBUG] CHILD_PROCESS_START run_id=%s pid=%s mode=%s jobs=%d",
+                 run_id, proc.pid, mode, len(jobs))
+        timeout = max(300, int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800")))
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log.error("[SCAN-DEBUG] CHILD_PROCESS_TIMEOUT run_id=%s pid=%s timeout=%ss",
+                      run_id, proc.pid, timeout)
+            _terminate_process_tree(proc)
+            returncode = 124
+            timeout_error = f"Child process timeout after {timeout}s"
+            try:
+                db.update_current_scan(run_id, status="timeout", progress=job_progress,
+                                       error=timeout_error)
+                db.save_scan_run(
+                    {"jobs_count": len(jobs), "scraped_total": 0, "unique_total": 0,
+                     "stored_items": 0, "storage_errors": 0, "failure_class": "TIMEOUT",
+                     "scrapy_debug": [], "source_errors": [
+                         {"source": j.get("source"), "job_id": j.get("job_id"),
+                          "failure_class": "TIMEOUT"} for j in jobs
+                     ]},
+                    time.time() - started_at,
+                    started_at=datetime.fromisoformat(started_iso),
+                )
+            except Exception:
+                log.exception("Timeout-Status/Debug-Report konnte nicht gespeichert werden")
         else:
-            log.info("Scan-Kindprozess erfolgreich beendet")
-        return result.returncode
-    except subprocess.TimeoutExpired:
-        log.error("Scan-Kindprozess wegen Timeout beendet")
-        return 124
-    except Exception:
+            status = "finished" if returncode == 0 else ("locked" if returncode == 3 else "failed")
+            try:
+                current = db.get_current_scan() or {}
+                progress = current.get("progress") or job_progress
+                db.update_current_scan(run_id, status=status, exit_code=returncode, progress=progress)
+            except Exception:
+                log.exception("Finaler Current-Scan-Status konnte nicht gespeichert werden")
+        return returncode
+    except Exception as exc:
         log.exception("Scan-Kindprozess konnte nicht gestartet werden")
+        try:
+            db.update_current_scan(run_id, status="failed", exit_code=1, error=f"{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
         return 1
+    finally:
+        if proc is not None and proc.poll() is None:
+            _terminate_process_tree(proc)
+        try:
+            # Keep the terminal state briefly visible for diagnostics; the API
+            # treats status != running as no current scan.
+            db.update_current_scan(run_id, pid=getattr(proc, "pid", None),
+                                   ended_at=datetime.now(timezone.utc))
+        except Exception:
+            pass
 
 def _background_scanner():
     """Periodisch einen isolierten Scrapy/Playwright-Scan starten.
@@ -163,7 +282,7 @@ def _background_scanner():
         if already_running:
             log.info("Eingebetteter Scan übersprungen: manueller Scan läuft bereits")
         else:
-            returncode = _run_scan_once_embedded()
+            returncode = _run_scan_once_embedded(mode="auto")
             log.info("AUTO-SCAN: scraper.py finished (exit=%s)", returncode)
 
         # Fallback-Heartbeat: unabhängig vom Exit-Code des Subprozesses,
@@ -393,7 +512,27 @@ def scan_diagnostics():
                          "locations":list(locations),"urls":urls,"urls_count":len(urls),
                          "adapter_available":bool(getattr(adapter,"AVAILABLE",True)) if 'adapter' in locals() else False,
                          "url_error":url_error})
-        last=db.get_last_scan_run() or {}
+        last_completed_scan = db.get_last_scan_run() or {}
+        current_scan = db.get_current_scan() or {}
+        # A terminal current-state document is history, not an active scan.
+        # If a hard kill/OOM happened before the supervisor could write a
+        # terminal state, prevent a permanently "running" banner.
+        if current_scan.get("status") == "running" and current_scan.get("updated_at"):
+            import datetime
+            age = (datetime.datetime.now(datetime.timezone.utc) - _utc(current_scan["updated_at"])).total_seconds()
+            stale_after = max(300, int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800")) + 60)
+            if age > stale_after:
+                try:
+                    db.update_current_scan(
+                        current_scan.get("run_id"), status="failed",
+                        exit_code=137, error=f"stale current scan state after {int(age)}s",
+                    )
+                    current_scan["status"] = "failed"
+                    current_scan["error"] = f"stale current scan state after {int(age)}s"
+                except Exception:
+                    log.exception("Stale Current-Scan-State konnte nicht bereinigt werden")
+        current_running_scan = current_scan if current_scan.get("status") == "running" else None
+        last = last_completed_scan
         lock=db.get_scan_lock()
         if lock:
             import datetime
@@ -415,7 +554,12 @@ def scan_diagnostics():
                        "lease_remaining_seconds":None,"held_by_this_process":False}
         return jsonify({
             "ok":True,"generated_at":time.time(),"duration_ms":round((time.monotonic()-started)*1000,1),
-            "process":{"pid":os.getpid(),"scan_thread_running":bool(scan_thread and scan_thread.is_alive())},
+            "process":{
+                "pid":os.getpid(),
+                "scan_thread_running":bool(scan_thread and scan_thread.is_alive()),
+                "current_scan_pid": current_running_scan.get("pid") if current_running_scan else None,
+                "current_scan_status": current_running_scan.get("status") if current_running_scan else None,
+            },
             "config":{"log_level":os.getenv("LOG_LEVEL","INFO"),"scan_debug":os.getenv("SCAN_DEBUG","true"),
                       "auto_scan_enabled":os.getenv("ENABLE_AUTO_SCAN","false").lower() in {"1","true","yes","on"},
                       "scrape_max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3")),
@@ -425,11 +569,21 @@ def scan_diagnostics():
             "db":{"connected":True,"setup":db.get_setup_stats()},
             "profiles":[{"id":p.get("id"),"name":p.get("name"),"active":p.get("active"),
                          "sources":p.get("sources") or [],"regions":p.get("regions") or [],"districts":p.get("districts")} for p in profiles],
-            "jobs":{"count":len(jobs),"items":jobs},"scan_lock":lock_view,
-            "in_process_scan":{"manual_thread_running":bool(scan_thread and scan_thread.is_alive())},
-            "last_scan_run":last,
-            "last_scrapy_debug": (last.get("summary", {}).get("scrapy_debug", [])
-                                  if isinstance(last, dict) else []),
+            "jobs":{"count":len(jobs),"items":jobs},
+            "scan_lock":lock_view,
+            "current_scan":{
+                "running": bool(current_running_scan),
+                "data": current_running_scan,
+                "started_at": current_running_scan.get("started_at") if current_running_scan else None,
+                "pid": current_running_scan.get("pid") if current_running_scan else None,
+                "jobs": current_running_scan.get("jobs") if current_running_scan else [],
+                "progress": current_running_scan.get("progress") if current_running_scan else None,
+            },
+            "current_running_scan": current_running_scan,
+            "last_completed_scan": last_completed_scan,
+            "last_scan_run": last_completed_scan,
+            "last_scrapy_debug": (last_completed_scan.get("summary", {}).get("scrapy_debug", [])
+                                  if isinstance(last_completed_scan, dict) else []),
             "recent_scan_runs":db.get_recent_scan_runs(10),
         })
     except Exception as exc:
@@ -467,24 +621,13 @@ def run_scan():
 
 
 def _manual_scan(profile_id=None):
-    import subprocess
-    try:
-        cmd=[sys.executable, os.path.join(os.path.dirname(__file__), "scraper.py"), "--once"]
-        if profile_id is not None:
-            cmd += ["--profile-id", str(profile_id)]
-        result=subprocess.run(
-            cmd, cwd=os.path.dirname(__file__), env=os.environ.copy(),
-            timeout=max(300, int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800"))),
-            check=False,
-        )
-        if result.returncode == 3:
-            log.warning("Manueller Scan übersprungen: gemeinsamer Scan-Lock ist bereits belegt (profile_id=%s)", profile_id)
-        elif result.returncode:
-            log.error("Manueller Scan fehlgeschlagen: profile_id=%s exit=%s", profile_id, result.returncode)
-        else:
-            log.info("Manueller Scan fertig: profile_id=%s exit=0", profile_id)
-    except Exception:
-        log.exception("Manueller Scan fehlgeschlagen")
+    returncode = _run_scan_once_embedded(profile_id=profile_id, mode="manual")
+    if returncode == 3:
+        log.warning("Manueller Scan übersprungen: gemeinsamer Scan-Lock ist bereits belegt (profile_id=%s)", profile_id)
+    elif returncode:
+        log.error("Manueller Scan fehlgeschlagen: profile_id=%s exit=%s", profile_id, returncode)
+    else:
+        log.info("Manueller Scan fertig: profile_id=%s exit=0", profile_id)
 
 
 @app.route("/profiles", methods=["GET", "POST"])
