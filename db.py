@@ -3,10 +3,12 @@ import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
+import certifi
 from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
+from pymongo.server_api import ServerApi
 from pymongo.errors import DuplicateKeyError
 
-MONGODB_URI = os.getenv("MONGODB_URI") or os.getenv("DATABASE_URL")
+MONGODB_URI = (os.getenv("MONGODB_URI") or "").strip()
 
 def _database_name_from_uri(uri):
     configured = os.getenv("MONGO_DB_NAME")
@@ -30,16 +32,21 @@ def _get_client():
     if not MONGODB_URI:
         raise RuntimeError("MONGODB_URI fehlt")
     if _client is None:
-        _client = MongoClient(
-            MONGODB_URI,
-            serverSelectionTimeoutMS=int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "10000")),
-            connectTimeoutMS=int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "10000")),
-            socketTimeoutMS=int(os.getenv("MONGO_SOCKET_TIMEOUT_MS", "30000")),
-            retryWrites=True,
-        )
-    # Fail fast during startup instead of discovering an invalid URI only on
-    # the first dashboard request.
-    _client.admin.command("ping")
+        kwargs = {
+            "serverSelectionTimeoutMS": int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "5000")),
+            "connectTimeoutMS": int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "5000")),
+            "socketTimeoutMS": int(os.getenv("MONGO_SOCKET_TIMEOUT_MS", "15000")),
+            "retryWrites": True,
+            "tls": True,
+            "tlsCAFile": certifi.where(),
+            "server_api": ServerApi("1"),
+        }
+        # TLS verification is deliberately kept enabled. Disabling certificate
+        # verification would hide deployment/network problems instead of fixing them.
+        if os.getenv("MONGO_TLS_INSECURE", "false").strip().lower() in {"1", "true", "yes", "on"}:
+            kwargs["tlsAllowInvalidCertificates"] = True
+            kwargs["tlsAllowInvalidHostnames"] = True
+        _client = MongoClient(MONGODB_URI, **kwargs)
     return _client
 
 

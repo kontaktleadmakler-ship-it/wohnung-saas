@@ -328,7 +328,7 @@ def run_once(profile_id=None):
 def worker_loop():
     log.info(
         "Konfiguration: MONGODB_URI=%s, TELEGRAM=%s, POLL=%ss, MIN_NOTIFY_SCORE=%s",
-        "gesetzt" if (os.getenv("MONGODB_URI") or os.getenv("DATABASE_URL")) else "FEHLT",
+        "gesetzt" if os.getenv("MONGODB_URI") else "FEHLT",
         "gesetzt" if os.getenv("TELEGRAM_BOT_TOKEN") else "nicht gesetzt",
         "gesetzt" if email_configured() else "nicht gesetzt",
         POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,

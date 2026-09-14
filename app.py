@@ -132,6 +132,15 @@ def _background_scanner():
         time.sleep(initial_delay)
 
     while True:
+        # MongoDB may be temporarily unavailable during deployment or when
+        # Atlas rejects the Render egress IP. Retry here instead of blocking
+        # Gunicorn startup or killing the web process.
+        if not _ensure_db_initialized():
+            retry_seconds = max(15, int(os.getenv("DB_RETRY_SECONDS", "30")))
+            log.error("AUTO-SCAN: MongoDB nicht erreichbar; neuer Versuch in %ss", retry_seconds)
+            time.sleep(retry_seconds)
+            continue
+
         log.info("AUTO-SCAN: launching scraper.py --once")
         started = time.monotonic()
         with scan_lock:
@@ -169,20 +178,17 @@ def _start_background_scanner_once():
 
 
 def _maybe_start_background_scanner():
-    """Start the periodic scanner for both Flask and Gunicorn imports.
+    """Start the scanner without making Gunicorn startup depend on MongoDB.
 
-    Gunicorn imports ``app`` and does not execute app.py's ``__main__`` block.
-    The previous implementation therefore served a healthy dashboard but
-    never launched the scanner in the production Render process.
+    A temporary Atlas/network/TLS outage must not prevent Render from opening
+    the HTTP port. The scanner retries database initialization in its own
+    background thread once MongoDB becomes reachable again.
     """
     enabled = os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}
     if enabled:
         log.info("AUTO-SCAN: enabled during app import (pid=%s)", os.getpid())
-        if _ensure_db_initialized():
-            _start_background_scanner_once()
-            log.info("AUTO-SCAN: background thread launch requested")
-        else:
-            log.error("AUTO-SCAN: DB initialization failed; scanner NOT started")
+        _start_background_scanner_once()
+        log.info("AUTO-SCAN: background thread launch requested")
     else:
         log.info("AUTO-SCAN: disabled (ENABLE_AUTO_SCAN=false)")
 
@@ -440,12 +446,20 @@ def delete_profile(pid):
 
 @app.route("/healthz")
 def healthz():
-    # Auch Healthchecks verwenden die gecachte Initialisierung statt DDL bei jedem Probe.
-    if _ensure_db_initialized():
+    """Liveness endpoint: Render must see the web process even when Atlas is
+    temporarily unavailable. Database state is returned as metadata instead
+    of causing a restart loop."""
+    try:
+        db_ok = _ensure_db_initialized()
+    except Exception:
+        db_ok = False
+
+    payload = {"ok": True, "database": "ok" if db_ok else "unavailable"}
+    if db_ok:
         try:
-            stats = db.get_setup_stats()
+            payload.update(db.get_setup_stats())
         except Exception:
-            stats = {}
+            pass
         try:
             hb = db.get_worker_heartbeat()
         except Exception:
@@ -453,15 +467,14 @@ def healthz():
         if hb and hb.get("last_seen_at"):
             import datetime
             age = (datetime.datetime.now(datetime.timezone.utc) - hb["last_seen_at"]).total_seconds()
-            stats["worker_last_seen_seconds_ago"] = round(age, 1)
-            stats["worker_poll_interval_seconds"] = hb.get("poll_interval_seconds")
-            stats["worker_pid"] = hb.get("pid")
+            payload["worker_last_seen_seconds_ago"] = round(age, 1)
+            payload["worker_poll_interval_seconds"] = hb.get("poll_interval_seconds")
+            payload["worker_pid"] = hb.get("pid")
         else:
-            stats["worker_last_seen_seconds_ago"] = None
-            stats["worker_poll_interval_seconds"] = None
-            stats["worker_pid"] = None
-        return {"ok": True, **stats}, 200
-    return {"ok": False, "error": "DB-Initialisierung fehlgeschlagen"}, 503
+            payload["worker_last_seen_seconds_ago"] = None
+            payload["worker_poll_interval_seconds"] = None
+            payload["worker_pid"] = None
+    return payload, 200
 
 
 def _profile_form():
