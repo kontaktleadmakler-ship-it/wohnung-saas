@@ -125,7 +125,7 @@ def score_listing(listing, profile):
     # Budget is the strongest constraint. A small tolerance prevents losing
     # borderline results because of minor warm/cold-rent differences or
     # Nebenkosten estimates that are slightly off.
-    if max_price and price is not None and price > max_price * (1 + TOLERANCE):
+    if max_price and price is not None and price > max_price:
         listing["_exclude_reason"] = REASON_OVER_BUDGET
         return None
 

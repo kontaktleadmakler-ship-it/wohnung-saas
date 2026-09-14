@@ -197,7 +197,14 @@ def upsert_listing(item):
         with c.cursor() as cur:
             cur.execute("""INSERT INTO listings(source,external_id,title,description,price,price_total,rooms,size,location,city,postal_code,region_code,url,contact_name,contact_phone,published_at,raw)
               VALUES(%(source)s,%(external_id)s,%(title)s,%(description)s,%(price)s,%(price_total)s,%(rooms)s,%(size)s,%(address)s,%(city)s,%(postal_code)s,%(region_code)s,%(url)s,%(contact_name)s,%(contact_phone)s,%(published_at)s,%(raw)s)
-              ON CONFLICT(source,external_id) DO UPDATE SET title=EXCLUDED.title,description=EXCLUDED.description,price=EXCLUDED.price,price_total=EXCLUDED.price_total,rooms=EXCLUDED.rooms,size=EXCLUDED.size,location=EXCLUDED.location,url=EXCLUDED.url,last_seen=NOW(),raw=EXCLUDED.raw
+              ON CONFLICT(source,external_id) DO UPDATE SET
+                title=EXCLUDED.title,description=EXCLUDED.description,price=EXCLUDED.price,
+                price_total=EXCLUDED.price_total,rooms=EXCLUDED.rooms,size=EXCLUDED.size,
+                location=EXCLUDED.location,city=EXCLUDED.city,postal_code=EXCLUDED.postal_code,
+                region_code=EXCLUDED.region_code,url=EXCLUDED.url,contact_name=EXCLUDED.contact_name,
+                contact_phone=EXCLUDED.contact_phone,
+                published_at=COALESCE(listings.published_at, EXCLUDED.published_at),
+                last_seen=NOW(),raw=EXCLUDED.raw
               RETURNING id,(xmax=0) AS is_new""",{**item.__dict__,'raw': psycopg2.extras.Json(item.raw or {})}); row=cur.fetchone(); c.commit(); return row[0],row[1]
 
 def save_match(listing_id,profile_id,score,components,reasons):

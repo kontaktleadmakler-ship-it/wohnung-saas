@@ -1,205 +1,119 @@
 from __future__ import annotations
-
-from urllib.parse import quote_plus
-
+import os, re
+from urllib.parse import quote, quote_plus
 from scrapers.models import Listing, SearchParams
 from .runner import run_jobs
 from .spiders.portals import SPIDER_CLASSES
-
+import logging
+log=logging.getLogger("wohnungsradar.adapters")
+LAST_RUN_STATUS=[]
+from .parsing import parse_number
 
 def slugify_city(name: str) -> str:
-    text = str(name or "").strip()
-    for src, repl in {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}.items():
-        text = text.replace(src, repl)
-    return "-".join(part for part in text.casefold().replace(".", " ").split() if part)
-
+    text=str(name or "").strip()
+    text=text.translate(str.maketrans({"ä":"ae","ö":"oe","ü":"ue","Ä":"Ae","Ö":"Oe","Ü":"Ue","ß":"ss"}))
+    return "-".join(part for part in re.sub(r"[^A-Za-z0-9]+"," ",text).casefold().split())
 
 def _locations(params):
-    if params.nationwide:
-        return []
     return list(params.locations or [])
 
-
 class ScrapyPortalAdapter:
-    SOURCE_KEY = ""
-    SOURCE_LABEL = ""
-    BASE_URL = ""
-    SPIDER = None
-
-    def build_search_urls(self, params: SearchParams):
-        raise NotImplementedError
-
-    def run(self, params: SearchParams):
-        urls = self.build_search_urls(params)
-        if not urls:
-            return []
-        spider = SPIDER_CLASSES[self.SOURCE_KEY]
-        raw = run_jobs([{"source": self.SOURCE_KEY, "urls": urls, "max_pages": spider.max_pages}])
-        return [self._to_listing(item) for item in raw if self._to_listing(item)]
-
-    def _to_listing(self, item):
+    SOURCE_KEY=""; SOURCE_LABEL=""; BASE_URL=""; SPIDER=None
+    def build_search_urls(self, params): raise NotImplementedError
+    def run(self, params):
+        urls=self.build_search_urls(params)
+        if not urls: return []
+        raw=run_jobs([{"job_id":"direct","source":self.SOURCE_KEY,"urls":urls,
+                       "max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3"))}])
+        return [x for x in (self._to_listing(i) for i in raw) if x]
+    def _to_listing(self,item):
         return Listing(
             source=item.get("source") or self.SOURCE_KEY,
-            external_id=str(item.get("external_id") or item.get("url")),
-            url=item.get("url"),
-            title=item.get("title") or "",
-            description=item.get("description"),
-            price=_num(item.get("price")),
-            price_total=_num(item.get("price_total")),
-            rooms=_num(item.get("rooms")),
-            size=_num(item.get("size")),
-            address=item.get("address"),
-            city=item.get("city"),
-            postal_code=item.get("postal_code"),
-            region_code=item.get("region_code"),
-            contact_name=item.get("contact_name"),
-            contact_phone=item.get("contact_phone"),
-            published_at=item.get("published_at"),
-            raw=item.get("raw") or {},
-        )
-
+            external_id=str(item.get("external_id") or item.get("url") or ""),
+            url=item.get("url") or "", title=item.get("title") or "",
+            description=item.get("description"), price=parse_number(item.get("price")),
+            price_total=parse_number(item.get("price_total")), rooms=parse_number(item.get("rooms")),
+            size=parse_number(item.get("size")), address=item.get("address"), city=item.get("city"),
+            postal_code=item.get("postal_code"), region_code=item.get("region_code"),
+            contact_name=item.get("contact_name"), contact_phone=item.get("contact_phone"),
+            published_at=item.get("published_at"), raw=item.get("raw") or {},
+        ) if item.get("url") and item.get("title") else None
 
 class KleinanzeigenAdapter(ScrapyPortalAdapter):
-    SOURCE_KEY = "kleinanzeigen"
-    SOURCE_LABEL = "eBay Kleinanzeigen"
-    BASE_URL = "https://www.kleinanzeigen.de"
-
-    def build_search_urls(self, p):
-        if p.nationwide:
-            return [f"{self.BASE_URL}/s-wohnung-mieten/c203"]
-        return [f"{self.BASE_URL}/s-wohnung-mieten/{slugify_city(x)}/c203" for x in _locations(p)][:8]
-
+    SOURCE_KEY="kleinanzeigen"; SOURCE_LABEL="Kleinanzeigen"; BASE_URL="https://www.kleinanzeigen.de"
+    def build_search_urls(self,p):
+        if p.nationwide: return [f"{self.BASE_URL}/s-wohnung-mieten/c203"]
+        return [f"{self.BASE_URL}/s-wohnung-mieten/{slugify_city(x)}/k0c203" for x in _locations(p)][:8]
 
 class ImmoScout24Adapter(ScrapyPortalAdapter):
-    SOURCE_KEY = "immoscout24"
-    SOURCE_LABEL = "ImmoScout24"
-    BASE_URL = "https://www.immobilienscout24.de"
-
-    def build_search_urls(self, p):
-        if p.nationwide:
-            return [f"{self.BASE_URL}/Suche/de/wohnung-mieten?geo=de"]
-        return [f"{self.BASE_URL}/Suche/de/{slugify_city(x)}/wohnung-mieten" for x in _locations(p)][:8]
-
+    SOURCE_KEY="immoscout24"; SOURCE_LABEL="ImmoScout24"; BASE_URL="https://www.immobilienscout24.de"
+    def build_search_urls(self,p):
+        if p.nationwide: return [f"{self.BASE_URL}/Suche/de/wohnung-mieten?geo=de"]
+        return [f"{self.BASE_URL}/Suche/de/{slugify_city(x)}/{slugify_city(x)}/wohnung-mieten" for x in _locations(p)][:8]
 
 class ImmoweltAdapter(ScrapyPortalAdapter):
-    SOURCE_KEY = "immowelt"
-    SOURCE_LABEL = "Immowelt"
-    BASE_URL = "https://www.immowelt.de"
-
-    def build_search_urls(self, p):
-        if p.nationwide:
-            return [f"{self.BASE_URL}/liste/deutschland/wohnungen/mieten"]
-        return [f"{self.BASE_URL}/liste/{slugify_city(x)}/wohnungen/mieten" for x in _locations(p)][:8]
-
+    SOURCE_KEY="immowelt"; SOURCE_LABEL="Immowelt"; BASE_URL="https://www.immowelt.de"
+    def build_search_urls(self,p):
+        if p.nationwide: return [f"{self.BASE_URL}/suche/mieten/wohnung/deutschland"]
+        return [f"{self.BASE_URL}/suche/mieten/wohnung/{slugify_city(x)}" for x in _locations(p)][:8]
 
 class ImmonetAdapter(ScrapyPortalAdapter):
-    SOURCE_KEY = "immonet"
-    SOURCE_LABEL = "Immonet"
-    BASE_URL = "https://www.immonet.de"
-
-    def build_search_urls(self, p):
-        if p.nationwide:
-            return [f"{self.BASE_URL}/immobiliensuche/sel.do?suchart=miete&location=Deutschland"]
-        return [f"{self.BASE_URL}/immobiliensuche/sel.do?suchart=miete&location={quote_plus(x)}" for x in _locations(p)][:8]
-
+    SOURCE_KEY="immonet"; SOURCE_LABEL="Immonet"; BASE_URL="https://www.immonet.de"
+    def build_search_urls(self,p):
+        if p.nationwide: return [f"{self.BASE_URL}/deutschland/wohnung-mieten.html"]
+        return [f"{self.BASE_URL}/{slugify_city(x)}/wohnung-mieten.html" for x in _locations(p)][:8]
 
 class WgGesuchtAdapter(ScrapyPortalAdapter):
-    SOURCE_KEY = "wg_gesucht"
-    SOURCE_LABEL = "WG-Gesucht"
-    BASE_URL = "https://www.wg-gesucht.de"
-
-    def build_search_urls(self, p):
-        if p.nationwide:
-            return []
-        out = []
-        for x in _locations(p):
-            slug = slugify_city(x)
-            out.extend([f"{self.BASE_URL}/wohnungen-in-{slug}.html", f"{self.BASE_URL}/1-zimmer-wohnungen/{slug}"])
-        return out[:8]
-
+    SOURCE_KEY="wg_gesucht"; SOURCE_LABEL="WG-Gesucht"; BASE_URL="https://www.wg-gesucht.de"
+    def build_search_urls(self,p):
+        if p.nationwide: return []
+        # Current WG-Gesucht exposes a stable SEO market page. It is safer than
+        # inventing city IDs; the spider can follow its real listing links.
+        return [f"{self.BASE_URL}/mietwohnungen/{quote(x.strip().casefold())}" for x in _locations(p)][:8]
 
 class MeinestadtAdapter(ScrapyPortalAdapter):
-    SOURCE_KEY = "meinestadt"
-    SOURCE_LABEL = "meinestadt.de"
-    BASE_URL = "https://immobilien.meinestadt.de"
-
-    def build_search_urls(self, p):
-        if p.nationwide:
-            return [f"{self.BASE_URL}/deutschland/wohnungen/mieten"]
-        return [f"{self.BASE_URL}/{slugify_city(x)}/wohnungen/mieten" for x in _locations(p)][:8]
-
+    SOURCE_KEY="meinestadt"; SOURCE_LABEL="meinestadt.de"; BASE_URL="https://immobilien.meinestadt.de"
+    def build_search_urls(self,p):
+        if p.nationwide: return [f"{self.BASE_URL}/deutschland/wohnung-mieten"]
+        return [f"{self.BASE_URL}/{slugify_city(x)}/wohnung-mieten" for x in _locations(p)][:8]
 
 class KalaydoAdapter(ScrapyPortalAdapter):
-    SOURCE_KEY = "kalaydo"
-    SOURCE_LABEL = "Kalaydo"
-    BASE_URL = "https://www.kalaydo.de"
+    SOURCE_KEY="kalaydo"; SOURCE_LABEL="Kalaydo"; BASE_URL="https://www.kalaydo.de"
+    def build_search_urls(self,p):
+        # The current site is primarily jobs/classified content; don't invent
+        # residential results when no verified residential search exists.
+        return []
 
-    def build_search_urls(self, p):
-        if p.nationwide:
-            return [f"{self.BASE_URL}/immobilien/"]
-        return [f"{self.BASE_URL}/immobilien/"]
-
+ADAPTERS={c.SOURCE_KEY:c for c in (KleinanzeigenAdapter,ImmoScout24Adapter,ImmoweltAdapter,ImmonetAdapter,WgGesuchtAdapter,MeinestadtAdapter,KalaydoAdapter)}
 
 def run_scrapy_jobs(work):
-    """Translate the dashboard jobs into one Scrapy crawl and group results."""
-    jobs = []
-    adapters = {}
-    for idx, (source, regions, locations, profile_ids) in enumerate(work):
-        adapter_cls = ADAPTERS[source]
-        adapter = adapter_cls()
-        job_id = str(idx)
-        adapters[job_id] = adapter
-        params = SearchParams(
-            nationwide=("DE" in regions and not locations),
-            region_codes=[] if "DE" in regions else list(regions),
-            locations=list(locations),
-        )
-        jobs.append({
-            "job_id": job_id,
-            "source": source,
-            "urls": adapter.build_search_urls(params),
-            "max_pages": SPIDER_CLASSES[source].max_pages,
-        })
-
-    raw_items = run_jobs(jobs)
-    grouped = {str(idx): [] for idx in range(len(work))}
-    for raw in raw_items:
-        job_id = str(raw.get("job_id", ""))
-        adapter = adapters.get(job_id)
-        if not adapter:
+    global LAST_RUN_STATUS
+    LAST_RUN_STATUS=[]
+    jobs=[]; adapters={}
+    for idx,(source,regions,locations,profile_ids) in enumerate(work):
+        adapter=ADAPTERS[source]; jid=str(idx); adapters[jid]=adapter
+        params=SearchParams(nationwide=("DE" in regions and not locations),
+                            region_codes=[] if "DE" in regions else list(regions),
+                            locations=list(locations))
+        urls=adapter.build_search_urls(params)
+        jobs.append({"job_id":jid,"source":source,"urls":urls,
+                     "max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3"))})
+    for job in jobs:
+        if not job["urls"]:
+            LAST_RUN_STATUS.append({"source":job["source"],"job_id":job["job_id"],"status":"source unavailable"})
+            log.warning("[%s] source unavailable: keine verifizierte Such-URL", job["source"])
+    raw=run_jobs(jobs)
+    grouped={str(i):[] for i in range(len(work))}
+    for item in raw:
+        if item.get("_runner_status") == "error":
+            LAST_RUN_STATUS.append(item)
             continue
-        item = adapter._to_listing(raw)
-        if item:
-            grouped.setdefault(job_id, []).append(item)
-    return [(work[idx][3], grouped.get(str(idx), [])) for idx in range(len(work))]
+        adapter=adapters.get(str(item.get("job_id","")))
+        if adapter:
+            listing=adapter._to_listing(item)
+            if listing: grouped.setdefault(str(item.get("job_id")),[]).append(listing)
+    return [(work[i][3],grouped.get(str(i),[])) for i in range(len(work))]
 
 
-def _num(value):
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    import re
-    cleaned = re.sub(r"[^0-9,.-]", "", str(value))
-    if "," in cleaned and "." in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".")
-    else:
-        cleaned = cleaned.replace(",", ".")
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-ADAPTERS = {
-    c.SOURCE_KEY: c
-    for c in (
-        KleinanzeigenAdapter,
-        ImmoScout24Adapter,
-        ImmoweltAdapter,
-        ImmonetAdapter,
-        WgGesuchtAdapter,
-        MeinestadtAdapter,
-        KalaydoAdapter,
-    )
-}
+def get_last_run_status():
+    return list(LAST_RUN_STATUS)

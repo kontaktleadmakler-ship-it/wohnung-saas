@@ -12,7 +12,7 @@ from matching import listing_fingerprint, score_listing
 from telegram import send_telegram, format_match_message
 from email_notifier import send_email, format_match_email, is_configured as email_configured
 from scrapers.registry import get_scraper
-from wohnungsradar_scrapy.adapters import run_scrapy_jobs
+from wohnungsradar_scrapy.adapters import run_scrapy_jobs, get_last_run_status
 from scrapers.models import SearchParams
 from scrapers.regions import STATE_CITY_SAMPLES
 
@@ -26,7 +26,6 @@ POLL_INTERVAL_SECONDS = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
 # dort zeigt alle). "Keine Treffer" im Dashboard trotz gesetzter MIN_NOTIFY_SCORE
 # deutet daher eher auf einen leeren Scan als auf diese Schwelle hin.
 MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
-MAX_CONCURRENT_SCRAPERS = max(1, int(os.getenv("MAX_CONCURRENT_SCRAPERS", "1")))
 # Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
 # aus einem Portal auf einmal in Playwright/Python weiterreichen.
 MAX_CANDIDATES_PER_SOURCE = max(0, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "0")))
@@ -121,6 +120,7 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
                 item.address,
                 item.url,
                 item.source,
+                price_total=item.price_total,
             )
 
             # Telegram and e-mail are tracked independently. A temporary
@@ -131,12 +131,13 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
                     db.mark_telegram_notified(listing_id, pid)
 
             if email_configured() and not notification_state.get("email_notified"):
-                subject, text = format_match_email(
+                subject, text, html_body = format_match_email(
                     profile["name"], score, item.title,
                     item.price_total or item.price, item.rooms,
                     item.size, item.address, item.url, item.source,
+                    price_total=item.price_total,
                 )
-                if send_email(subject, text):
+                if send_email(subject, text, html_body):
                     db.mark_email_notified(listing_id, pid)
 
 
@@ -246,11 +247,18 @@ def run_once(profile_id=None):
         source_counts = defaultdict(int)
         source_errors = []
         source_empty = []
+        source_unavailable = []
 
         # Ein Scrapy-Prozess pro kompletter Scan. Alle Portal-Spider laufen
         # darin, damit der Twisted-Reactor nicht mehrfach gestartet werden muss.
         try:
             all_results = run_scrapy_jobs(work)
+            runner_status = get_last_run_status()
+            for status in runner_status:
+                if status.get("status") == "source unavailable":
+                    source_unavailable.append(status.get("source"))
+                else:
+                    source_errors.append(status.get("source"))
             for job, (profile_ids, listings) in zip(work, all_results):
                 source = job[0]
                 log.info(
@@ -287,8 +295,9 @@ def run_once(profile_id=None):
                     )
 
         funnel = _log_and_build_funnel(profiles_by_id, profile_stats, dict(source_counts))
-        funnel["source_errors"] = source_errors
-        funnel["source_empty"] = source_empty
+        funnel["source_errors"] = sorted(set(source_errors))
+        funnel["source_empty"] = sorted(set(source_empty))
+        funnel["source_unavailable"] = sorted(set(source_unavailable))
         funnel["scraped_total"] = total
         funnel["unique_total"] = processed
         funnel["profiles_count"] = len(profiles)
@@ -326,10 +335,9 @@ def worker_loop():
         POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
     )
     log.info(
-        "Worker gestartet (pid=%s): poll_interval=%ss, min_notify_score=%s, "
-        "max_concurrent_scrapers=%s, log_level=%s",
+        "Worker gestartet (pid=%s): poll_interval=%ss, min_notify_score=%s, log_level=%s",
         os.getpid(), POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
-        MAX_CONCURRENT_SCRAPERS, os.getenv("LOG_LEVEL", "INFO"),
+        os.getenv("LOG_LEVEL", "INFO"),
     )
     db.init_db()
     db.cleanup_scan_runs()

@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import smtplib
 import ssl
+import logging
+import html
 from email.message import EmailMessage
 
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
@@ -19,6 +21,7 @@ EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USERNAME).strip()
 EMAIL_TO = os.getenv("EMAIL_TO", "").strip()
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no", "off"}
 SMTP_TIMEOUT = max(5, int(os.getenv("SMTP_TIMEOUT", "20")))
+log = logging.getLogger("notifications.email")
 
 
 def is_configured() -> bool:
@@ -55,20 +58,33 @@ def send_email(subject: str, text: str, html: str | None = None) -> bool:
                 smtp.send_message(message)
         return True
     except Exception:
+        log.exception("SMTP-Versand fehlgeschlagen")
         return False
 
 
-def format_match_email(profile_name, score, title, price, rooms, size, location, url, source):
+def format_match_email(profile_name, score, title, price, rooms, size, location, url, source, price_total=None):
+    warm = price_total is not None
+    amount = price_total if warm else price
+    label = "Warm-/Gesamtmiete" if warm else "Kaltmiete (Warmmiete unbekannt)"
     subject = f"Neue Wohnung: {title} ({score}/100)"
     text = (
-        f"Neuer Wohnungstreffer für das Profil: {profile_name}\n\n"
-        f"{title}\n"
-        f"Quelle: {source}\n"
-        f"Lage: {location or 'unbekannt'}\n"
-        f"Preis: {price or '–'} €\n"
-        f"Zimmer: {rooms or '–'}\n"
-        f"Fläche: {size or '–'} m²\n"
-        f"Score: {score}/100\n\n"
+        f"Neuer Wohnungstreffer für das Profil: {profile_name}\n\n{title}\n"
+        f"Quelle: {source}\nLage: {location or 'unbekannt'}\n"
+        f"{label}: {amount if amount is not None else '–'} €\n"
+        f"Zimmer: {rooms if rooms is not None else '–'}\n"
+        f"Fläche: {size if size is not None else '–'} m²\nScore: {score}/100\n"
         f"Inserat: {url}\n"
     )
-    return subject, text
+    safe_url=html.escape(str(url),quote=True)
+    safe_title=html.escape(str(title or "Wohnung"))
+    safe_source=html.escape(str(source)); safe_location=html.escape(str(location or "unbekannt"))
+    html_body=(
+        f"<h2>Neuer Wohnungstreffer für {html.escape(str(profile_name))}</h2>"
+        f"<p><strong>{safe_title}</strong><br>{safe_source} · {safe_location}<br>"
+        f"{html.escape(label)}: {html.escape(str(amount if amount is not None else '–'))} €<br>"
+        f"Zimmer: {html.escape(str(rooms if rooms is not None else '–'))}<br>"
+        f"Fläche: {html.escape(str(size if size is not None else '–'))} m²<br>"
+        f"Score: {int(score)}/100</p>"
+        f'<p><a href="{safe_url}">Inserat öffnen</a></p>'
+    )
+    return subject, text, html_body

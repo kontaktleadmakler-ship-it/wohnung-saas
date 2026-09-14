@@ -47,8 +47,6 @@ services:
         value: "30"
       - key: MIN_NOTIFY_SCORE
         value: "75"
-      - key: MAX_CONCURRENT_SCRAPERS
-        value: "1"
       - key: SCRAPE_MAX_PAGES
         value: "3"
       - key: MAX_CANDIDATES_PER_SOURCE

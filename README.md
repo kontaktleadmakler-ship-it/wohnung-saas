@@ -41,7 +41,6 @@ TELEGRAM_CHAT_ID=...
 POLL_INTERVAL_SECONDS=300
 MIN_NOTIFY_SCORE=75
 PLAYWRIGHT_BROWSERS_PATH=0
-MAX_CONCURRENT_SCRAPERS=1
 DASHBOARD_LIMIT=300
 ```
 
@@ -150,8 +149,33 @@ Nur öffentlich zugängliche Inhalte abrufen, Nutzungsbedingungen und Robots-/Zu
 ## Betriebshinweise
 
 - `DASHBOARD_LIMIT` steuert die maximale Anzahl der Treffer im Dashboard (Standard 300).
-- `MAX_CONCURRENT_SCRAPERS=1` ist der speichersichere Standard für kleine Render-Instanzen. Höhere Werte sind bewusst eine Betriebsentscheidung.
 - Ein `DE`-Profil wird bei den Scrapers als `SearchParams.nationwide=True` behandelt und nicht auf Berlin zurückgefallen. Regionale Profile ohne Districts werden über 2–3 große Städte je Bundesland als Suchanker aufgebaut; explizite Districts haben Vorrang.
 - Cookie-Consent wird zusätzlich in gängigen Consent-iframes versucht, damit eingebettete Banner die Extraktion nicht blockieren.
 - Der Scan-Thread läuft im Web-Prozess. Bei mehreren Gunicorn-Workern ist der Laufstatus deshalb nicht global; der PostgreSQL-Advisory-Lock verhindert jedoch parallele Scans. Für den integrierten Thread `python app.py` bzw. einen einzelnen Web-Worker verwenden.
 - **Entscheidung offen: Kalaydo/Immonet.** Beide bleiben vorerst in `SOURCE_CLASSES` und fehlertolerant. Kalaydo ist aktuell primär Jobbörse; Immonet ist weitgehend in Immowelt konsolidiert. Sie wurden bewusst nicht entfernt, damit eine spätere Reaktivierung per Konfiguration möglich bleibt. Die endgültige Entfernung sollte erst nach einem echten Produktionsscan bzw. einer bewussten Konfigurationsentscheidung erfolgen.
+
+
+## Architektur (repariert)
+
+Der einzige Scraping-Pfad ist:
+
+`Flask -> scraper.py -> wohnungsradar_scrapy.runner -> PortalSpider -> NormalizePipeline -> DB/Matching`
+
+Die frühere `scrapers/base.py`/Playwright-Standalone-Implementierung wurde entfernt. `scrapers.sites` exportiert nur noch die Scrapy-Adapter für die öffentliche API.
+
+### Laufzeit
+
+- `SCRAPE_MAX_PAGES` wird vom Scan-Job bis in jeden Spider durchgereicht.
+- Scrapy und Playwright laufen pro Scan in einem kurzlebigen Kindprozess. Dadurch wird der Twisted-Reactor nicht mehrfach gestartet und ein Browser-OOM reißt den Flask-Prozess nicht mit.
+- Maximal ein Playwright-Kontext/eine Seite und ein Scrapy-Request gleichzeitig.
+- Portalfehler werden pro Quelle geloggt; andere Quellen laufen weiter.
+- `Kalaydo` wird nicht künstlich mit Ergebnissen gefüllt, wenn keine verifizierte Wohnungs-Suchroute vorhanden ist; das Dashboard zeigt die Quelle als nicht verfügbar.
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -v
+python test_smoke.py
+```
+
+Die Tests arbeiten mit Fixture-HTML und prüfen Parser, JSON-LD, Preis/Warmmiete, Zimmer, Fläche und URL-Normalisierung ohne Netzwerk.

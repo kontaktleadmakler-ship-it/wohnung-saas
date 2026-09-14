@@ -20,7 +20,7 @@
   {% if last_scan.summary.jobs_count is not none %}· {{last_scan.summary.jobs_count}} Jobs{% endif %}
   {% if last_scan.duration_seconds %}· {{'%.0f'|format(last_scan.duration_seconds)}}s Laufzeit{% endif %}
   {% if last_scan.summary.source_errors %}<div class="source-error">Fehlgeschlagene Quellen (andere liefen weiter): {{last_scan.summary.source_errors|join(', ')}}</div>{% endif %}
-  {% if last_scan.summary.source_empty %}<div class="source-error">Quellen ohne Treffer: {{last_scan.summary.source_empty|join(', ')}}</div>{% endif %}
+  {% if last_scan.summary.source_empty %}<div class="source-error">Quellen ohne Treffer: {{last_scan.summary.source_empty|join(', ')}}</div>{% endif %}\n  {% if last_scan.summary.source_unavailable %}<div class="source-error">Quelle nicht verfügbar / keine verifizierte Suchroute: {{last_scan.summary.source_unavailable|join(', ')}}</div>{% endif %}
   <details><summary>Warum wenige/keine Treffer? Trichter pro Profil anzeigen</summary>
     {% for pid, f in (last_scan.summary.per_profile or {}).items() %}
     <div><b>{{f.profile_name}}</b>
@@ -47,7 +47,7 @@
     <p>{{r.location or 'Lage nicht angegeben'}}</p>
   </div>
   <dl>
-    <div><dt>PREIS</dt><dd>{{r.price|int if r.price is not none else '–'}} €</dd></div>
+    <div><dt>{{'WARMMIETE' if r.price_total is not none else 'KALTMIETE'}}</dt><dd>{{(r.price_total if r.price_total is not none else r.price)|int if (r.price_total is not none or r.price is not none) else '–'}} €</dd></div>
     <div><dt>ZI.</dt><dd>{{r.rooms or '–'}}</dd></div>
     <div><dt>M²</dt><dd>{{r.size or '–'}}</dd></div>
   </dl>

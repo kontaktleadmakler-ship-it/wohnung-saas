@@ -85,17 +85,32 @@ def _ensure_db_initialized():
 
 
 def _run_scan_once_embedded():
-    """Run the scanner in-process.
+    """Run one scan in a short-lived child process.
 
-    Keeping one Python process avoids duplicating the web process just to
-    launch Playwright/Chromium. Jobs themselves are still executed sequentially
-    (MAX_CONCURRENT_SCRAPERS=1), so only one browser is active at a time.
+    Scrapy/Twisted reactors are not restartable. A persistent Flask process
+    therefore must not create a new CrawlerProcess for every poll cycle.
+    The child owns Scrapy + Playwright and is fully cleaned up after one scan;
+    Flask stays responsive and survives a browser OOM.
     """
+    import subprocess
     try:
-        result = worker.run_once()
-        return 0 if not isinstance(result, dict) or not result.get("error") else 1
+        env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        result = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "scraper.py"), "--once"],
+            cwd=os.path.dirname(__file__),
+            env=env,
+            timeout=max(300, int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800"))),
+            check=False,
+        )
+        if result.returncode:
+            log.error("Scan-Kindprozess beendet mit Exit-Code %s", result.returncode)
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        log.error("Scan-Kindprozess wegen Timeout beendet")
+        return 124
     except Exception:
-        log.exception("Eingebetteter Scan fehlgeschlagen")
+        log.exception("Scan-Kindprozess konnte nicht gestartet werden")
         return 1
 
 def _background_scanner():
@@ -331,14 +346,17 @@ def run_scan():
 
 
 def _manual_scan(profile_id=None):
+    import subprocess
     try:
-        result = worker.run_once(profile_id=profile_id)
-        log.info(
-            "Manueller Scan fertig: profile_id=%s jobs=%s listings=%s",
-            profile_id,
-            result.get("jobs") if isinstance(result, dict) else "?",
-            result.get("listings") if isinstance(result, dict) else "?",
+        cmd=[sys.executable, os.path.join(os.path.dirname(__file__), "scraper.py"), "--once"]
+        if profile_id is not None:
+            cmd += ["--profile-id", str(profile_id)]
+        result=subprocess.run(
+            cmd, cwd=os.path.dirname(__file__), env=os.environ.copy(),
+            timeout=max(300, int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS", "1800"))),
+            check=False,
         )
+        log.info("Manueller Scan fertig: profile_id=%s exit=%s", profile_id, result.returncode)
     except Exception:
         log.exception("Manueller Scan fehlgeschlagen")
 
