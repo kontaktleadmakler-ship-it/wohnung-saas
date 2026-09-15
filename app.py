@@ -398,9 +398,12 @@ def auth(view):
 
 @app.before_request
 def ensure_db():
-    # DDL/Indizes werden nicht bei jedem Request erneut ausgeführt.
-    if request.endpoint != "static":
-        _ensure_db_initialized()
+    # Render probes these endpoints during boot. They must never wait for
+    # MongoDB, otherwise a transient Atlas/network delay can prevent the
+    # Gunicorn worker from becoming healthy.
+    if request.endpoint in {"static", "healthz", "readyz"}:
+        return None
+    _ensure_db_initialized()
 
 
 @app.after_request
@@ -740,43 +743,13 @@ def delete_profile(pid):
 
 @app.route("/healthz")
 def healthz():
-    """Liveness endpoint: Render must see the web process even when Atlas is
-    temporarily unavailable. Database state is returned as metadata instead
-    of causing a restart loop."""
-    try:
-        db_ok = _ensure_db_initialized()
-    except Exception:
-        db_ok = False
-
-    payload = {
+    """Pure liveness probe. Never touches MongoDB."""
+    return jsonify({
         "ok": True,
-        "database": "ok" if db_ok else "unavailable",
         "environment": APP_ENV,
         "configuration": "ok" if not config_errors else "degraded",
-    }
-    if config_errors:
-        payload["configuration_errors"] = list(config_errors)
-    if db_ok:
-        try:
-            payload.update(db.get_setup_stats())
-        except Exception:
-            pass
-        try:
-            hb = db.get_worker_heartbeat()
-        except Exception:
-            hb = None
-        if hb and hb.get("last_seen_at"):
-            import datetime
-            last_seen_at = _utc(hb.get("last_seen_at"))
-            age = (datetime.datetime.now(datetime.timezone.utc) - last_seen_at).total_seconds()
-            payload["worker_last_seen_seconds_ago"] = round(age, 1)
-            payload["worker_poll_interval_seconds"] = hb.get("poll_interval_seconds")
-            payload["worker_pid"] = hb.get("pid")
-        else:
-            payload["worker_last_seen_seconds_ago"] = None
-            payload["worker_poll_interval_seconds"] = None
-            payload["worker_pid"] = None
-    return payload, 200
+        "database": "not_checked",
+    }), 200
 
 
 @app.route("/readyz")
