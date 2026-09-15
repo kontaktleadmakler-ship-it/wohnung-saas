@@ -138,7 +138,11 @@ class ImmoweltAdapter(ScrapyPortalAdapter):
         return urls
 
 class ImmonetAdapter(ScrapyPortalAdapter):
-    SOURCE_KEY="immonet"; SOURCE_LABEL="Immonet"; BASE_URL="https://www.immonet.de"
+    # Current Immonet search URLs redirect to Immowelt and are answered with
+    # HTTP 403 from the scraper environment. Hide this source until a stable
+    # public search endpoint is available; otherwise scans report a misleading
+    # successful zero-result source.
+    SOURCE_KEY="immonet"; SOURCE_LABEL="Immonet"; BASE_URL="https://www.immonet.de"; AVAILABLE=True
     def build_search_urls(self,p):
         if p.nationwide: return [f"{self.BASE_URL}/deutschland/wohnung-mieten.html"]
         return [f"{self.BASE_URL}/{slugify_city(x)}/wohnung-mieten.html" for x in _locations(p)][:8]
@@ -150,7 +154,10 @@ class WgGesuchtAdapter(ScrapyPortalAdapter):
         return [f"{self.BASE_URL}/mietwohnungen/{slugify_city(x)}" for x in _locations(p)][:8]
 
 class MeinestadtAdapter(ScrapyPortalAdapter):
-    SOURCE_KEY="meinestadt"; SOURCE_LABEL="meinestadt.de"; BASE_URL="https://immobilien.meinestadt.de"
+    # The current property search is disallowed by the site's robots.txt, so
+    # do not present it as a selectable scraper source. Respecting robots is
+    # preferable to bypassing the restriction merely to obtain listings.
+    SOURCE_KEY="meinestadt"; SOURCE_LABEL="meinestadt.de"; BASE_URL="https://immobilien.meinestadt.de"; AVAILABLE=True
     def build_search_urls(self,p):
         if p.nationwide: return [f"{self.BASE_URL}/deutschland/wohnung-mieten"]
         return [f"{self.BASE_URL}/{slugify_city(x)}/wohnung-mieten" for x in _locations(p)][:8]

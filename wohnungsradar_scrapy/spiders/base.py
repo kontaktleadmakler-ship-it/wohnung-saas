@@ -29,6 +29,12 @@ class PortalSpider(scrapy.Spider):
     source_label=""
     base_url=""
     use_playwright=True
+    # Portal-specific Playwright navigation tuning. A few portals keep
+    # long-lived requests open; subclasses can use ``commit`` so navigation
+    # itself does not hold the crawl hostage while the page is already usable.
+    playwright_wait_until="domcontentloaded"
+    playwright_nav_timeout_env="SCRAPE_NAV_TIMEOUT_MS"
+    playwright_wait_ms_env="SCRAPE_WAIT_MS"
     max_pages_env="SCRAPE_MAX_PAGES"
     card_selectors=()
     link_selectors=()
@@ -218,8 +224,8 @@ class PortalSpider(scrapy.Spider):
         if self.use_playwright:
             meta.update({"playwright":True,
                          "playwright_page_goto_kwargs": {
-                             "wait_until": "domcontentloaded",
-                             "timeout": int(os.getenv("SCRAPE_NAV_TIMEOUT_MS", "15000")),
+                             "wait_until": self.playwright_wait_until,
+                             "timeout": int(os.getenv(self.playwright_nav_timeout_env, "15000")),
                          },
                          "playwright_page_methods":[
                 PageMethod("evaluate", """
@@ -236,7 +242,7 @@ class PortalSpider(scrapy.Spider):
                         }
                     }
                 """),
-                PageMethod("wait_for_timeout",500),
+                PageMethod("wait_for_timeout", int(os.getenv(self.playwright_wait_ms_env, "1200"))),
             ]})
         return scrapy.Request(url,callback=self.parse,errback=self.errback,meta=meta,headers=headers,dont_filter=True)
 

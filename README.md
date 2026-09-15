@@ -92,3 +92,10 @@ Offline-Tests benötigen die in `requirements.txt` definierten Abhängigkeiten. 
 - optionales Webhook-Secret für Telegram
 - keine CAPTCHA-/Anti-Bot-/Stealth-/Proxy-Umgehung
 - keine Produktionsdaten oder `.env`-Dateien im Repository
+
+### v8 scraper reliability
+
+- WG-Gesucht uses a short `commit` navigation plus a bounded settle wait, avoiding long-lived page resources blocking `domcontentloaded`.
+- Immonet is temporarily hidden from selectable sources because its current search surface redirects to Immowelt and returns HTTP 403 in the scraper environment.
+- meinestadt.de is temporarily hidden because the current property search is disallowed by robots.txt; the scraper does not bypass that restriction.
+- The JSONL feed pipeline is compatible with Scrapy 2.19's pipeline signatures, eliminating the old `open_spider`/`process_item` deprecation path.

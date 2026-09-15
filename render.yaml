@@ -72,6 +72,10 @@ services:
         value: "30000"
       - key: SCRAPE_WAIT_MS
         value: "1800"
+      - key: WG_GESUCHT_NAV_TIMEOUT_MS
+        value: "10000"
+      - key: WG_GESUCHT_WAIT_MS
+        value: "2500"
       - key: SCRAPE_DELAY_MIN
         value: "1.0"
       - key: SCRAPE_DELAY_MAX
@@ -140,6 +144,10 @@ services:
         value: "30000"
       - key: SCRAPE_WAIT_MS
         value: "1800"
+      - key: WG_GESUCHT_NAV_TIMEOUT_MS
+        value: "10000"
+      - key: WG_GESUCHT_WAIT_MS
+        value: "2500"
       - key: SCRAPE_DELAY_MIN
         value: "1.0"
       - key: SCRAPE_DELAY_MAX

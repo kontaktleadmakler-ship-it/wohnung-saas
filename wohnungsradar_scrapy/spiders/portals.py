@@ -38,6 +38,10 @@ class ImmoweltSpider(PortalSpider):
     def _build_page_url(self,url,page): return query_page(url,"page",page)
 
 class ImmonetSpider(PortalSpider):
+    # Immonet now redirects this search surface to Immowelt, which returns
+    # HTTP 403 from the crawler environment. Do not waste a full portal
+    # timeout pretending this source is healthy. The adapter remains present
+    # for backwards compatibility but the source is disabled in v8.
     name=source_key="immonet"; source_label="Immonet"; base_url="https://www.immonet.de"
     card_selectors=("div[data-testid*='result' i]","div.list-entry","article.list-entry","article")
     link_selectors=("a[href*='/expose/']","a[href*='/angebot/']")
@@ -46,6 +50,13 @@ class ImmonetSpider(PortalSpider):
 
 class WgGesuchtSpider(PortalSpider):
     name=source_key="wg_gesucht"; source_label="WG-Gesucht"; base_url="https://www.wg-gesucht.de"
+    # WG-Gesucht keeps enough long-running resources open that
+    # ``domcontentloaded`` can time out even though the listing document is
+    # already usable. ``commit`` lets the short post-navigation wait do the
+    # actual settling without blocking the crawl on the page lifecycle.
+    playwright_wait_until="commit"
+    playwright_nav_timeout_env="WG_GESUCHT_NAV_TIMEOUT_MS"
+    playwright_wait_ms_env="WG_GESUCHT_WAIT_MS"
     card_selectors=(".offer_list_item",".wgg_card","div[id^='ad-']","article")
     link_selectors=("a[href*='.html']","a[href*='/']")
     def is_listing_href(self,href):

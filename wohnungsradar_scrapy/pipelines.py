@@ -29,8 +29,13 @@ class NormalizePipeline:
 class JobFeedPipeline:
     """One JSONL feed per spider/job; never shares a file between crawlers."""
 
-    def __init__(self):
+    def __init__(self, crawler=None):
+        self.crawler = crawler
         self._handles = {}
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler)
 
     def open_spider(self, spider):
         feed_path = getattr(spider, "feed_path", None)
@@ -49,7 +54,7 @@ class JobFeedPipeline:
             handle.close()
             spider.logger.info("[SCAN-DEBUG][%s] FEED_CLOSED", spider.source_key)
 
-    def process_item(self, item):
+    def process_item(self, item, spider):
         handle = self._handles.get(id(spider))
         if handle is None:
             raise RuntimeError(f"Feed handle fehlt für Job {getattr(spider, 'job_id', spider.name)}")
