@@ -99,7 +99,9 @@ def init_db():
     d.scan_state.create_index([("updated_at", DESCENDING)])
     d.source_health.create_index([("source", ASCENDING)], unique=True)
     d.scan_events.create_index([("run_id", ASCENDING), ("created_at", ASCENDING)])
-    d.schema_meta.create_index([("_id", ASCENDING)], unique=True)
+    # Kein create_index auf "_id" nötig: MongoDB legt für _id immer schon
+    # einen impliziten, eindeutigen Index an. unique=True darauf ist ungültig
+    # (Fehler 197 InvalidIndexSpecificationOption) und lässt init_db() crashen.
     d.schema_meta.update_one({"_id": "schema"}, {"$set": {"schema_version": 3, "updated_at": _now()}}, upsert=True)
 
 
