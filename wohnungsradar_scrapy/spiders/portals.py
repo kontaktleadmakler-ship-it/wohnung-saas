@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os
+import os, re
 from urllib.parse import quote_plus, urlsplit, urlunsplit, parse_qsl, urlencode
 from .base import PortalSpider
 
@@ -68,4 +68,53 @@ class KalaydoSpider(PortalSpider):
     def is_listing_href(self,href): return "/immobilie/" in href and "/jobs" not in href
     def _build_page_url(self,url,page): return None
 
-SPIDER_CLASSES={c.source_key:c for c in (KleinanzeigenSpider,ImmoScout24Spider,ImmoweltSpider,ImmonetSpider,WgGesuchtSpider,MeinestadtSpider,KalaydoSpider)}
+class ImmobilienDeSpider(PortalSpider):
+    name=source_key="immobilien_de"; source_label="immobilien.de"; base_url="https://www.immobilien.de"
+    card_selectors=("article",)
+    link_selectors=("a[href*='/expose/']",)
+    def is_listing_href(self,href): return bool(re.search(r"/expose/\d+", href))
+    def _build_page_url(self,url,page): return query_page(url,"page",page)
+
+class WohnungsboerseSpider(PortalSpider):
+    name=source_key="wohnungsboerse"; source_label="wohnungsbörse.net"; base_url="https://www.wohnungsboerse.net"
+    card_selectors=("article","div[class*='result' i]","div[class*='listing' i]")
+    link_selectors=("a[href*='/expose/']","a[href*='/immobilie/']")
+    def is_listing_href(self,href):
+        return bool(re.search(r"/(?:expose|immobilie)/\d", href)) or bool(re.search(r"-\d{5,}(?:\.html)?$", href))
+    def _build_page_url(self,url,page): return query_page(url,"page",page)
+
+class OhneMaklerSpider(PortalSpider):
+    name=source_key="ohne_makler"; source_label="ohne-makler.net"; base_url="https://www.ohne-makler.net"
+    card_selectors=("article","div[class*='result' i]","div[class*='card' i]")
+    link_selectors=("a[href*='/immobilien/']",)
+    # ohne-makler.net detail pages sit under /immobilien/<ort-slug>/ (no
+    # further static category segment); category/search pages end in one
+    # of a small fixed set of "-mieten"/"-kaufen" segments instead.
+    _CATEGORY_TAILS=("wohnung-mieten","immobilie-mieten","haus-mieten","wohnung-kaufen","immobilie-kaufen","haus-kaufen")
+    def is_listing_href(self,href):
+        if "/immobilien/" not in href: return False
+        tail=href.rstrip("/").rsplit("/",1)[-1]
+        return len(tail)>2 and tail not in self._CATEGORY_TAILS
+    def _build_page_url(self,url,page): return query_page(url,"page",page)
+
+class WunderflatsSpider(PortalSpider):
+    name=source_key="wunderflats"; source_label="Wunderflats"; base_url="https://wunderflats.com"
+    card_selectors=("article","div[data-testid*='listing' i]","div[class*='card' i]")
+    link_selectors=("a[href*='/en/furnished-apartments/'][href*='/rent/']","a[href*='/en/furnished-apartments/']")
+    def is_listing_href(self,href):
+        return "/en/furnished-apartments/" in href and bool(re.search(r"/[a-z0-9-]+-\w{6,}$", href.rstrip("/")))
+    def _build_page_url(self,url,page): return query_page(url,"page",page)
+
+class HousingAnywhereSpider(PortalSpider):
+    name=source_key="housinganywhere"; source_label="HousingAnywhere"; base_url="https://housinganywhere.com"
+    card_selectors=("article","div[data-testid*='listing' i]","div[class*='card' i]")
+    link_selectors=("a[href*='/room/']","a[href*='/studio/']","a[href*='/apartment/']")
+    def is_listing_href(self,href):
+        return bool(re.search(r"/(room|studio|apartment)/", href))
+    def _build_page_url(self,url,page): return query_page(url,"page",page)
+
+SPIDER_CLASSES={c.source_key:c for c in (
+    KleinanzeigenSpider,ImmoScout24Spider,ImmoweltSpider,ImmonetSpider,WgGesuchtSpider,
+    MeinestadtSpider,KalaydoSpider,ImmobilienDeSpider,WohnungsboerseSpider,OhneMaklerSpider,
+    WunderflatsSpider,HousingAnywhereSpider,
+)}

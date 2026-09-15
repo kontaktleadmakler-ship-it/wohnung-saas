@@ -2,6 +2,23 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+
+@dataclass
+class SearchParams:
+    """Normalized search request handed to every scraper/adapter.
+
+    Constructed identically in scraper.py, app.py and
+    wohnungsradar_scrapy/adapters.py: `nationwide` is True for a
+    profile scoped to all of Germany with no specific city/district
+    filled in, `region_codes` holds Bundesland codes (e.g. "BY") when a
+    region but no city was chosen, and `locations` holds explicit
+    city/district names.
+    """
+    nationwide: bool = False
+    region_codes: list = field(default_factory=list)
+    locations: list = field(default_factory=list)
+
+
 @dataclass
 class Listing:
     source: str

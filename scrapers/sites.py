@@ -11,9 +11,20 @@ from wohnungsradar_scrapy.adapters import (
     WgGesuchtAdapter as WgGesuchtScraper,
     MeinestadtAdapter as MeinestadtScraper,
     KalaydoAdapter as KalaydoScraper,
+    ImmobilienDeAdapter as ImmobilienDeScraper,
+    WohnungsboerseAdapter as WohnungsboerseScraper,
+    OhneMaklerAdapter as OhneMaklerScraper,
+    WunderflatsAdapter as WunderflatsScraper,
+    HousingAnywhereAdapter as HousingAnywhereScraper,
+    QuokaAdapter as QuokaScraper,
+    TauschwohnungAdapter as TauschwohnungScraper,
+    VonoviaAdapter as VonoviaScraper,
+    LegAdapter as LegScraper,
     slugify_city,
 )
 SOURCE_CLASSES = [
     KleinanzeigenScraper, ImmoScout24Scraper, ImmoweltScraper, ImmonetScraper,
-    WgGesuchtScraper, MeinestadtScraper, KalaydoScraper,
+    WgGesuchtScraper, MeinestadtScraper, KalaydoScraper, ImmobilienDeScraper,
+    WohnungsboerseScraper, OhneMaklerScraper, WunderflatsScraper, HousingAnywhereScraper,
+    QuokaScraper, TauschwohnungScraper, VonoviaScraper, LegScraper,
 ]

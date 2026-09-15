@@ -1,8 +1,8 @@
 from __future__ import annotations
-import os, re
+import os, re, unicodedata
 from urllib.parse import quote, quote_plus
 from scrapers.models import Listing, SearchParams
-from scrapers.regions import STATE_CITY_SAMPLES
+from scrapers.regions import STATE_CITY_SAMPLES, BUNDESLAENDER
 from .runner import run_jobs, get_last_run_debug
 from .spiders.portals import SPIDER_CLASSES
 import logging
@@ -14,6 +14,28 @@ def slugify_city(name: str) -> str:
     text=str(name or "").strip()
     text=text.translate(str.maketrans({"ä":"ae","ö":"oe","ü":"ue","Ä":"Ae","Ö":"Oe","Ü":"Ue","ß":"ss"}))
     return "-".join(part for part in re.sub(r"[^A-Za-z0-9]+"," ",text).casefold().split())
+
+def _diacritic_strip_slug(name: str) -> str:
+    """Slug variant some portals use: strip diacritics (ü->u, not ue) rather
+    than transliterating them, e.g. wohnungsboerse.net/ohne-makler.net city
+    slugs ("Löptin" -> "Loeptin"/"gemütlichkeit" -> "gemutlichkeit")."""
+    text=str(name or "").strip().replace("ß","ss")
+    text="".join(c for c in unicodedata.normalize("NFKD",text) if not unicodedata.combining(c))
+    return re.sub(r"[^A-Za-z0-9]+","-",text).strip("-").casefold()
+
+def _title_slug(name: str) -> str:
+    """wohnungsboerse.net/HousingAnywhere city segments are Title-Case with
+    umlauts transliterated the same way slugify_city() does (ö->oe, not a
+    bare diacritic strip), e.g. "Börm" -> "Boerm", "Löptin" -> "Loeptin"."""
+    text=str(name or "").strip()
+    text=text.translate(str.maketrans({"ä":"ae","ö":"oe","ü":"ue","Ä":"Ae","Ö":"Oe","Ü":"Ue","ß":"ss"}))
+    parts=[p for p in re.split(r"[^A-Za-z0-9]+",text) if p]
+    return "-".join(p.capitalize() for p in parts)
+
+# Maps a known sample city (as used by _locations()/STATE_CITY_SAMPLES) to
+# its Bundesland code, for portals whose URLs need the state name as well
+# as the city (e.g. ohne-makler.net).
+_CITY_STATE_CODE={city.casefold():code for code,cities in STATE_CITY_SAMPLES.items() for city in cities}
 
 def _locations(params):
     # `districts` in the UI may contain neighborhoods such as Moabit.
@@ -141,7 +163,97 @@ class KalaydoAdapter(ScrapyPortalAdapter):
         # residential results when no verified residential search exists.
         return []
 
-ADAPTER_CLASSES=(KleinanzeigenAdapter,ImmoScout24Adapter,ImmoweltAdapter,ImmonetAdapter,WgGesuchtAdapter,MeinestadtAdapter,KalaydoAdapter)
+class ImmobilienDeAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="immobilien_de"; SOURCE_LABEL="immobilien.de"; BASE_URL="https://www.immobilien.de"
+    def build_search_urls(self,p):
+        if p.nationwide: return [f"{self.BASE_URL}/mieten/wohnung/"]
+        return [f"{self.BASE_URL}/mieten/wohnung/{slugify_city(x)}/" for x in _locations(p)][:8]
+
+class WohnungsboerseAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="wohnungsboerse"; SOURCE_LABEL="wohnungsbörse.net"; BASE_URL="https://www.wohnungsboerse.net"
+    def build_search_urls(self,p):
+        # No verified deutschlandweite search URL - portal search is
+        # location-anchored (/<Ort>/mieten/wohnungen), same limitation as
+        # WG-Gesucht below.
+        if p.nationwide: return []
+        return [f"{self.BASE_URL}/{_title_slug(x)}/mieten/wohnungen" for x in _locations(p)][:8]
+
+class OhneMaklerAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="ohne_makler"; SOURCE_LABEL="ohne-makler.net"; BASE_URL="https://www.ohne-makler.net"
+    def build_search_urls(self,p):
+        if p.nationwide: return [f"{self.BASE_URL}/immobilien/wohnung-mieten/"]
+        urls=[]
+        for city in _locations(p)[:8]:
+            state_code=_CITY_STATE_CODE.get(city.casefold())
+            state_name=BUNDESLAENDER.get(state_code) if state_code else None
+            if not state_name:
+                continue
+            urls.append(f"{self.BASE_URL}/immobilien/wohnung-mieten/{_diacritic_strip_slug(state_name)}/{_diacritic_strip_slug(city)}/")
+        return urls
+
+class WunderflatsAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="wunderflats"; SOURCE_LABEL="Wunderflats"; BASE_URL="https://wunderflats.com"
+    def build_search_urls(self,p):
+        # Furnished/temporary-stay inventory only exists per city; no
+        # deutschlandweite search endpoint is offered.
+        if p.nationwide: return []
+        return [f"{self.BASE_URL}/en/furnished-apartments/{slugify_city(x)}" for x in _locations(p)][:8]
+
+class HousingAnywhereAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="housinganywhere"; SOURCE_LABEL="HousingAnywhere"; BASE_URL="https://housinganywhere.com"
+    def build_search_urls(self,p):
+        if p.nationwide: return []
+        urls=[]
+        for city in _locations(p)[:8]:
+            slug=_title_slug(city)
+            if not slug:
+                continue
+            urls.append(f"{self.BASE_URL}/s/{slug}--Germany")
+        return urls
+
+class QuokaAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="quoka"; SOURCE_LABEL="Quoka"; BASE_URL="https://www.quoka.de"
+    AVAILABLE=False
+    def build_search_urls(self,p):
+        # No verified, stable public search-results URL structure for
+        # residential rentals could be established - see project notes.
+        # Marked unavailable instead of shipping a guessed/broken adapter.
+        return []
+
+class TauschwohnungAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="tauschwohnung"; SOURCE_LABEL="Tauschwohnung.com"; BASE_URL="https://www.tauschwohnung.com"
+    AVAILABLE=False
+    def build_search_urls(self,p):
+        # tauschwohnung.com is a subscription-gated swap marketplace: its
+        # own listings are not browsable without a paid account (14-day
+        # trial, then a location-priced subscription), so there is no
+        # public search-results URL to scrape. Its content does surface
+        # secondhand via other portals (immoscout24/immowelt), which are
+        # already covered by their own adapters.
+        return []
+
+class VonoviaAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="vonovia"; SOURCE_LABEL="Vonovia"; BASE_URL="https://www.vonovia.de"
+    AVAILABLE=False
+    def build_search_urls(self,p):
+        # Vonovia's own-inventory search is a JS/API-driven application
+        # with no verified static, query-string-based search URL. Marked
+        # unavailable instead of shipping a guessed/broken adapter.
+        return []
+
+class LegAdapter(ScrapyPortalAdapter):
+    SOURCE_KEY="leg"; SOURCE_LABEL="LEG Immobilien"; BASE_URL="https://www.leg-wohnen.de"
+    AVAILABLE=False
+    def build_search_urls(self,p):
+        # Same situation as Vonovia: no verified public search-URL
+        # structure for LEG's own-inventory portal.
+        return []
+
+ADAPTER_CLASSES=(
+    KleinanzeigenAdapter,ImmoScout24Adapter,ImmoweltAdapter,ImmonetAdapter,WgGesuchtAdapter,
+    MeinestadtAdapter,KalaydoAdapter,ImmobilienDeAdapter,WohnungsboerseAdapter,OhneMaklerAdapter,
+    WunderflatsAdapter,HousingAnywhereAdapter,QuokaAdapter,TauschwohnungAdapter,VonoviaAdapter,LegAdapter,
+)
 ADAPTERS={c.SOURCE_KEY:c() for c in ADAPTER_CLASSES}
 
 def run_scrapy_jobs(work):

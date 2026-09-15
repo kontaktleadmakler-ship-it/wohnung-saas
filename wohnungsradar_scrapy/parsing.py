@@ -46,6 +46,11 @@ def external_id_from_url(url: str, source: str = "") -> str:
         "wg_gesucht": [r"/(\d{6,})\.html$"],
         "meinestadt": [r"/immobilien/(?:[^/]+/)*(\d{5,})"],
         "kalaydo": [r"/immobilie/[^/]*?[-_](\d{5,})", r"/immobilie/(\d{5,})"],
+        "immobilien_de": [r"/expose/(\d{5,})"],
+        "wohnungsboerse": [r"/(?:expose|immobilie)/(\d{4,})", r"-(\d{5,})(?:\.html)?$"],
+        "ohne_makler": [r"/immobilien/([a-z0-9-]+)/?$"],
+        "wunderflats": [r"/en/furnished-apartments/[^/]+/([a-z0-9-]+-\w{6,})$"],
+        "housinganywhere": [r"/(?:room|studio|apartment)/([a-zA-Z0-9-]+)"],
     }
     for pattern in patterns.get(source, []):
         m = re.search(pattern, path, re.I)

@@ -48,5 +48,61 @@ class MatchingTests(unittest.TestCase):
         listing={"url":"https://x.test/1","title":"Wohnung in Wgendorf","description":"2 Zimmer","price_total":800,"rooms":2,"size":50}
         self.assertIsNotNone(score_listing(listing,self.profile))
 
+    def test_float_values_not_reparsed_as_german_strings(self):
+        # Regression test for a production bug: scraper.py/adapters.py hand
+        # score_listing() *already-parsed* Python floats (via
+        # wohnungsradar_scrapy/adapters.py -> parsing.py::parse_number()),
+        # not strings. matching.py::_number() used to run every value
+        # through German-number string parsing regardless of type, which
+        # silently inflated real floats by 10-100x, e.g. 830.0 -> 8300.0,
+        # 65.0 -> 650.0, 3.0 -> 30.0. Plain int literals (as used in the
+        # other tests above) happen to survive that buggy round-trip by
+        # accident, which is why this needs float literals specifically.
+        listing={
+            "url":"https://x.test/float",
+            "title":"Wohnung Berlin Mitte",
+            "description":"3 Zimmer",
+            "price_total":830.0,
+            "rooms":3.0,
+            "size":65.0,
+        }
+        result=score_listing(listing,self.profile)
+        self.assertIsNotNone(result)
+        score, components, reasons=result
+        self.assertTrue(any("830" in r for r in reasons))
+        self.assertTrue(any("3 Zimmer" in r for r in reasons))
+        self.assertTrue(any("65" in r for r in reasons))
+        # A listing at 830.0/3.0/65.0 comfortably satisfies this profile's
+        # max_price=1000/min_rooms=2/min_size=40 - it must not be rejected
+        # as if it were 8300/30/650.
+        self.assertGreater(score, 0)
+
+        # A listing genuinely over budget (as a float) must still be
+        # excluded - this guards against overcorrecting into "floats are
+        # never real budget violations".
+        over_budget={
+            "url":"https://x.test/float-over",
+            "title":"Wohnung Berlin Mitte",
+            "description":"3 Zimmer",
+            "price_total":1500.0,
+            "rooms":3.0,
+            "size":65.0,
+        }
+        self.assertIsNone(score_listing(over_budget,self.profile))
+
+    def test_number_passthrough_vs_german_string_parsing(self):
+        from matching import _number
+        # Already-numeric values must be passed through as-is, never
+        # reinterpreted as German-formatted text.
+        self.assertEqual(_number(830.0), 830.0)
+        self.assertEqual(_number(3.0), 3.0)
+        self.assertEqual(_number(65), 65.0)
+        # Genuine strings still need German-format parsing (thousands
+        # separator ".", decimal separator ",").
+        self.assertEqual(_number("1.234,56"), 1234.56)
+        self.assertEqual(_number("830"), 830.0)
+        self.assertIsNone(_number(None))
+        self.assertIsNone(_number(""))
+
 if __name__ == "__main__":
     unittest.main()

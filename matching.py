@@ -4,6 +4,8 @@ import hashlib
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from wohnungsradar_scrapy.parsing import parse_number
+
 TOLERANCE = 0.05
 
 # Reported when score_listing() rejects a listing outright, so scraper.py can
@@ -61,12 +63,34 @@ def listing_fingerprint(listing: dict) -> str:
 
 
 def _number(value):
-    try:
-        if value is None or value == "":
-            return None
-        return float(str(value).replace(".", "").replace(",", "."))
-    except (TypeError, ValueError):
+    """Coerce a listing/profile field to float.
+
+    scraper.py hands score_listing() a dict built straight from the
+    scraper's Listing/adapter objects (`dict(item.__dict__)`), where
+    price/size/rooms have already been parsed into real Python floats by
+    wohnungsradar_scrapy/adapters.py (via parsing.py::parse_number()).
+    Profile numbers (max_price, min_size, ...) are floats too - see
+    app.py's `num()` helper and db.py, which store them as such.
+
+    Blindly treating an already-numeric value as a German-formatted
+    string ("830.0" -> strip "." -> "8300") silently inflated price,
+    size, and room counts by a factor of 10-100 for every real listing
+    in production. int/float values are therefore passed straight
+    through; only genuine strings (still possible for older data, manual
+    DB edits, or ad-hoc test/import data) are parsed as German-formatted
+    numbers, delegating to the same parse_number() the scraper itself
+    uses so both stay consistent.
+    """
+    if value is None or value == "":
         return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    return parse_number(value)
 
 
 def _effective_rent(listing):
