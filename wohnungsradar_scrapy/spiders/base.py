@@ -212,12 +212,17 @@ class PortalSpider(scrapy.Spider):
         return random.choice(pool)
 
     def _request(self,url,page_number):
-        meta={"page_number":page_number}
+        meta={"page_number":page_number, "handle_httpstatus_all": True}
         ua=self._pick_user_agent()
         headers={"User-Agent":ua} if ua else None
         if self.use_playwright:
-            meta.update({"playwright":True,"playwright_page_methods":[
-                PageMethod("wait_for_timeout", max(0, int(os.getenv("SCRAPE_WAIT_MS", "4000")))),
+            meta.update({"playwright":True,
+                         "playwright_page_goto_kwargs": {
+                             "wait_until": "domcontentloaded",
+                             "timeout": int(os.getenv("SCRAPE_NAV_TIMEOUT_MS", "15000")),
+                         },
+                         "playwright_page_methods":[
+                PageMethod("wait_for_timeout", max(0, int(os.getenv("SCRAPE_WAIT_MS", "1200")))),
                 PageMethod("evaluate", """
                     () => {
                         const labels = [
@@ -232,9 +237,7 @@ class PortalSpider(scrapy.Spider):
                         }
                     }
                 """),
-                PageMethod("wait_for_timeout",500),
-                PageMethod("evaluate","window.scrollTo(0, document.body.scrollHeight)"),
-                PageMethod("wait_for_timeout",800),
+                PageMethod("wait_for_timeout",300),
             ]})
         return scrapy.Request(url,callback=self.parse,errback=self.errback,meta=meta,headers=headers,dont_filter=True)
 

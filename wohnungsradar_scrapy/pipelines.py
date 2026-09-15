@@ -7,7 +7,7 @@ from .parsing import parse_number, parse_rents, parse_rooms, parse_size
 
 
 class NormalizePipeline:
-    def process_item(self, item, spider):
+    def process_item(self, item):
         text = " ".join(str(item.get(k) or "") for k in ("title", "description", "address"))
         if item.get("price") is None or item.get("price_total") is None:
             cold, warm = parse_rents(text)
@@ -49,7 +49,7 @@ class JobFeedPipeline:
             handle.close()
             spider.logger.info("[SCAN-DEBUG][%s] FEED_CLOSED", spider.source_key)
 
-    def process_item(self, item, spider):
+    def process_item(self, item):
         handle = self._handles.get(id(spider))
         if handle is None:
             raise RuntimeError(f"Feed handle fehlt für Job {getattr(spider, 'job_id', spider.name)}")

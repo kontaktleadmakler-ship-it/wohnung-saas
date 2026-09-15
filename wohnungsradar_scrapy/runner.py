@@ -6,6 +6,7 @@ import os
 import tempfile
 import uuid
 from pathlib import Path
+import os
 
 from .settings import *
 from scrapy.utils.reactor import install_reactor
@@ -256,13 +257,24 @@ def run_jobs(jobs):
             for job, crawler in crawlers:
                 log.info("[SCAN-DEBUG][%s] CRAWL_START job_id=%s urls=%d",
                          job["source"], job["job_id"], len(job["urls"]))
-                yield runner.crawl(
+                crawl_deferred = runner.crawl(
                     crawler,
                     start_urls=job["urls"],
                     max_pages=job.get("max_pages"),
                     job_id=job["job_id"],
                     feed_path=str(job["feed_path"]),
                 )
+                timeout_s = max(30, int(os.getenv("SCRAPE_JOB_TIMEOUT_SECONDS", "180")))
+                crawl_deferred.addTimeout(timeout_s, reactor)
+                try:
+                    yield crawl_deferred
+                except Exception as exc:
+                    log.error("[SCAN-DEBUG][%s] CRAWL_ERROR timeout=%ss error=%s", job.get("source"), timeout_s, exc)
+                    try:
+                        yield crawler.stop()
+                    except Exception:
+                        pass
+                    raise
                 log.info("[SCAN-DEBUG][%s] CRAWL_DONE job_id=%s",
                          job["source"], job["job_id"])
 

@@ -15,7 +15,7 @@ RETRY_TIMES = max(0, int(os.getenv("SCRAPE_RETRIES", "3")))
 # wastes time and can make a block worse. 429 is still retried in a bounded way.
 RETRY_HTTP_CODES = [408, 425, 429, 500, 502, 503, 504]
 DOWNLOAD_DELAY = 1.0
-RANDOMIZE_DOWNLOAD_DELAY = True
+DOWNLOAD_DELAY_JITTER = 0.5
 AUTOTHROTTLE_ENABLED = True
 AUTOTHROTTLE_START_DELAY = 1.0
 AUTOTHROTTLE_MAX_DELAY = 12.0
@@ -52,7 +52,7 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
         "--renderer-process-limit=1",
     ],
 }
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 30000
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 15000
 
 ITEM_PIPELINES = {
     "wohnungsradar_scrapy.pipelines.NormalizePipeline": 100,
