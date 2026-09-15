@@ -78,7 +78,14 @@ def _failure_class(debug):
 
 
 def _build_debug(job, crawler, process_start_error=None):
-    stats = crawler.stats.get_stats()
+    # A crawler created with CrawlerRunner does not have ``stats`` until its
+    # crawl has actually started.  This function is also called when runner
+    # startup itself fails, so reading crawler.stats unconditionally masks the
+    # real startup exception with ``Crawler.stats is not set yet``.
+    try:
+        stats = crawler.stats.get_stats()
+    except RuntimeError:
+        stats = {}
     spider = getattr(crawler, "spider", None)
 
     start = stats.get("start_time")
@@ -238,7 +245,7 @@ def run_jobs(jobs):
             log.info("[SCAN-DEBUG][%s] CRAWLER_CREATED job_id=%s feed=%s",
                      job["source"], job["job_id"], feed)
 
-        async def crawl_sequentially():
+        async def crawl_sequentially(reactor):
             for job, crawler in crawlers:
                 log.info("[SCAN-DEBUG][%s] CRAWL_START job_id=%s urls=%d",
                          job["source"], job["job_id"], len(job["urls"]))
