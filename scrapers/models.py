@@ -52,17 +52,3 @@ class Listing:
     contact_phone: Optional[str] = None
     images_count: Optional[int] = None
     raw: dict = field(default_factory=dict)
-
-
-@dataclass
-class SearchParams:
-    """Normalized search constraints passed from profiles to portal adapters."""
-    nationwide: bool = True
-    region_codes: list[str] = field(default_factory=list)
-    locations: list[str] = field(default_factory=list)
-    min_price: Optional[float] = None
-    max_price: Optional[float] = None
-    min_rooms: Optional[float] = None
-    max_rooms: Optional[float] = None
-    min_size: Optional[float] = None
-    exclude_terms: list[str] = field(default_factory=list)

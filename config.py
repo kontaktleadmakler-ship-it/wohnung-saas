@@ -43,10 +43,12 @@ class Settings:
         errors=[]
         if not self.mongodb_uri: errors.append("MONGODB_URI fehlt")
         elif urlparse(self.mongodb_uri).scheme not in {"mongodb", "mongodb+srv"}: errors.append("MONGODB_URI muss mongodb:// oder mongodb+srv:// verwenden")
-        if production and not self.secret_key: errors.append("SECRET_KEY fehlt")
-        if production and not self.app_password: errors.append("APP_PASSWORD fehlt")
+        # SECRET_KEY and APP_PASSWORD are handled by the web layer as optional
+        # boot-time configuration. Missing values must not prevent Gunicorn from
+        # importing app.py; the web layer logs warnings and exposes readiness
+        # diagnostics instead.
+        if production and self.mongo_tls_insecure: errors.append("MONGO_TLS_INSECURE darf im Produktionsbetrieb nicht aktiviert sein")
         if self.scan_lock_renew_seconds >= self.scan_lock_lease_seconds: errors.append("SCAN_LOCK_RENEW_INTERVAL_SECONDS muss kleiner als SCAN_LOCK_LEASE_SECONDS sein")
-        if self.mongo_tls_insecure and production: errors.append("MONGO_TLS_INSECURE darf im Produktionsbetrieb nicht aktiviert sein")
         return errors
 
 settings = Settings()

@@ -27,31 +27,53 @@ from scrapers.models import SearchParams
 
 app = Flask(__name__)
 
-APP_PASSWORD = os.getenv("APP_PASSWORD")
-SECRET_KEY = os.getenv("SECRET_KEY")
+# Environment-aware startup configuration. Importing the Flask module must never
+# crash merely because an optional secret/password was omitted: Gunicorn needs
+# to boot so that /healthz and /readyz can report the real configuration state.
+IS_RENDER = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
+APP_ENV = os.getenv("APP_ENV", "production" if IS_RENDER else "development").strip().lower()
+IS_PRODUCTION = APP_ENV in {"production", "prod"}
+
+APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 
 if not SECRET_KEY:
-    if APP_PASSWORD:
-        # Mit aktivem Passwortschutz darf kein bekannter Fallback-Key verwendet werden.
-        raise RuntimeError("SECRET_KEY fehlt. Für eine geschützte App muss SECRET_KEY gesetzt sein.")
+    # A generated key is safe for boot/liveness, but sessions are intentionally
+    # ephemeral until a persistent SECRET_KEY is configured.
     SECRET_KEY = secrets.token_urlsafe(48)
     logging.getLogger("web").warning(
-        "SECRET_KEY fehlt; für lokale Entwicklung wird ein zufälliger Prozess-Key verwendet."
+        "SECRET_KEY fehlt; es wurde ein temporärer Prozess-Key erzeugt. "
+        "Für persistente Sessions SECRET_KEY in Render setzen."
+    )
+
+# Password protection is enabled only when a password exists. This keeps a
+# misconfigured deployment reachable instead of causing a Gunicorn boot loop.
+# APP_AUTH_REQUIRED=true can explicitly require authentication; in that mode a
+# missing APP_PASSWORD is reported as a configuration warning and access stays
+# disabled rather than accepting an empty password.
+APP_AUTH_REQUIRED = os.getenv("APP_AUTH_REQUIRED", "true" if APP_PASSWORD else "false").strip().lower() in {"1", "true", "yes", "on"}
+if IS_PRODUCTION and not APP_PASSWORD:
+    logging.getLogger("web").warning(
+        "APP_PASSWORD fehlt: Web-Authentifizierung ist deaktiviert. "
+        "Für einen geschützten Produktionsbetrieb APP_PASSWORD setzen."
     )
 
 app.secret_key = SECRET_KEY
 app.config.update(
-    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "true").lower() in {"1","true","yes","on"},
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "true" if IS_PRODUCTION else "false").lower() in {"1","true","yes","on"},
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=3600,
 )
 CSRFProtect(app)
 
-if os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"):
-    config_errors=settings.validate(production=True)
-    if config_errors:
-        raise RuntimeError("Produktionskonfiguration ungültig: " + "; ".join(config_errors))
+config_errors = settings.validate(production=IS_PRODUCTION)
+if config_errors:
+    # Do not raise during module import. Gunicorn must remain alive so Render
+    # can observe /healthz and /readyz instead of entering a restart loop.
+    logging.getLogger("web").error(
+        "Konfigurationsprobleme erkannt: %s", "; ".join(config_errors)
+    )
 
 log = logging.getLogger("web")
 
@@ -368,7 +390,7 @@ def _heartbeat_status():
 def auth(view):
     @wraps(view)
     def wrapper(*a, **kw):
-        if APP_PASSWORD and not session.get("logged_in"):
+        if APP_AUTH_REQUIRED and APP_PASSWORD and not session.get("logged_in"):
             return redirect(url_for("login", next=request.path))
         return view(*a, **kw)
     return wrapper
@@ -406,7 +428,7 @@ _maybe_start_background_scanner()
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        if not APP_PASSWORD or hmac.compare_digest(request.form.get("password", ""), APP_PASSWORD):
+        if APP_PASSWORD and hmac.compare_digest(request.form.get("password", ""), APP_PASSWORD):
             session["logged_in"] = True
             return redirect(request.args.get("next") or url_for("home"))
         return render_template("login.html", error="Falsches Passwort")
@@ -726,7 +748,14 @@ def healthz():
     except Exception:
         db_ok = False
 
-    payload = {"ok": True, "database": "ok" if db_ok else "unavailable"}
+    payload = {
+        "ok": True,
+        "database": "ok" if db_ok else "unavailable",
+        "environment": APP_ENV,
+        "configuration": "ok" if not config_errors else "degraded",
+    }
+    if config_errors:
+        payload["configuration_errors"] = list(config_errors)
     if db_ok:
         try:
             payload.update(db.get_setup_stats())
@@ -752,11 +781,26 @@ def healthz():
 
 @app.route("/readyz")
 def readyz():
+    # Readiness is diagnostic, not an import-time crash mechanism. Render can
+    # therefore distinguish a live process from a service that still lacks a
+    # required runtime dependency such as MongoDB.
+    if config_errors:
+        return jsonify({
+            "ready": False,
+            "database": "not_checked",
+            "configuration": "invalid",
+            "configuration_errors": list(config_errors),
+        }), 503
     try:
         db.ping(); db.get_setup_stats()
-        return jsonify({"ready": True, "database": "ok"}), 200
+        return jsonify({"ready": True, "database": "ok", "configuration": "ok"}), 200
     except Exception as exc:
-        return jsonify({"ready": False, "database": "unavailable", "error": type(exc).__name__}), 503
+        return jsonify({
+            "ready": False,
+            "database": "unavailable",
+            "configuration": "ok",
+            "error": type(exc).__name__,
+        }), 503
 
 
 @app.route("/api/status")

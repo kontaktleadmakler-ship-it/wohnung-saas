@@ -16,11 +16,15 @@ WohnungsRadar ist ein automatisierter deutscher Wohnungssuchdienst mit Flask-Das
 
 `render.yaml` definiert einen Web-Service und einen unabhängigen Cron-Scanner. Beide verwenden dasselbe Dockerfile und dieselbe MongoDB.
 
-Benötigte Secrets:
+Produktionsvariablen:
 
-- `MONGODB_URI`
-- `SECRET_KEY`
-- `APP_PASSWORD`
+- `MONGODB_URI` – erforderlich für Datenbankzugriff.
+- `SECRET_KEY` – dringend empfohlen; fehlt sie, erzeugt der Web-Prozess für den Boot einen temporären Key und meldet dies in den Logs.
+- `APP_PASSWORD` – optional für den Boot; ist sie gesetzt, wird der Web-Zugang geschützt. Fehlt sie, startet die Anwendung trotzdem und meldet die Authentifizierung als deaktiviert.
+- `APP_AUTH_REQUIRED` – standardmäßig `true`, sobald `APP_PASSWORD` gesetzt ist; ohne Passwort bleibt der Zugang trotz dieser Variable offen, damit ein versehentlich nicht gesetztes Secret keinen Gunicorn-Restart-Loop verursacht.
+- `APP_ENV` – auf Render automatisch `production`, lokal standardmäßig `development`.
+
+Wichtig: Fehlende Web-Secrets verursachen keinen Import-/Gunicorn-Crash mehr. `/healthz` bleibt als Liveness-Endpunkt verfügbar; `/readyz` meldet Konfigurations- oder MongoDB-Probleme mit HTTP 503. Für einen abgesicherten öffentlichen Betrieb `APP_PASSWORD` und eine persistente `SECRET_KEY` in Render setzen.
 
 Optional:
 
