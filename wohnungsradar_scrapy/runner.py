@@ -7,9 +7,19 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from scrapy.crawler import CrawlerProcess
-
 from .settings import *
+from scrapy.utils.reactor import install_reactor
+
+# Install the configured asyncio reactor before importing any Twisted reactor
+# users. Scrapy 2.19 supports coroutine-based crawler APIs; we deliberately
+# run the portal spiders sequentially because each crawler owns its own
+# scrapy-playwright browser/context. Starting 6 Playwright crawlers at once
+# multiplies browser memory and can stall/OOM small Render instances.
+install_reactor(TWISTED_REACTOR)
+
+from scrapy.crawler import CrawlerRunner
+from scrapy.utils.defer import deferred_f_from_coro_f
+from twisted.internet.task import react
 from .spiders.portals import SPIDER_CLASSES
 
 log = logging.getLogger("wohnungsradar.scrapy")
@@ -208,40 +218,48 @@ def run_jobs(jobs):
             "FEED_EXPORT_ENCODING": FEED_EXPORT_ENCODING,
             "LOG_LEVEL": os.getenv("SCRAPY_LOG_LEVEL", LOG_LEVEL),
             "TELNETCONSOLE_ENABLED": False,
+            # Scrapy 2.19 enables its local remote-control server by default.
+            # It is not used by this application and one server per crawler
+            # wastes sockets/resources and obscures production diagnostics.
+            "REMOTE_CONTROL_ENABLED": False,
             "REQUEST_FINGERPRINTER_IMPLEMENTATION": REQUEST_FINGERPRINTER_IMPLEMENTATION,
         }
 
-        log.info("[SCAN-DEBUG] SCRAPY_PROCESS_CREATE jobs=%d", len(normalized))
-        process = CrawlerProcess(settings=settings)
+        log.info("[SCAN-DEBUG] SCRAPY_RUNNER_CREATE jobs=%d mode=sequential", len(normalized))
+        runner = CrawlerRunner(settings=settings)
         crawlers = []
 
         for idx, job in enumerate(normalized):
             cls = SPIDER_CLASSES[job["source"]]
-            crawler = process.create_crawler(cls)
+            crawler = runner.create_crawler(cls)
             crawlers.append((job, crawler))
             feed = tmp_path / f"items_job_{idx}_{uuid.uuid4().hex}.jsonl"
             job["feed_path"] = str(feed)
             log.info("[SCAN-DEBUG][%s] CRAWLER_CREATED job_id=%s feed=%s",
                      job["source"], job["job_id"], feed)
-            process.crawl(
-                crawler,
-                start_urls=job["urls"],
-                max_pages=job.get("max_pages"),
-                job_id=job["job_id"],
-                feed_path=str(feed),
-            )
-            log.info("[SCAN-DEBUG][%s] CRAWL_REGISTERED job_id=%s urls=%d",
-                     job["source"], job["job_id"], len(job["urls"]))
 
-        log.info("[SCAN-DEBUG] CRAWL_QUEUE_READY jobs=%d", len(crawlers))
+        async def crawl_sequentially():
+            for job, crawler in crawlers:
+                log.info("[SCAN-DEBUG][%s] CRAWL_START job_id=%s urls=%d",
+                         job["source"], job["job_id"], len(job["urls"]))
+                await runner.crawl(
+                    crawler,
+                    start_urls=job["urls"],
+                    max_pages=job.get("max_pages"),
+                    job_id=job["job_id"],
+                    feed_path=str(job["feed_path"]),
+                )
+                log.info("[SCAN-DEBUG][%s] CRAWL_DONE job_id=%s",
+                         job["source"], job["job_id"])
+
         process_start_error = None
         try:
-            log.info("[SCAN-DEBUG] PROCESS_START")
-            process.start(stop_after_crawl=True, install_signal_handlers=False)
-            log.info("[SCAN-DEBUG] PROCESS_STOP")
+            log.info("[SCAN-DEBUG] REACT_START sequential_jobs=%d", len(crawlers))
+            react(deferred_f_from_coro_f(crawl_sequentially))
+            log.info("[SCAN-DEBUG] REACT_STOP")
         except Exception as exc:
             process_start_error = exc
-            log.exception("[SCAN-DEBUG] PROCESS_START_ERROR")
+            log.exception("[SCAN-DEBUG] REACT_START_ERROR")
 
         all_items = []
         for job, crawler in crawlers:

@@ -24,5 +24,5 @@ for path in ROOT.rglob("*.py"):
 
 print("OK: required files present and Python syntax valid")
 print("Render start: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120")
-print("Scanner: Render Cron (ENABLE_AUTO_SCAN=false im Web-Service)")
+print("Scanner: Render Cron (ENABLE_AUTO_SCAN=false im Web-Service; Scrapy-Jobs seriell)")
 print("Startup: fehlende optionale Web-Secrets verursachen keinen Gunicorn-Import-Crash; /readyz meldet Konfigurations-/DB-Probleme.")

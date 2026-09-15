@@ -354,7 +354,7 @@ def _maybe_start_background_scanner():
     the HTTP port. The scanner retries database initialization in its own
     background thread once MongoDB becomes reachable again.
     """
-    enabled = os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}
+    enabled = os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
     if enabled:
         log.info("AUTO-SCAN: enabled during app import (pid=%s)", os.getpid())
         _start_background_scanner_once()

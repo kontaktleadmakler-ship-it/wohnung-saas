@@ -71,6 +71,10 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(json.loads(p1.read_text())["job_id"], "1")
             self.assertEqual(json.loads(p2.read_text())["job_id"], "2")
 
+    def test_remote_control_is_disabled_for_production_runner(self):
+        from wohnungsradar_scrapy import runner
+        self.assertFalse(runner.REMOTE_CONTROL_ENABLED)
+
     def test_required_failure_classes_exist(self):
         from wohnungsradar_scrapy.runner import FAILURE_CLASSES
         for value in ("CONFIG_ERROR", "NO_START_URLS", "REQUEST_PIPELINE_FAILURE",

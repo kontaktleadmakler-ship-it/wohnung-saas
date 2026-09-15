@@ -63,6 +63,8 @@ LOG_LEVEL = "INFO"
 
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
 TELNETCONSOLE_ENABLED = False
+# Not used by the application; disabling avoids one local HTTP server per crawler.
+REMOTE_CONTROL_ENABLED = False
 
 
 PLAYWRIGHT_MAX_CONTEXTS = 1

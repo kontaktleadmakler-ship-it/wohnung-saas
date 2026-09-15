@@ -7,7 +7,7 @@ WohnungsRadar ist ein automatisierter deutscher Wohnungssuchdienst mit Flask-Das
 - **Flask/Gunicorn:** Dashboard, Profile, Diagnose und API.
 - **Render Cron:** startet `python scraper.py --once` unabhängig vom Web-Traffic.
 - **MongoDB:** gemeinsamer Zustand, Historie, Match- und Scan-Daten, Lease-Lock.
-- **Scrapy:** einziger produktiver Scraping-Pfad.
+- **Scrapy:** einziger produktiver Scraping-Pfad; Portal-Jobs laufen seriell, damit nicht mehrere Playwright-Browser parallel den kleinen Render-Prozess belasten.
 - **Playwright:** nur für Quellen, die dynamische Inhalte benötigen.
 - **Matching:** Hard Filters + Soft Score 0–100 + Datenqualitätswert.
 - **Notifications:** Telegram und E-Mail getrennt und idempotent.
