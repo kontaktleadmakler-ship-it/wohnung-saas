@@ -6,7 +6,6 @@ import os
 import tempfile
 import uuid
 from pathlib import Path
-import os
 
 from .settings import *
 from scrapy.utils.reactor import install_reactor
@@ -20,7 +19,6 @@ install_reactor(TWISTED_REACTOR)
 
 from scrapy.crawler import CrawlerRunner
 from twisted.internet import defer
-from twisted.internet.error import CancelledError
 from twisted.internet.task import react
 from .spiders.portals import SPIDER_CLASSES
 
