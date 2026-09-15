@@ -83,7 +83,9 @@ class PortalSpider(scrapy.Spider):
         crawler.signals.connect(self._on_request_dropped, signal=signals.request_dropped)
         crawler.signals.connect(self._on_response_received, signal=signals.response_received)
         crawler.signals.connect(self._on_spider_error, signal=signals.spider_error)
-        crawler.signals.connect(self._on_downloader_exception, signal=signals.downloader_exception)
+        # Scrapy 2.19 does not expose a ``downloader_exception`` signal.
+        # Downloader failures are handled through request errbacks/middleware;
+        # connecting to the removed signal aborts spider creation entirely.
 
     def _on_spider_opened(self, spider):
         if spider is not self:
