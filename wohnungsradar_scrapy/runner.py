@@ -18,7 +18,7 @@ from scrapy.utils.reactor import install_reactor
 install_reactor(TWISTED_REACTOR)
 
 from scrapy.crawler import CrawlerRunner
-from scrapy.utils.defer import deferred_f_from_coro_f
+from twisted.internet import defer
 from twisted.internet.task import react
 from .spiders.portals import SPIDER_CLASSES
 
@@ -245,11 +245,18 @@ def run_jobs(jobs):
             log.info("[SCAN-DEBUG][%s] CRAWLER_CREATED job_id=%s feed=%s",
                      job["source"], job["job_id"], feed)
 
-        async def crawl_sequentially(reactor):
+        @defer.inlineCallbacks
+        def crawl_sequentially():
+            """Run each crawler to completion before starting the next one.
+
+            CrawlerRunner.crawl() returns a Twisted Deferred, not an
+            asyncio Future.  Therefore this runner must yield the Deferred
+            with inlineCallbacks rather than await it from a native coroutine.
+            """
             for job, crawler in crawlers:
                 log.info("[SCAN-DEBUG][%s] CRAWL_START job_id=%s urls=%d",
                          job["source"], job["job_id"], len(job["urls"]))
-                await runner.crawl(
+                yield runner.crawl(
                     crawler,
                     start_urls=job["urls"],
                     max_pages=job.get("max_pages"),
@@ -262,7 +269,7 @@ def run_jobs(jobs):
         process_start_error = None
         try:
             log.info("[SCAN-DEBUG] REACT_START sequential_jobs=%d", len(crawlers))
-            react(deferred_f_from_coro_f(crawl_sequentially))
+            react(lambda reactor: crawl_sequentially())
             log.info("[SCAN-DEBUG] REACT_STOP")
         except Exception as exc:
             process_start_error = exc
