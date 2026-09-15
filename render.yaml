@@ -1,9 +1,5 @@
-# Ein einzelner Service:
-#  - wohnung-saas-web: Dashboard UND Scanning in einem Prozess. Der Scan
-#    läuft als Hintergrund-Thread im Web-Prozess (ENABLE_AUTO_SCAN=true),
-#    kein separater Cron-Service nötig. Damit der Prozess nicht wegen
-#    Inaktivität einschläft und der Hintergrund-Scan dadurch pausiert,
-#    lohnt sich ein externer Keep-Alive-Ping (z. B. UptimeRobot).
+# Production architecture: stateless Flask web + independent Render cron scanner.
+# Both services share MongoDB and the same renewable MongoDB scan lease.
 services:
   - type: web
     name: wohnung-saas-web
@@ -15,7 +11,41 @@ services:
       - key: MONGODB_URI
         sync: false
       - key: MONGO_DB_NAME
-        value: "wohnung_saas"
+        value: wohnung_saas
+      - key: SECRET_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_TO
+        sync: false
+      - key: SMTP_USE_TLS
+        value: "true"
+      - key: ENABLE_AUTO_SCAN
+        value: "false"
+      - key: DASHBOARD_LIMIT
+        value: "300"
+      - key: MIN_NOTIFY_SCORE
+        value: "75"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: MONGO_SERVER_SELECTION_TIMEOUT_MS
         value: "5000"
       - key: MONGO_CONNECT_TIMEOUT_MS
@@ -24,10 +54,42 @@ services:
         value: "15000"
       - key: MONGO_TLS_INSECURE
         value: "false"
-      - key: SECRET_KEY
+      - key: SCAN_LOCK_LEASE_SECONDS
+        value: "180"
+      - key: SCAN_LOCK_RENEW_INTERVAL_SECONDS
+        value: "30"
+      - key: LEGACY_SCAN_LOCK_STALE_SECONDS
+        value: "120"
+      - key: SCAN_PROCESS_TIMEOUT_SECONDS
+        value: "1800"
+      - key: SCRAPE_MAX_PAGES
+        value: "3"
+      - key: SCRAPE_RETRIES
+        value: "3"
+      - key: SCRAPE_PAGE_TIMEOUT_MS
+        value: "30000"
+      - key: SCRAPE_WAIT_MS
+        value: "1800"
+      - key: SCRAPE_DELAY_MIN
+        value: "1.0"
+      - key: SCRAPE_DELAY_MAX
+        value: "2.0"
+      - key: LISTING_RETENTION_DAYS
+        value: "60"
+      - key: SCAN_RETENTION_DAYS
+        value: "90"
+
+  - type: cron
+    name: wohnung-saas-scanner
+    env: docker
+    dockerfilePath: ./Dockerfile
+    schedule: "*/10 * * * *"
+    dockerCommand: python scraper.py --once
+    envVars:
+      - key: MONGODB_URI
         sync: false
-      - key: APP_PASSWORD
-        sync: false
+      - key: MONGO_DB_NAME
+        value: wohnung_saas
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
@@ -46,55 +108,41 @@ services:
         sync: false
       - key: SMTP_USE_TLS
         value: "true"
-      - key: DASHBOARD_LIMIT
-        value: "300"
       - key: POLL_INTERVAL_SECONDS
-        value: "300"
-      # Kein separater Cron-Service mehr -> der Web-Prozess scannt selbst
-      # per Hintergrund-Thread. Deshalb hier "true".
-      - key: ENABLE_AUTO_SCAN
-        value: "true"
-      - key: INITIAL_SCAN_DELAY_SECONDS
-        value: "30"
-      - key: DB_RETRY_SECONDS
-        value: "30"
+        value: "600"
       - key: MIN_NOTIFY_SCORE
         value: "75"
-      - key: SCRAPE_MAX_PAGES
-        value: "3"
-      - key: MAX_CANDIDATES_PER_SOURCE
-        value: "0"
-      - key: SCRAPE_DELAY_MIN
-        value: "0.8"
-      - key: SCRAPE_DELAY_MAX
-        value: "1.8"
-      - key: SCRAPE_WAIT_MS
-        value: "4000"
-      - key: SCRAPE_PAGE_TIMEOUT_MS
-        value: "30000"
-      - key: SCRAPE_RETRIES
-        value: "3"
-      - key: SCRAPE_BACKOFF_BASE
-        value: "1.5"
-      - key: LISTING_RETENTION_DAYS
-        value: "60"
       - key: LOG_LEVEL
-        value: "INFO"
-      # PYTHONUNBUFFERED=1 zusammen mit dem Flushing-Handler in
-      # logging_setup.py, damit bei einem harten Kill (OOM,
-      # Health-Check-Timeout) keine Log-Zeilen im Puffer verloren gehen.
+        value: INFO
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: WEB_CONCURRENCY
-        value: "1"
-      # Shared MongoDB scan lock is a renewable lease. This keeps auto/manual
-      # scans coordinated while allowing an orphaned lock to expire quickly
-      # after a deploy or hard crash.
+      - key: MONGO_SERVER_SELECTION_TIMEOUT_MS
+        value: "5000"
+      - key: MONGO_CONNECT_TIMEOUT_MS
+        value: "5000"
+      - key: MONGO_SOCKET_TIMEOUT_MS
+        value: "15000"
+      - key: MONGO_TLS_INSECURE
+        value: "false"
       - key: SCAN_LOCK_LEASE_SECONDS
         value: "180"
       - key: SCAN_LOCK_RENEW_INTERVAL_SECONDS
         value: "30"
       - key: LEGACY_SCAN_LOCK_STALE_SECONDS
         value: "120"
-      - key: SCAN_PROCESS_TIMEOUT_SECONDS
+      - key: SCRAPE_MAX_PAGES
+        value: "3"
+      - key: SCRAPE_RETRIES
+        value: "3"
+      - key: SCRAPE_PAGE_TIMEOUT_MS
+        value: "30000"
+      - key: SCRAPE_WAIT_MS
         value: "1800"
+      - key: SCRAPE_DELAY_MIN
+        value: "1.0"
+      - key: SCRAPE_DELAY_MAX
+        value: "2.0"
+      - key: LISTING_RETENTION_DAYS
+        value: "60"
+      - key: SCAN_RETENTION_DAYS
+        value: "90"

@@ -49,29 +49,43 @@ class ScrapyPortalAdapter:
                        "max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3"))}])
         return [x for x in (self._to_listing(i) for i in raw) if x]
     def _to_listing(self,item):
+        if not item.get("url") or not item.get("title"):
+            return None
+        cold=parse_number(item.get("cold_rent") if item.get("cold_rent") is not None else item.get("price"))
+        warm=parse_number(item.get("warm_rent") if item.get("warm_rent") is not None else item.get("price_total"))
         return Listing(
-            source=item.get("source") or self.SOURCE_KEY,
-            external_id=str(item.get("external_id") or item.get("url") or ""),
-            url=item.get("url") or "", title=item.get("title") or "",
-            description=item.get("description"), price=parse_number(item.get("price")),
-            price_total=parse_number(item.get("price_total")), rooms=parse_number(item.get("rooms")),
-            size=parse_number(item.get("size")), address=item.get("address"), city=item.get("city"),
-            postal_code=item.get("postal_code"), region_code=item.get("region_code"),
-            contact_name=item.get("contact_name"), contact_phone=item.get("contact_phone"),
-            published_at=item.get("published_at"), raw=item.get("raw") or {},
-        ) if item.get("url") and item.get("title") else None
+            source=item.get("source") or self.SOURCE_KEY, external_id=str(item.get("external_id") or item.get("url") or ""),
+            url=item.get("url") or "", title=item.get("title") or "", description=item.get("description"),
+            cold_rent=cold, warm_rent=warm, utilities=parse_number(item.get("utilities")),
+            heating_costs=parse_number(item.get("heating_costs")), total_rent=parse_number(item.get("total_rent")) or warm,
+            rent_type=item.get("rent_type") or ("warm" if warm is not None else "cold" if cold is not None else None),
+            rent_confidence=parse_number(item.get("rent_confidence")), price=cold, price_total=warm,
+            rooms=parse_number(item.get("rooms")), size=parse_number(item.get("size")), address=item.get("address"),
+            city=item.get("city"), district=item.get("district"), neighborhood=item.get("neighborhood"),
+            postal_code=item.get("postal_code"), region_code=item.get("region_code"), street=item.get("street"),
+            floor=item.get("floor"), total_floors=int(item["total_floors"]) if str(item.get("total_floors") or "").isdigit() else None,
+            balcony=item.get("balcony"), terrace=item.get("terrace"), garden=item.get("garden"), elevator=item.get("elevator"),
+            fitted_kitchen=item.get("fitted_kitchen"), furnished=item.get("furnished"), wg_possible=item.get("wg_possible"),
+            temporary=item.get("temporary"), swap=item.get("swap"), wbs_required=item.get("wbs_required"),
+            commission=parse_number(item.get("commission")), commission_free=item.get("commission_free"),
+            parking=item.get("parking"), cellar=item.get("cellar"), pets_allowed=item.get("pets_allowed"),
+            smoking_allowed=item.get("smoking_allowed"), available_from=item.get("available_from"),
+            published_at=item.get("published_at"), provider=item.get("provider"), contact_name=item.get("contact_name"),
+            contact_phone=item.get("contact_phone"), images_count=int(item["images_count"]) if str(item.get("images_count") or "").isdigit() else None,
+            raw=item.get("raw") or {},
+        )
 
 class KleinanzeigenAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="kleinanzeigen"; SOURCE_LABEL="Kleinanzeigen"; BASE_URL="https://www.kleinanzeigen.de"
     def build_search_urls(self,p):
         if p.nationwide: return [f"{self.BASE_URL}/s-wohnung-mieten/c203"]
-        return [f"{self.BASE_URL}/s-wohnung-mieten/{slugify_city(x)}/k0c203" for x in _locations(p)][:8]
+        return [f"{self.BASE_URL}/s-wohnung-mieten/{slugify_city(x)}/c203" for x in _locations(p)][:8]
 
 class ImmoScout24Adapter(ScrapyPortalAdapter):
     SOURCE_KEY="immoscout24"; SOURCE_LABEL="ImmoScout24"; BASE_URL="https://www.immobilienscout24.de"
     def build_search_urls(self,p):
-        if p.nationwide: return [f"{self.BASE_URL}/Suche/de/wohnung-mieten?geo=de"]
-        return [f"{self.BASE_URL}/Suche/de/{slugify_city(x)}/{slugify_city(x)}/wohnung-mieten" for x in _locations(p)][:8]
+        if p.nationwide: return [f"{self.BASE_URL}/Suche/de/wohnung-mieten/"]
+        return [f"{self.BASE_URL}/Suche/de/{slugify_city(x)}/{slugify_city(x)}/wohnung-mieten/" for x in _locations(p)][:8]
 
 class ImmoweltAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="immowelt"; SOURCE_LABEL="Immowelt"; BASE_URL="https://www.immowelt.de"
@@ -111,9 +125,7 @@ class WgGesuchtAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="wg_gesucht"; SOURCE_LABEL="WG-Gesucht"; BASE_URL="https://www.wg-gesucht.de"
     def build_search_urls(self,p):
         if p.nationwide: return []
-        # Current WG-Gesucht exposes a stable SEO market page. It is safer than
-        # inventing city IDs; the spider can follow its real listing links.
-        return [f"{self.BASE_URL}/mietwohnungen/{quote(x.strip().casefold())}" for x in _locations(p)][:8]
+        return [f"{self.BASE_URL}/mietwohnungen/{slugify_city(x)}" for x in _locations(p)][:8]
 
 class MeinestadtAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="meinestadt"; SOURCE_LABEL="meinestadt.de"; BASE_URL="https://immobilien.meinestadt.de"

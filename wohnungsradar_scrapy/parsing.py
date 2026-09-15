@@ -272,3 +272,43 @@ def jsonld_to_raw(obj, base_url):
         "postal_code": postal,
         "published_at": clean_text(published),
     }
+
+
+def parse_rent_details(text: str) -> dict:
+    text = clean_text(text) or ""
+    cold, warm = parse_rents(text)
+    def labeled(pattern):
+        m = re.search(pattern, text, re.I)
+        return parse_number(m.group(1)) if m else None
+    utilities = labeled(r"(?:nebenkosten|betriebskosten)\D{0,30}((?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?)\s*(?:€|eur|euro)")
+    heating = labeled(r"(?:heizkosten|heizungskosten)\D{0,30}((?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?)\s*(?:€|eur|euro)")
+    total = warm
+    rent_type = "warm" if warm is not None else "cold" if cold is not None else None
+    confidence = 1.0 if warm is not None else 0.75 if cold is not None else 0.0
+    return {"cold_rent": cold, "warm_rent": warm, "utilities": utilities,
+            "heating_costs": heating, "total_rent": total, "rent_type": rent_type,
+            "rent_confidence": confidence}
+
+
+def validate_listing_dict(data: dict) -> tuple[bool, list[str]]:
+    warnings=[]
+    url=str(data.get("url") or "")
+    if not url.startswith(("http://", "https://")): warnings.append("invalid_url")
+    if not str(data.get("title") or "").strip(): warnings.append("missing_title")
+    for field in ("price", "price_total", "cold_rent", "warm_rent", "size", "rooms"):
+        value=data.get(field)
+        if value is not None:
+            try:
+                if float(value) < 0: warnings.append(f"negative_{field}")
+            except (TypeError, ValueError): warnings.append(f"invalid_{field}")
+    postal=data.get("postal_code")
+    if postal and not re.fullmatch(r"\d{5}", str(postal).strip()): warnings.append("invalid_postal_code")
+    if data.get("rooms") is not None:
+        try:
+            if float(data["rooms"]) <= 0 or float(data["rooms"]) > 30: warnings.append("implausible_rooms")
+        except (TypeError, ValueError): warnings.append("invalid_rooms")
+    if data.get("size") is not None:
+        try:
+            if float(data["size"]) <= 0 or float(data["size"]) > 2000: warnings.append("implausible_size")
+        except (TypeError, ValueError): warnings.append("invalid_size")
+    return not any(x in warnings for x in ("invalid_url", "missing_title", "negative_price", "negative_price_total", "negative_cold_rent", "negative_warm_rent", "invalid_rooms", "invalid_size")), warnings

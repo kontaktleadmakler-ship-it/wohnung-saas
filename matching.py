@@ -107,7 +107,7 @@ def score_listing(listing, profile):
 
     # Hard exclusions: never notify on these.
     excludes = _tokens(profile.get("keywords_exclude"))
-    if any(term in text for term in excludes):
+    if any(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text) for term in excludes):
         listing["_exclude_reason"] = REASON_EXCLUDED_KEYWORD
         return None
 
@@ -175,7 +175,11 @@ def score_listing(listing, profile):
     if not districts:
         location_score = 70
     else:
-        location_score = 100 if any(d in text for d in districts) else 35
+        location_score = 100 if any(re.search(r"(?<!\w)" + re.escape(d) + r"(?!\w)", text) for d in districts) else 35
+
+    completeness_fields = ("title", "url", "price_total", "price", "rooms", "size", "city", "postal_code", "address", "published_at")
+    known = sum(1 for f in completeness_fields if listing.get(f) not in (None, ""))
+    data_completeness_score = round(100 * known / len(completeness_fields))
 
     score = round(
         price_score * 0.35
@@ -185,6 +189,7 @@ def score_listing(listing, profile):
     )
 
     reasons = []
+    reasons.append(f"Datenqualität: {data_completeness_score}/100")
     if price is not None:
         label = (
             "Warmmiete (geschätzt aus Kaltmiete)"

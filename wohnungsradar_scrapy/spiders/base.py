@@ -5,7 +5,7 @@ import scrapy
 from scrapy import signals
 from scrapy_playwright.page import PageMethod
 from ..items import ApartmentItem
-from ..parsing import node_text, clean_text, canonical_url, external_id_from_url, parse_rents, parse_rooms, parse_size, parse_location, parse_number, jsonld_objects, jsonld_to_raw
+from ..parsing import node_text, clean_text, canonical_url, external_id_from_url, parse_rents, parse_rooms, parse_size, parse_location, parse_number, jsonld_objects, jsonld_to_raw, parse_rent_details, validate_listing_dict
 
 # Text markers that indicate a bot-check/interstitial page rather than a
 # genuine "0 results" search page. Kept case-insensitive and portal-agnostic
@@ -52,6 +52,7 @@ class PortalSpider(scrapy.Spider):
         self._seen_urls=set(); self._seen_pages=set()
         self.page_errors=0; self.pages_seen=0
         self.blocked_pages=0
+        self.result_page_valid=False
         self._first_page_url_set=None
         self.feed_path = None
         self._start_entered = False
@@ -250,6 +251,7 @@ class PortalSpider(scrapy.Spider):
         self.pages_seen += 1
         page_number=int(response.meta.get("page_number",1))
         cards=self.parse_listing_cards(response)
+        self.result_page_valid = self.result_page_valid or self._is_valid_result_page(response, cards)
         if not cards and self._looks_blocked(response):
             self.blocked_pages += 1
             # Reuse the existing page_errors counter so this also shows up
@@ -295,6 +297,20 @@ class PortalSpider(scrapy.Spider):
             if key not in self._seen_pages:
                 self._seen_pages.add(key)
                 yield self._request(next_url,page_number+1)
+
+
+    def _is_valid_result_page(self, response, cards):
+        if int(getattr(response, "status", 0) or 0) < 200 or int(getattr(response, "status", 0) or 0) >= 400:
+            return False
+        if self._looks_blocked(response):
+            return False
+        body=(response.text or "")[:100000].casefold()
+        # Require evidence that this is a real property-results document.
+        result_markers=("wohnung", "mietwohnung", "mieten", "immobil", "zimmer", "m²", "qm")
+        has_result_language=sum(1 for marker in result_markers if marker in body) >= 2
+        has_listing_links=any(self.is_listing_href(h) for h in response.css("a::attr(href)").getall())
+        has_empty_state=any(marker in body for marker in ("keine ergebnisse", "keine passenden", "keine angebote", "0 ergebnisse", "leider keine"))
+        return has_result_language and (bool(cards) or has_listing_links or has_empty_state)
 
     def next_page_url(self,response,page_number,card_count,new_count):
         if page_number>=self.max_pages or not cards_continue(card_count,new_count):
@@ -348,7 +364,8 @@ class PortalSpider(scrapy.Spider):
             try:
                 value=node.css(selector).xpath("string(.)").get()
                 if value and clean_text(value): return clean_text(value)
-            except Exception: pass
+            except Exception:
+                continue
         return None
 
     def adaptive_extract(self,response):
@@ -425,11 +442,22 @@ class PortalSpider(scrapy.Spider):
         postal,city=parse_location(raw.get("address") or combined)
         postal=raw.get("postal_code") or postal; city=raw.get("city") or city
         address=clean_text(raw.get("address")) or (f"{postal} {city}" if postal and city else None)
+        details=parse_rent_details(combined)
+        if cold is not None: details["cold_rent"]=cold
+        if warm is not None: details["warm_rent"]=warm
+        details["price"]=details.get("cold_rent"); details["price_total"]=details.get("warm_rent")
+        data={"url":href,"title":title,"rooms":rooms,"size":size,**details}
+        valid,warnings=validate_listing_dict(data)
+        if not valid:
+            self.logger.warning("[%s] Listing verworfen: %s url=%s",self.source_key, warnings, href)
+            return None
+        raw_out=dict(raw); raw_out.update(details); raw_out["data_quality_warning"]=warnings
         return ApartmentItem(
             job_id=self.job_id,source=self.source_key,external_id=external_id_from_url(href,self.source_key),
             url=href,title=title,description=clean_text(raw.get("description")),
-            price=cold,price_total=warm,rooms=rooms,size=size,address=address,city=city,postal_code=postal,
-            region_code=None,contact_name=None,contact_phone=None,published_at=raw.get("published_at"),raw=dict(raw),
+            price=details.get("cold_rent"),price_total=details.get("warm_rent"),
+            rooms=rooms,size=size,address=address,city=city,postal_code=postal,
+            region_code=None,contact_name=None,contact_phone=None,published_at=raw.get("published_at"),raw=raw_out,
         )
 
     def errback(self, failure):

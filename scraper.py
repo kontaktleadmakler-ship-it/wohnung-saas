@@ -29,8 +29,6 @@ MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
 # Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
 # aus einem Portal auf einmal in Playwright/Python weiterreichen.
 MAX_CANDIDATES_PER_SOURCE = max(0, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "0")))
-# TODO: Ein geteilter Browser mit ausgeliehenen Contexts könnte später mehr Parallelität
-# erlauben; auf kleinen Render-Instanzen ist ein Browser pro Job sonst zu speicherintensiv.
 
 REASON_LABELS = {
     "excluded_keyword": "Ausschlussbegriff im Text",
@@ -88,6 +86,9 @@ def _update_scan_state(run_id, **fields):
 def _run_job(job):
     source, regions, locations, profile_ids = job
     log.info("[%s] Scan startet: Profile=%s, Regionen=%s, Orte=%s", source, sorted(profile_ids), sorted(regions), sorted(locations))
+    if db.source_circuit_state(source) == "OPEN":
+        log.warning("[%s] Circuit breaker OPEN - Quelle vorübergehend pausiert", source)
+        return source, profile_ids, []
     scraper = get_scraper(source)
     params = SearchParams(
         nationwide=("DE" in regions and not locations),
@@ -99,7 +100,8 @@ def _run_job(job):
 
 
 def process_listing(item, profiles_by_id, profile_ids, profile_stats):
-    listing_id, _is_new = db.upsert_listing(item)
+    listing_id, is_new = db.upsert_listing(item)
+    stored_listing = db.get_listing(listing_id) or {}
 
     for pid in profile_ids:
         stats = profile_stats[pid]
@@ -117,7 +119,12 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
         score, components, reasons = result
         notification_state = db.save_match(listing_id, pid, score, components, reasons)
 
-        if score >= MIN_NOTIFY_SCORE:
+        should_notify = (is_new or notification_state.get("score_improved") or stored_listing.get("last_status") in {"UPDATED", "MISSING"})
+        if should_notify and not is_new:
+            db.reset_match_notifications(listing_id, pid)
+            notification_state["telegram_notified"] = False
+            notification_state["email_notified"] = False
+        if score >= MIN_NOTIFY_SCORE and (should_notify or not notification_state.get("notified")):
             msg = format_match_message(
                 profile["name"],
                 score,
@@ -183,7 +190,7 @@ def _log_and_build_funnel(profiles_by_id, profile_stats, source_counts):
 
 def run_once(profile_id=None):
     """Run one scan, optionally restricted to one dashboard-selected profile."""
-    scan_run_id = os.getenv("SCAN_RUN_ID", "").strip()
+    scan_run_id = os.getenv("SCAN_RUN_ID", "").strip() or __import__("uuid").uuid4().hex
     scan_started_at = None
     if os.getenv("SCAN_STARTED_AT"):
         try:
@@ -210,8 +217,17 @@ def run_once(profile_id=None):
     lock = db.try_scan_lock()
     if not lock:
         log.warning("Scan bereits durch einen anderen Prozess gesperrt")
+        try: db.clear_current_scan(scan_run_id, status="locked", exit_code=3)
+        except Exception: log.exception("Locked-Scanstatus konnte nicht gespeichert werden")
         return {"jobs": 0, "listings": 0, "locked": True}
     log.info("Scan-Lock erworben (Lease=%ss)", db.LOCK_LEASE_SECONDS)
+    if scan_started_at is None:
+        from datetime import datetime, timezone
+        scan_started_at=datetime.now(timezone.utc)
+    try:
+        db.set_current_scan(scan_run_id, pid=os.getpid(), status="running", started_at=scan_started_at, mode="cron" if os.getenv("SCAN_RUN_ID", "").strip()=="" else "supervised")
+    except Exception:
+        log.exception("Current-Scan konnte beim Start nicht gespeichert werden")
 
     started = time.monotonic()
     stop_lock_renewer = threading.Event()
@@ -279,10 +295,21 @@ def run_once(profile_id=None):
                 failure = debug.get("failure_class")
                 log.info("[SCAN-DEBUG][%s] RESULT listings=%d failure_class=%s",
                          source, len(listings), failure)
-                if not listings and not failure:
-                    source_empty.append(source)
                 total_for_source = len(listings)
                 source_counts[source] += total_for_source
+                if not listings and not failure:
+                    # An empty result is only legitimate when the spider
+                    # completed a real result page and its parser reported a
+                    # healthy page structure. The runner encodes that as
+                    # ``result_page_valid``.
+                    if debug.get("result_page_valid") is True:
+                        source_empty.append(source)
+                        db.update_source_health(source, status="empty", result_count=0, parser_ok=True, duration_seconds=debug.get("duration_seconds"))
+                    else:
+                        source_errors.append({"source":source,"job_id":debug.get("job_id"),"failure_class":"PARSER_FAILURE"})
+                        db.update_source_health(source, status="failed", result_count=0, parser_ok=False, duration_seconds=debug.get("duration_seconds"), error="zero-results page not validated")
+                else:
+                    db.update_source_health(source, status="blocked" if failure in {"HTTP_403","HTTP_429"} or debug.get("blocked_pages",0) else "failed" if failure else "finished", result_count=total_for_source, parser_ok=not bool(failure), blocked=bool(debug.get("blocked_pages",0)), duration_seconds=debug.get("duration_seconds"), error=(failure or None))
 
             job_snapshot = [
                 {**x, "status": "failed" if any(str(e.get("job_id")) == x["job_id"] for e in source_errors)
@@ -322,8 +349,22 @@ def run_once(profile_id=None):
         if storage_errors:
             source_errors.append({"source": "storage", "job_id": None, "failure_class": "STORAGE_FAILURE"})
 
+        # Only a fully successful source may transition unseen listings to MISSING.
+        successful_sources={str(d.get("source")) for d in get_last_run_status() if d.get("source") and not d.get("failure_class") and d.get("result_page_valid") is True}
+        seen_by_source=defaultdict(set)
+        for _pids, listings in all_results:
+            for item in listings:
+                if item.source in successful_sources:
+                    seen_by_source[item.source].add(item.external_id)
+        for source in successful_sources:
+            try:
+                db.mark_listings_missing(source, seen_by_source.get(source,set()), scan_started_at)
+            except Exception:
+                log.exception("Lifecycle-Missing-Markierung für %s fehlgeschlagen", source)
+
         funnel = _log_and_build_funnel(profiles_by_id, profile_stats, dict(source_counts))
         funnel.update({
+            "scan_status": "failed" if source_errors and not processed else "partial" if source_errors else "finished",
             "source_errors": sorted(source_errors, key=lambda x: (str(x.get("source")), str(x.get("job_id")))),
             "source_empty": sorted(set(source_empty)),
             "source_unavailable": sorted(set(source_unavailable)),
@@ -349,6 +390,10 @@ def run_once(profile_id=None):
         lock_renewer.join(timeout=2)
         if lock_lost.is_set():
             log.error("Scan beendet, nachdem der Scan-Lock verloren ging")
+        try:
+            db.clear_current_scan(scan_run_id, status="partial" if lock_lost.is_set() else "finished", exit_code=0 if not lock_lost.is_set() else 2)
+        except Exception:
+            log.exception("Current-Scan konnte nicht finalisiert werden")
         db.release_scan_lock(lock)
 
 def worker_loop():
@@ -455,6 +500,9 @@ def _dry_run():
         log.warning("Dry-Run: Profile existieren, aber ohne zugewiesene Quellen.")
         return
     for (source, regions, locations), profile_ids in jobs.items():
+        if db.source_circuit_state(source) == "OPEN":
+            log.warning("[%s] Circuit breaker OPEN - Quelle vorübergehend pausiert", source)
+            continue
         scraper = get_scraper(source)
         params = SearchParams(
             nationwide=("DE" in regions and not locations),

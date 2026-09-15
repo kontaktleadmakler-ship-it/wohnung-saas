@@ -24,4 +24,4 @@ for path in ROOT.rglob("*.py"):
 
 print("OK: required files present and Python syntax valid")
 print("Render start: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120")
-print("Auto scan: ENABLE_AUTO_SCAN=true")
+print("Scanner: Render Cron (ENABLE_AUTO_SCAN=false im Web-Service)")

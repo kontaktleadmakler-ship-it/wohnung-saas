@@ -29,6 +29,11 @@
   {% endif %}
 </div>
 
+
+<div class="diagnose-block source-health">
+<h2>Portal Health</h2>
+{% if source_health %}<table class="diagnose-table"><tr><th>Quelle</th><th>Status</th><th>Letzter Erfolg</th><th>Fehler</th><th>Treffer</th><th>Quality</th><th>Circuit</th></tr>{% for h in source_health %}<tr><td>{{h.source}}</td><td>{{h.status}}</td><td>{{h.last_success or '–'}}</td><td>{{h.consecutive_failures or 0}}</td><td>{{h.last_result_count or 0}}</td><td>{{h.source_quality_score or 0}}/100</td><td>{{h.circuit_state or 'CLOSED'}}</td></tr>{% endfor %}</table>{% else %}<p>Noch keine Portal-Telemetrie.</p>{% endif %}
+</div>
 <div class="diagnose-block">
   <h2>Aktive Profile</h2>
   {% if profiles %}

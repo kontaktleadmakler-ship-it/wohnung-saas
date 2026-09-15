@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from functools import wraps
+from config import settings
 
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 from flask_wtf.csrf import CSRFProtect
@@ -19,11 +20,13 @@ configure_logging()
 
 import db
 import scraper as worker
+from telegram_commands import register as register_telegram_commands
 from scrapers.registry import list_sources, get_scraper
 from scrapers.regions import BUNDESLAENDER
 from scrapers.models import SearchParams
 
 app = Flask(__name__)
+
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 SECRET_KEY = os.getenv("SECRET_KEY")
 
@@ -37,7 +40,18 @@ if not SECRET_KEY:
     )
 
 app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "true").lower() in {"1","true","yes","on"},
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=3600,
+)
 CSRFProtect(app)
+
+if os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"):
+    config_errors=settings.validate(production=True)
+    if config_errors:
+        raise RuntimeError("Produktionskonfiguration ungültig: " + "; ".join(config_errors))
 
 log = logging.getLogger("web")
 
@@ -367,6 +381,25 @@ def ensure_db():
         _ensure_db_initialized()
 
 
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    return response
+
+
+def _telegram_scan_callback():
+    global scan_thread
+    with scan_lock:
+        if scan_thread and scan_thread.is_alive():
+            return
+        scan_thread=threading.Thread(target=_manual_scan,daemon=True,name="telegram-scan")
+        scan_thread.start()
+
+register_telegram_commands(app, _telegram_scan_callback)
+
 # Start in Gunicorn as well as `python app.py`/`python main.py`.
 _maybe_start_background_scanner()
 
@@ -477,9 +510,14 @@ def diagnose():
             "urls": urls,
         })
 
+    try:
+        source_health = db.get_source_health()
+    except Exception:
+        source_health = []
     return render_template(
         "diagnose.html",
         setup_stats=setup_stats,
+        source_health=source_health,
         heartbeat=heartbeat,
         heartbeat_status=heartbeat_status,
         heartbeat_message=heartbeat_message,
@@ -639,8 +677,12 @@ def profiles():
             flash(error)
             return redirect(url_for("profiles"))
         pid = db.add_profile(data)
-        db.set_profile_sources(pid, request.form.getlist("sources"))
-        db.set_profile_regions(pid, request.form.getlist("regions"))
+        selected_sources=[x for x in request.form.getlist("sources") if any(s["key"]==x for s in list_sources())]
+        db.set_profile_sources(pid, selected_sources)
+        regions=request.form.getlist("regions") or ["DE"]
+        regions=[r for r in regions if r == "DE" or r in BUNDESLAENDER]
+        if "DE" in regions: regions=["DE"]
+        db.set_profile_regions(pid, regions)
         flash("Profil angelegt.")
         return redirect(url_for("profiles"))
     return render_template(
@@ -706,6 +748,30 @@ def healthz():
             payload["worker_poll_interval_seconds"] = None
             payload["worker_pid"] = None
     return payload, 200
+
+
+@app.route("/readyz")
+def readyz():
+    try:
+        db.ping(); db.get_setup_stats()
+        return jsonify({"ready": True, "database": "ok"}), 200
+    except Exception as exc:
+        return jsonify({"ready": False, "database": "unavailable", "error": type(exc).__name__}), 503
+
+
+@app.route("/api/status")
+@auth
+def api_status():
+    try:
+        current=db.get_current_scan() or {}
+        last=db.get_last_scan_run() or {}
+        health=db.get_source_health()
+        return jsonify({"ok":True,"database":"ok","current_scan":current,"last_scan":last,"source_health":health,
+                        "profiles":db.get_setup_stats(),"config":{"auto_scan":settings.enable_auto_scan,"poll_interval_seconds":settings.poll_interval_seconds,
+                        "max_pages":settings.max_pages,"min_notify_score":settings.min_notify_score}})
+    except Exception as exc:
+        return jsonify({"ok":False,"error":type(exc).__name__}),503
+
 
 
 def _profile_form():

@@ -58,6 +58,8 @@ def _failure_class(debug):
         return "DOWNLOAD_FAILURE"
     if debug.get("spider_errors", 0) or debug.get("downloader_exceptions", 0):
         return "DOWNLOAD_FAILURE"
+    if debug.get("result_page_valid") is True:
+        return None
     if debug.get("responses_received", 0) > 0 and debug.get("items_scraped", 0) == 0:
         return "PARSER_FAILURE"
     if debug.get("finish_reason") not in (None, "finished"):
@@ -94,6 +96,11 @@ def _build_debug(job, crawler, process_start_error=None):
     downloader_exceptions = int(getattr(spider, "_downloader_exceptions", stats.get("downloader/exception_count", 0)))
     retries = int(stats.get("retry/count", 0))
 
+    result_page_valid = bool(
+        getattr(spider, "result_page_valid", False)
+        and not getattr(spider, "blocked_pages", 0)
+        and not getattr(spider, "page_errors", 0)
+    )
     debug = {
         "source": job["source"],
         "job_id": str(job.get("job_id", "")),
@@ -112,6 +119,7 @@ def _build_debug(job, crawler, process_start_error=None):
         "responses_5xx": int(getattr(spider, "_responses_5xx", 0)),
         "http_statuses": statuses,
         "items_scraped": items,
+        "result_page_valid": result_page_valid,
         "spider_errors": spider_errors,
         "downloader_exceptions": downloader_exceptions,
         "retries": retries,

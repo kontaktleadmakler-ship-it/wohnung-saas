@@ -4,7 +4,7 @@ BOT_NAME = "wohnungsradar"
 SPIDER_MODULES = ["wohnungsradar_scrapy.spiders"]
 NEWSPIDER_MODULE = "wohnungsradar_scrapy.spiders"
 
-ROBOTSTXT_OBEY = False
+ROBOTSTXT_OBEY = True
 COOKIES_ENABLED = True
 CONCURRENT_REQUESTS = 1
 CONCURRENT_REQUESTS_PER_DOMAIN = 1
@@ -24,15 +24,7 @@ AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
 # Rotating pool of plausible desktop user agents. base.py picks one at
 # random per request instead of always sending the exact same fingerprint.
 USER_AGENT_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/139.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/140.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
 ]
 USER_AGENT = USER_AGENT_POOL[0]
 

@@ -63,6 +63,11 @@ def _db():
     return _get_client()[MONGO_DB_NAME]
 
 
+def ping():
+    _get_client().admin.command("ping")
+    return True
+
+
 def _now():
     return datetime.now(timezone.utc)
 
@@ -92,6 +97,10 @@ def init_db():
     d.matches.create_index([("notified", ASCENDING)])
     d.scan_runs.create_index([("started_at", DESCENDING)])
     d.scan_state.create_index([("updated_at", DESCENDING)])
+    d.source_health.create_index([("source", ASCENDING)], unique=True)
+    d.scan_events.create_index([("run_id", ASCENDING), ("created_at", ASCENDING)])
+    d.schema_meta.create_index([("_id", ASCENDING)], unique=True)
+    d.schema_meta.update_one({"_id": "schema"}, {"$set": {"schema_version": 3, "updated_at": _now()}}, upsert=True)
 
 
 def cleanup_old_listings(days=60):
@@ -355,69 +364,100 @@ def delete_profile(pid):
     d.matches.delete_many({"profile_id": pid})
 
 
+def _listing_changed(existing, data):
+    fields = ("title", "description", "price", "price_total", "rooms", "size", "location", "city",
+              "postal_code", "url", "published_at", "raw")
+    return any(existing.get(f) != data.get(f) for f in fields)
+
+
+def _data_completeness(data):
+    fields=("url","title","price_total","price","rooms","size","city","postal_code","address","published_at")
+    return round(100 * sum(1 for f in fields if data.get(f) not in (None, "")) / len(fields))
+
+
 def upsert_listing(item):
-    d = _db()
-    now = _now()
-    data = dict(item.__dict__)
-    existing = d.listings.find_one({"source": data["source"], "external_id": data["external_id"]})
+    d = _db(); now = _now(); data = dict(item.__dict__)
+    data.setdefault("raw", {})
+    # Normalize aliases and ensure all absent values remain null rather than fabricated.
+    data["price"] = data.get("cold_rent") if data.get("cold_rent") is not None else data.get("price")
+    data["price_total"] = data.get("warm_rent") if data.get("warm_rent") is not None else data.get("price_total")
+    key={"source": data.get("source"), "external_id": data.get("external_id")}
+    existing=d.listings.find_one(key)
     if existing:
-        update_fields = {
-            "title": data.get("title"),
-            "description": data.get("description"),
-            "price": data.get("price"),
-            "price_total": data.get("price_total"),
-            "rooms": data.get("rooms"),
-            "size": data.get("size"),
-            "location": data.get("address"),
-            "city": data.get("city"),
-            "postal_code": data.get("postal_code"),
-            "region_code": data.get("region_code"),
-            "url": data.get("url"),
-            "contact_name": data.get("contact_name"),
-            "contact_phone": data.get("contact_phone"),
-            "published_at": existing.get("published_at") or data.get("published_at"),
-            "last_seen": now,
-            "raw": data.get("raw") or {},
+        changed=_listing_changed(existing,data)
+        update_fields={
+            "title":data.get("title"),"description":data.get("description"),"price":data.get("price"),"price_total":data.get("price_total"),
+            "cold_rent":data.get("cold_rent"),"warm_rent":data.get("warm_rent"),"utilities":data.get("utilities"),"heating_costs":data.get("heating_costs"),
+            "total_rent":data.get("total_rent"),"rent_type":data.get("rent_type"),"rent_confidence":data.get("rent_confidence"),
+            "rooms":data.get("rooms"),"size":data.get("size"),"location":data.get("address"),"city":data.get("city"),"district":data.get("district"),
+            "neighborhood":data.get("neighborhood"),"postal_code":data.get("postal_code"),"region_code":data.get("region_code"),"street":data.get("street"),
+            "floor":data.get("floor"),"total_floors":data.get("total_floors"),"balcony":data.get("balcony"),"terrace":data.get("terrace"),"garden":data.get("garden"),
+            "elevator":data.get("elevator"),"fitted_kitchen":data.get("fitted_kitchen"),"furnished":data.get("furnished"),"wg_possible":data.get("wg_possible"),
+            "temporary":data.get("temporary"),"swap":data.get("swap"),"wbs_required":data.get("wbs_required"),"commission":data.get("commission"),
+            "commission_free":data.get("commission_free"),"parking":data.get("parking"),"cellar":data.get("cellar"),"pets_allowed":data.get("pets_allowed"),
+            "smoking_allowed":data.get("smoking_allowed"),"available_from":data.get("available_from"),"published_at":existing.get("published_at") or data.get("published_at"),
+            "provider":data.get("provider"),"contact_name":data.get("contact_name"),"contact_phone":data.get("contact_phone"),"images_count":data.get("images_count"),
+            "url":data.get("url"),"raw":data.get("raw") or {},"last_seen":now,"last_status":"UPDATED" if changed else "UNCHANGED",
+            "status":"UPDATED" if changed else "ACTIVE","last_changed":now if changed else existing.get("last_changed"),
+            "missing_since":None,"data_completeness_score":_data_completeness(data),
         }
-        d.listings.update_one({"id": existing["id"]}, {"$set": update_fields})
+        d.listings.update_one({"id":existing["id"]},{"$set":update_fields})
         return existing["id"], False
-
-    lid = _next_id("listings")
-    doc = {
-        "id": lid,
-        "source": data.get("source"),
-        "external_id": data.get("external_id"),
-        "title": data.get("title"),
-        "description": data.get("description"),
-        "price": data.get("price"),
-        "price_total": data.get("price_total"),
-        "rooms": data.get("rooms"),
-        "size": data.get("size"),
-        "location": data.get("address"),
-        "city": data.get("city"),
-        "postal_code": data.get("postal_code"),
-        "region_code": data.get("region_code"),
-        "url": data.get("url"),
-        "contact_name": data.get("contact_name"),
-        "contact_phone": data.get("contact_phone"),
-        "published_at": data.get("published_at"),
-        "first_seen": now,
-        "last_seen": now,
-        "raw": data.get("raw") or {},
-    }
-    try:
-        d.listings.insert_one(doc)
+    lid=_next_id("listings")
+    doc={"id":lid,"source":data.get("source"),"external_id":data.get("external_id"),"title":data.get("title"),"description":data.get("description"),
+         "price":data.get("price"),"price_total":data.get("price_total"),"cold_rent":data.get("cold_rent"),"warm_rent":data.get("warm_rent"),
+         "utilities":data.get("utilities"),"heating_costs":data.get("heating_costs"),"total_rent":data.get("total_rent"),"rent_type":data.get("rent_type"),
+         "rent_confidence":data.get("rent_confidence"),"rooms":data.get("rooms"),"size":data.get("size"),"location":data.get("address"),"city":data.get("city"),
+         "district":data.get("district"),"neighborhood":data.get("neighborhood"),"postal_code":data.get("postal_code"),"region_code":data.get("region_code"),
+         "street":data.get("street"),"floor":data.get("floor"),"total_floors":data.get("total_floors"),"balcony":data.get("balcony"),"terrace":data.get("terrace"),
+         "garden":data.get("garden"),"elevator":data.get("elevator"),"fitted_kitchen":data.get("fitted_kitchen"),"furnished":data.get("furnished"),"wg_possible":data.get("wg_possible"),
+         "temporary":data.get("temporary"),"swap":data.get("swap"),"wbs_required":data.get("wbs_required"),"commission":data.get("commission"),"commission_free":data.get("commission_free"),
+         "parking":data.get("parking"),"cellar":data.get("cellar"),"pets_allowed":data.get("pets_allowed"),"smoking_allowed":data.get("smoking_allowed"),
+         "available_from":data.get("available_from"),"published_at":data.get("published_at"),"first_seen":now,"last_seen":now,"last_changed":now,"missing_since":None,
+         "status":"NEW","last_status":"NEW","provider":data.get("provider"),"contact_name":data.get("contact_name"),"contact_phone":data.get("contact_phone"),"images_count":data.get("images_count"),
+         "data_completeness_score":_data_completeness(data),"raw":data.get("raw") or {}}
+    try:d.listings.insert_one(doc)
     except DuplicateKeyError:
-        # Race: ein anderer Prozess hat inzwischen denselben (source, external_id) angelegt.
-        existing = d.listings.find_one({"source": doc["source"], "external_id": doc["external_id"]})
-        return existing["id"], False
-    return lid, True
+        existing=d.listings.find_one(key); return existing["id"],False
+    return lid,True
 
+
+def get_listing(listing_id):
+    return _db().listings.find_one({"id":listing_id},{"_id":0})
+
+
+def mark_listings_missing(source: str, seen_external_ids: set[str], scan_started_at=None):
+    """Mark source listings missing only after a source completed successfully.
+    This prevents a blocked/broken portal from making every listing disappear."""
+    d=_db(); now=_now(); query={"source":source,"status":{"$in":["NEW","ACTIVE","UPDATED","UNCHANGED"]}}
+    if seen_external_ids: query["external_id"]={"$nin":list(seen_external_ids)}
+    result=d.listings.update_many(query,{"$set":{"status":"MISSING","missing_since":now,"last_status":"MISSING"}})
+    return result.modified_count
+
+
+def update_source_health(source, *, status, result_count=0, error=None, duration_seconds=None, parser_ok=True, blocked=False):
+    d=_db(); now=_now(); previous=d.source_health.find_one({"source":source}) or {}
+    failures=int(previous.get("consecutive_failures",0)); empties=int(previous.get("consecutive_empty_results",0))
+    if status in {"failed","blocked","unavailable","timeout"}: failures+=1
+    else: failures=0
+    if status=="empty": empties+=1
+    else: empties=0
+    if status in {"finished","empty"}: last_success=now
+    else: last_success=previous.get("last_success")
+    health="QUARANTINED" if failures>=10 else "DEGRADED" if failures>=5 or blocked else "HEALTHY"
+    d.source_health.update_one({"source":source},{"$set":{"source":source,"status":health,"last_status":status,"last_attempt":now,"last_success":last_success,"last_error":error,"last_result_count":result_count,"consecutive_failures":failures,"consecutive_empty_results":empties,"blocked_count":int(previous.get("blocked_count",0))+(1 if blocked else 0),"average_duration":duration_seconds if duration_seconds is not None else previous.get("average_duration"),"parser_health":parser_ok,"updated_at":now,"source_quality_score":max(0,min(100,100-failures*10-(20 if blocked else 0)-(10 if empties>=3 else 0))),"circuit_state":"OPEN" if failures>=10 else "HALF_OPEN" if failures>=5 else "CLOSED"}},upsert=True)
+    return health
+
+
+def get_source_health():
+    return list(_db().source_health.find({}, {"_id":0}).sort("source", ASCENDING))
 
 def save_match(listing_id, profile_id, score, components, reasons):
     price_score, rooms_score, size_score, location_score = components
     now = _now()
     d = _db()
+    previous = d.matches.find_one({"listing_id": listing_id, "profile_id": profile_id}) or {}
+    previous_score = previous.get("score")
     update_fields = {
         "score": score,
         "price_score": price_score,
@@ -450,7 +490,13 @@ def save_match(listing_id, profile_id, score, components, reasons):
         "notified": doc.get("notified", False),
         "telegram_notified": doc.get("telegram_notified", False),
         "email_notified": doc.get("email_notified", False),
+        "previous_score": previous_score,
+        "score_improved": previous_score is not None and score >= previous_score + 10,
     }
+
+
+def reset_match_notifications(listing_id, profile_id):
+    _db().matches.update_one({"listing_id":listing_id,"profile_id":profile_id},{"$set":{"telegram_notified":False,"email_notified":False,"notified":False,"updated_at":_now()}})
 
 
 def mark_telegram_notified(listing_id, profile_id):
@@ -572,6 +618,25 @@ def get_dashboard_rows(min_score=0, profile_id=None, limit=None):
             "source": listing.get("source"),
             "first_seen": listing.get("first_seen"),
             "last_seen": listing.get("last_seen"),
+            "last_changed": listing.get("last_changed"),
+            "status": listing.get("status"),
+            "data_completeness_score": listing.get("data_completeness_score"),
+            "warm_rent": listing.get("warm_rent"),
+            "cold_rent": listing.get("cold_rent"),
             "profile_name": profile.get("name"),
         })
     return rows
+
+
+def source_circuit_state(source):
+    doc=_db().source_health.find_one({"source":source}) or {}
+    failures=int(doc.get("consecutive_failures",0)); state=doc.get("circuit_state") or ("OPEN" if failures>=10 else "HALF_OPEN" if failures>=5 else "CLOSED")
+    if state == "OPEN":
+        opened=doc.get("circuit_updated_at")
+        if opened and (_now()-opened).total_seconds() >= 1800:
+            _db().source_health.update_one({"source":source},{"$set":{"circuit_state":"HALF_OPEN"}})
+            return "HALF_OPEN"
+    return state
+
+def set_source_circuit(source, state):
+    _db().source_health.update_one({"source":source},{"$set":{"circuit_state":state,"circuit_updated_at":_now()}},upsert=True)

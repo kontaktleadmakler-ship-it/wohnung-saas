@@ -1,191 +1,90 @@
-# WohnungsRadar V13
+# WohnungsRadar – Production
 
-Production hardening focused on Scrapy request lifecycle telemetry, per-job feeds, failure classification, scan supervision, lock/timeout diagnostics, and current-vs-last scan state.
+WohnungsRadar ist ein automatisierter deutscher Wohnungssuchdienst mit Flask-Dashboard, MongoDB, Scrapy/Playwright, Matching sowie Telegram/E-Mail-Benachrichtigungen.
 
-See `V13_FIXES.md` for the complete change log and deployment/test status.
+## Produktionsarchitektur
 
-# Wohnungsradar – deutsche Immobilien-Scraping-Anwendung
+- **Flask/Gunicorn:** Dashboard, Profile, Diagnose und API.
+- **Render Cron:** startet `python scraper.py --once` unabhängig vom Web-Traffic.
+- **MongoDB:** gemeinsamer Zustand, Historie, Match- und Scan-Daten, Lease-Lock.
+- **Scrapy:** einziger produktiver Scraping-Pfad.
+- **Playwright:** nur für Quellen, die dynamische Inhalte benötigen.
+- **Matching:** Hard Filters + Soft Score 0–100 + Datenqualitätswert.
+- **Notifications:** Telegram und E-Mail getrennt und idempotent.
 
-Flask-Dashboard + MongoDB + Playwright/BeautifulSoup + periodischer Scan + Telegram- und E-Mail-Benachrichtigungen.
+## Render
 
-## Enthaltene Quellen
+`render.yaml` definiert einen Web-Service und einen unabhängigen Cron-Scanner. Beide verwenden dasselbe Dockerfile und dieselbe MongoDB.
 
-- eBay Kleinanzeigen
-- ImmobilienScout24
+Benötigte Secrets:
+
+- `MONGODB_URI`
+- `SECRET_KEY`
+- `APP_PASSWORD`
+
+Optional:
+
+- Telegram: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_WEBHOOK_SECRET`
+- E-Mail: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`, `SMTP_USE_TLS`
+
+Der Scanner läuft standardmäßig alle 10 Minuten. Der MongoDB-Lease verhindert parallele Scans von Cron und manueller Dashboard-Ausführung.
+
+## Endpunkte
+
+- `/healthz` – Liveness
+- `/readyz` – Readiness inklusive MongoDB-Ping
+- `/api/status` – strukturierter Status ohne Secrets
+- `/diagnose` – menschlich lesbare Diagnose
+- `/scan/diagnostics` – Scanpfad und Telemetrie
+- `/profiles` – Profile
+- `/telegram/webhook` – optionaler authentifizierter Telegram-Command-Endpunkt
+
+## Scan-Zustände
+
+`pending`, `running`, `finished`, `partial`, `failed`, `timeout`, `blocked`, `unavailable`, `locked`, `cancelled` werden getrennt behandelt. Ein Portal mit null Ergebnissen gilt nur dann als leer, wenn die Seite erfolgreich geladen, nicht blockiert und als valide Ergebnis-Seite erkannt wurde.
+
+## Quellen
+
+Die Adapter verwenden keine erfundenen CAPTCHA- oder Anti-Bot-Umgehungen. Aktuelle öffentlich erreichbare Suchstrukturen werden portalbezogen behandelt. Wenn keine verlässliche öffentliche Suchroute bekannt ist, wird die Quelle als `unavailable` bzw. `degraded` behandelt.
+
+Derzeit registrierte Quellen:
+
+- Kleinanzeigen
+- ImmoScout24
 - Immowelt
 - Immonet
 - WG-Gesucht
 - meinestadt.de
-- Kalaydo
 
-Die aktiven Scraper liegen ausschließlich in `scrapers/sites.py`; alte, nicht von `registry.py` geladene Adapter-Dateien wurden entfernt.
+Kalaydo ist bewusst deaktiviert, solange keine verlässliche öffentliche Wohnungs-Suchroute vorhanden ist.
 
-Die Scraper benutzen eine plattformspezifische URL-/Link-Strategie, mehrere Selektoren und danach einen generischen DOM-Fallback. Pro URL wird ein Fehler isoliert. Playwright wartet mindestens 10 Sekunden auf clientseitig gerenderte Inhalte und versucht übliche Cookie-Dialoge zu akzeptieren.
+## Datenqualität
 
-**Pagination:** Jede Such-URL wird bis zu `SCRAPE_MAX_PAGES` (Standard 3) Seiten weit verfolgt und stoppt automatisch, sobald eine Seite keine neuen Inserate mehr liefert – das war der Hauptgrund, warum Profile bisher oft nur eine Handvoll Wohnungen sahen (die meisten Portale zeigen ca. 20 Treffer pro Seite). Der Seitenparameter ist pro Scraper in `scrapers/sites.py` konfigurierbar (`PAGE_PARAM`); für ImmoScout24 ist `pagenumber` hinterlegt, eBay Kleinanzeigen überschreibt `build_page_url` und nutzt stattdessen `seite:N` im Pfad, alle anderen nutzen aktuell den generischen `?page=N`-Fallback. **Wichtig:** Diese Parameter konnten in dieser Umgebung nicht gegen die echten Portale verifiziert werden (kein Netzwerkzugriff auf Immobilienportale). Ein falscher Parameter führt nicht zu Fehlern – das Portal liefert dann einfach wiederholt Seite 1, die per Deduplizierung verworfen wird –, sollte aber nach dem Deployment anhand der Logs (`Seite N - X Kandidaten (Y neu)`) geprüft und bei Bedarf angepasst werden.
+Inserate erhalten strukturierte Miet-, Lage-, Ausstattungs- und Zeitfelder. Fehlende Werte bleiben `null`. Kaltmiete und Warmmiete werden nicht verwechselt. Verdächtige Daten werden mit `data_quality_warning` dokumentiert.
 
-**Wichtiger aktueller Hinweis:** Die öffentlich erreichbare Kalaydo-Präsenz ist inzwischen primär eine Jobbörse. Der Kalaydo-Adapter ist deshalb absichtlich fehlertolerant und erzeugt keine erfundenen Immobilienangebote. Wenn Kalaydo wieder eine öffentliche Wohnimmobilien-Suche anbietet, muss nur die URL-Konfiguration in `scrapers/sites.py` angepasst werden.
+Inseratslebenszyklus:
 
-## Lokal starten
+`NEW → ACTIVE/UPDATED → UNCHANGED → MISSING/EXPIRED/REMOVED`
 
-```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-```
+Historische Zeitfelder werden für `first_seen`, `last_seen`, `last_changed` und `missing_since` erhalten.
 
-Benötigt wird MongoDB. Danach setzen:
-
-```text
-MONGODB_URI=mongodb+srv://...
-SECRET_KEY=ein-langes-zufälliges-secret
-APP_PASSWORD=dashboard-passwort
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-POLL_INTERVAL_SECONDS=300
-MIN_NOTIFY_SCORE=75
-PLAYWRIGHT_BROWSERS_PATH=0
-DASHBOARD_LIMIT=300
-```
-
-Web:
-
-```bash
-python app.py
-```
-
-Worker:
-
-```bash
-python scraper.py
-```
-
-## Render
-
-Das Repository enthält `render.yaml` mit zwei Services:
-
-1. `wohnung-saas-web` – Flask-Dashboard. Darf auf dem Free-Tier nach 15 Minuten ohne Traffic einschlafen; das betrifft nur die Anzeige, nicht mehr das Scanning.
-2. `wohnung-saas-cron` – **Render Cron Job**, führt `python scraper.py --once` auf einem festen Zeitplan (Standard: alle 10 Minuten) aus. Läuft unabhängig vom Web-Traffic und schläft nicht ein – ein externer Keep-Alive-Ping (z. B. UptimeRobot) ist dafür nicht mehr nötig. `ENABLE_AUTO_SCAN` im Web-Service ist deshalb standardmäßig `false`; wird der Cron-Service nicht verwendet, kann es zurück auf `true` gesetzt werden, um stattdessen den alten eingebetteten Hintergrundscan zu nutzen.
-
-Beide Services installieren Chromium über `playwright install --with-deps chromium` und teilen sich denselben MongoDB-Lock-Dokument (`db.py`), sodass sich ein manueller Dashboard-Scan und ein zeitgleicher Cron-Lauf nicht überschneiden. Die Datenbanktabellen werden beim Prozessstart einmalig initialisiert. Bei aktiviertem `APP_PASSWORD` ist `SECRET_KEY` im Web-Service Pflicht.
-
-### Render-Variablen
-
-`MONGODB_URI`, `SECRET_KEY` (nur Web), `APP_PASSWORD` (nur Web), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL_SECONDS`, `MIN_NOTIFY_SCORE`, `PLAYWRIGHT_BROWSERS_PATH`, `LISTING_RETENTION_DAYS` (Standard 60 – nach so vielen Tagen ohne erneute Sichtung werden alte Inserate inkl. Matches automatisch gelöscht).
-
-Für E-Mail über SMTP zusätzlich: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`, optional `SMTP_USE_TLS=true`.
-Telegram und E-Mail werden unabhängig voneinander als zugestellt gespeichert. Fällt ein Kanal vorübergehend aus, wird nur dieser Kanal beim nächsten passenden Scan erneut versucht.
-
-### Warum keine Treffer?
-
-Empfohlene Reihenfolge zum Eingrenzen:
-
-1. **`/diagnose` im Dashboard aufrufen.** Zeigt Setup-Stats, Worker-Heartbeat, alle aktiven Profile mit ihren Quellen/Regionen und die daraus tatsächlich gebauten Such-URLs (ohne Playwright, ohne Portal-Request).
-2. **`/healthz` aufrufen.** Enthält neben `active_profiles`/`profiles_with_sources`/`scan_runs` auch `worker_last_seen_seconds_ago`, `worker_poll_interval_seconds` und `worker_pid`. Ist `worker_last_seen_seconds_ago` groß oder `null`, läuft der eingebettete Hintergrundscan nicht.
-3. Erst danach die Render-Logs prüfen.
-
-Häufige Ursachen im Detail:
-
-- Standardmäßig läuft der Scan im `wohnung-saas-cron`-Service, nicht mehr im Web-Prozess. In dessen Logs muss `SCRAPER: --once started` bzw. `SCRAPER: --once completed` erscheinen. Nur wenn `ENABLE_AUTO_SCAN=true` im Web-Service gesetzt ist, läuft stattdessen der ältere eingebettete Thread (`Eingebetteter Scan-Thread gestartet`).
-- `LOG_LEVEL=INFO` muss in beiden Services gesetzt sein. `DEBUG` ist deutlich lauter; `WARNING` oder `ERROR` schneidet die Scraper- und Funnel-Logs komplett ab, die zeigen, warum ein Scan 0 Treffer liefert.
-- Ist `profiles_with_sources` 0, wurde im Dashboard noch keinem Profil eine Quelle zugewiesen - dann kann der Cron-Job laufen, ohne je einen Job zu bauen.
-- Manche Portale liefern gegenüber Rechenzentrums-IPs (wie sie Render vergibt) andere Ergebnisse oder blockieren gelegentlich Anfragen (403/429, oder eine Bot-Check-Zwischenseite). Ein Spider-Log `sieht wie eine Bot-Check-/Block-Seite aus` unterscheidet das explizit von einem echten "0 Treffer"-Ergebnis. Das Projekt implementiert bewusst keine aktive Umgehung (kein Captcha-Solving, kein Proxy-Dienst) - bei dauerhaften Problemen mit einer einzelnen Quelle die Abruffrequenz über `SCRAPE_DELAY_MIN`/`SCRAPE_DELAY_MAX` senken oder die Quelle vorübergehend aus den Profilen entfernen.
-- Ein Warn-Log `liefert exakt dieselben Treffer wie Seite 1` deutet auf einen falsch konfigurierten Pagination-Parameter für dieses Portal hin (siehe `wohnungsradar_scrapy/spiders/portals.py`).
-
-## Matching
-
-Der Score ist 0–100:
-
-- Preis 35 %
-- Zimmer 20 %
-- Größe 25 %
-- Lage 20 %
-
-Harte Ausschlüsse:
-
-- Preis > 105 % des Maximalbudgets
-- bekannte Wohnfläche unter Mindestfläche
-- Zimmer unter Mindestzimmerzahl
-- Zimmer über konfiguriertem Maximum
-- Ausschlussbegriffe in Titel/Beschreibung/Lage
-
-Inserate bis 5 % über dem Budget bleiben erhalten, erhalten aber einen linear reduzierten Preis-Score.
-
-## Datenbank
-
-`profiles`, `listings`, `matches`, `profile_sources`, `profile_regions` werden automatisch erzeugt. Listings sind über `(source, external_id)` eindeutig. Zusätzlich existieren Indizes für Quelle, Aktualität, Profil und Score.
-
-Ein MongoDB-Advisory-Lock verhindert parallele Scans, z. B. wenn ein manueller Scan und der Hintergrundscan zeitgleich starten.
-
-## Selektoren anpassen
-
-Die Plattform-spezifische Konfiguration befindet sich in zwei Dateien:
-
-- `wohnungsradar_scrapy/adapters.py` – `build_search_urls()` pro Portal (welche URLs überhaupt angefragt werden). Ein Adapter mit `AVAILABLE=False` (aktuell: Kalaydo) wird im Profil-Formular nicht als Quelle angeboten, weil er keine echte Such-URL bauen kann.
-- `wohnungsradar_scrapy/spiders/portals.py` – `card_selectors`, `link_selectors`, `is_listing_href()`, Pagination (`_build_page_url()`) pro Portal.
-
-Wenn eine Plattform ihre CSS-Klassen ändert, versucht der gemeinsame Parser (`wohnungsradar_scrapy/spiders/base.py`) zuerst die bekannten Selektoren und danach einen adaptiven Fallback über semantische Listing-URLs, Preis-/m²-/Zimmer-Muster und JSON-LD. Zusätzlich rotiert er den User-Agent pro Request aus `USER_AGENT_POOL` (`wohnungsradar_scrapy/settings.py`) und erkennt gängige Bot-Check-/Captcha-Zwischenseiten anhand von Textmarkern (`BLOCK_PAGE_MARKERS`).
-
-## Test
-
-Der mitgelieferte Smoke-Test benötigt keine externe Website und prüft Datenmodell, Matching und den adaptiven Parser:
-
-```bash
-python test_smoke.py
-```
-
-Ein echter Live-Scan muss in der Zielumgebung ausgeführt werden, weil einige Portale Bot-Schutz, Geobeschränkungen oder dynamische Inhalte verwenden. Der Code beendet bei einem Portalfehler niemals den gesamten Lauf.
-
-Zum Prüfen, welche aktiven Profile es gibt und welche Such-URLs daraus gebaut würden - ganz ohne Playwright oder Portal-Requests:
-
-```bash
-python scraper.py --dry-run
-```
-
-Das ist der schnellste Weg zu sehen, ob ein Profil überhaupt zu Jobs führt, bevor man einen vollen Scan abwartet.
-
-## Rechtliches / Betrieb
-
-Nur öffentlich zugängliche Inhalte abrufen, Nutzungsbedingungen und Robots-/Zugriffsregeln der jeweiligen Plattform beachten und die Abruffrequenz niedrig halten. Dieses Projekt enthält keine CAPTCHA-, Login- oder Anti-Bot-Umgehung.
-
-
-## Betriebshinweise
-
-- `DASHBOARD_LIMIT` steuert die maximale Anzahl der Treffer im Dashboard (Standard 300).
-- Ein `DE`-Profil wird bei den Scrapers als `SearchParams.nationwide=True` behandelt und nicht auf Berlin zurückgefallen. Regionale Profile ohne Districts werden über 2–3 große Städte je Bundesland als Suchanker aufgebaut; explizite Districts haben Vorrang.
-- Cookie-Consent wird zusätzlich in gängigen Consent-iframes versucht, damit eingebettete Banner die Extraktion nicht blockieren.
-- Der Scan-Thread läuft im Web-Prozess. Bei mehreren Gunicorn-Workern ist der Laufstatus deshalb nicht global; der MongoDB-Advisory-Lock verhindert jedoch parallele Scans. Für den integrierten Thread `python app.py` bzw. einen einzelnen Web-Worker verwenden.
-- **Entscheidung offen: Kalaydo/Immonet.** Beide bleiben vorerst in `SOURCE_CLASSES` und fehlertolerant. Kalaydo ist aktuell primär Jobbörse; Immonet ist weitgehend in Immowelt konsolidiert. Sie wurden bewusst nicht entfernt, damit eine spätere Reaktivierung per Konfiguration möglich bleibt. Die endgültige Entfernung sollte erst nach einem echten Produktionsscan bzw. einer bewussten Konfigurationsentscheidung erfolgen.
-
-
-## Architektur (repariert)
-
-Der einzige Scraping-Pfad ist:
-
-`Flask -> scraper.py -> wohnungsradar_scrapy.runner -> PortalSpider -> NormalizePipeline -> DB/Matching`
-
-Die frühere `scrapers/base.py`/Playwright-Standalone-Implementierung wurde entfernt. `scrapers.sites` exportiert nur noch die Scrapy-Adapter für die öffentliche API.
-
-### Laufzeit
-
-- `SCRAPE_MAX_PAGES` wird vom Scan-Job bis in jeden Spider durchgereicht.
-- Scrapy und Playwright laufen pro Scan in einem kurzlebigen Kindprozess. Dadurch wird der Twisted-Reactor nicht mehrfach gestartet und ein Browser-OOM reißt den Flask-Prozess nicht mit.
-- Maximal ein Playwright-Kontext/eine Seite und ein Scrapy-Request gleichzeitig.
-- Portalfehler werden pro Quelle geloggt; andere Quellen laufen weiter.
-- `Kalaydo` wird nicht künstlich mit Ergebnissen gefüllt, wenn keine verifizierte Wohnungs-Suchroute vorhanden ist; das Dashboard zeigt die Quelle als nicht verfügbar.
-
-### Tests
+## Lokale Entwicklung
 
 ```bash
 python -m unittest discover -s tests -v
+python selftest.py
 python test_smoke.py
+python scraper.py --dry-run
 ```
 
-Die Tests arbeiten mit Fixture-HTML und prüfen Parser, JSON-LD, Preis/Warmmiete, Zimmer, Fläche und URL-Normalisierung ohne Netzwerk.
+Offline-Tests benötigen die in `requirements.txt` definierten Abhängigkeiten. Live-Portal-Tests sind nicht Bestandteil des normalen Testlaufs.
 
+## Sicherheit
 
-## Render Start Command
-
-Der produktive Start erfolgt mit Gunicorn (`gunicorn app:app`). Zusätzlich bleibt `python main.py` als kompatibler Fallback für bereits konfigurierte Render-Services erhalten; dafür ist kein Uvicorn/FastAPI erforderlich.
+- CSRF für Formulare
+- sichere Session-Cookies im Produktionsbetrieb
+- keine Secrets in Logs oder API-Antworten
+- Telegram-Commands nur für die konfigurierte Chat-ID
+- optionales Webhook-Secret für Telegram
+- keine CAPTCHA-/Anti-Bot-/Stealth-/Proxy-Umgehung
+- keine Produktionsdaten oder `.env`-Dateien im Repository
