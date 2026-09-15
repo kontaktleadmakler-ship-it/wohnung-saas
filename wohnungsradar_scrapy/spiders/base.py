@@ -222,7 +222,6 @@ class PortalSpider(scrapy.Spider):
                              "timeout": int(os.getenv("SCRAPE_NAV_TIMEOUT_MS", "15000")),
                          },
                          "playwright_page_methods":[
-                PageMethod("wait_for_timeout", max(0, int(os.getenv("SCRAPE_WAIT_MS", "1200")))),
                 PageMethod("evaluate", """
                     () => {
                         const labels = [
@@ -237,7 +236,7 @@ class PortalSpider(scrapy.Spider):
                         }
                     }
                 """),
-                PageMethod("wait_for_timeout",300),
+                PageMethod("wait_for_timeout",500),
             ]})
         return scrapy.Request(url,callback=self.parse,errback=self.errback,meta=meta,headers=headers,dont_filter=True)
 

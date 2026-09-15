@@ -20,6 +20,7 @@ install_reactor(TWISTED_REACTOR)
 
 from scrapy.crawler import CrawlerRunner
 from twisted.internet import defer
+from twisted.internet.error import CancelledError
 from twisted.internet.task import react
 from .spiders.portals import SPIDER_CLASSES
 
@@ -162,7 +163,7 @@ def _build_debug(job, crawler, process_start_error=None):
 
 
 def run_jobs(jobs):
-    """Run all requested spiders in one CrawlerProcess.
+    """Run all requested spiders sequentially in one CrawlerRunner.
 
     Each job gets its own JSONL feed. A missing feed is a diagnostic error,
     while an existing empty feed is a legitimate zero-item result.
@@ -208,7 +209,7 @@ def run_jobs(jobs):
             "RETRY_TIMES": RETRY_TIMES,
             "RETRY_HTTP_CODES": RETRY_HTTP_CODES,
             "DOWNLOAD_DELAY": float(os.getenv("SCRAPE_DELAY_MIN", DOWNLOAD_DELAY)),
-            "RANDOMIZE_DOWNLOAD_DELAY": RANDOMIZE_DOWNLOAD_DELAY,
+            "DOWNLOAD_DELAY_JITTER": DOWNLOAD_DELAY_JITTER,
             "AUTOTHROTTLE_ENABLED": AUTOTHROTTLE_ENABLED,
             "AUTOTHROTTLE_START_DELAY": AUTOTHROTTLE_START_DELAY,
             "AUTOTHROTTLE_MAX_DELAY": AUTOTHROTTLE_MAX_DELAY,
@@ -231,6 +232,7 @@ def run_jobs(jobs):
             # wastes sockets/resources and obscures production diagnostics.
             "REMOTE_CONTROL_ENABLED": False,
             "REQUEST_FINGERPRINTER_IMPLEMENTATION": REQUEST_FINGERPRINTER_IMPLEMENTATION,
+            "CLOSESPIDER_TIMEOUT": int(os.getenv("SCRAPE_CLOSESPIDER_TIMEOUT", "120")),
         }
 
         log.info("[SCAN-DEBUG] SCRAPY_RUNNER_CREATE jobs=%d mode=sequential", len(normalized))
@@ -247,7 +249,7 @@ def run_jobs(jobs):
                      job["source"], job["job_id"], feed)
 
         @defer.inlineCallbacks
-        def crawl_sequentially():
+        def crawl_sequentially(reactor):
             """Run each crawler to completion before starting the next one.
 
             CrawlerRunner.crawl() returns a Twisted Deferred, not an
@@ -265,23 +267,28 @@ def run_jobs(jobs):
                     feed_path=str(job["feed_path"]),
                 )
                 timeout_s = max(30, int(os.getenv("SCRAPE_JOB_TIMEOUT_SECONDS", "180")))
-                crawl_deferred.addTimeout(timeout_s, reactor)
+                timed = crawl_deferred.addTimeout(timeout_s, reactor)
                 try:
-                    yield crawl_deferred
+                    yield timed
+                    log.info("[SCAN-DEBUG][%s] CRAWL_DONE job_id=%s",
+                             job["source"], job["job_id"])
                 except Exception as exc:
-                    log.error("[SCAN-DEBUG][%s] CRAWL_ERROR timeout=%ss error=%s", job.get("source"), timeout_s, exc)
+                    log.error("[SCAN-DEBUG][%s] CRAWL_ABORT timeout=%ss error=%s",
+                              job.get("source"), timeout_s, exc)
                     try:
-                        yield crawler.stop()
+                        stop_deferred = crawler.stop()
+                        if stop_deferred is not None:
+                            yield stop_deferred
                     except Exception:
-                        pass
-                    raise
-                log.info("[SCAN-DEBUG][%s] CRAWL_DONE job_id=%s",
-                         job["source"], job["job_id"])
+                        log.exception("[SCAN-DEBUG][%s] CRAWLER_STOP_FAILED job_id=%s",
+                                      job["source"], job["job_id"])
+                    log.info("[SCAN-DEBUG][%s] CRAWL_ABORTED_CONTINUE job_id=%s",
+                             job["source"], job["job_id"])
 
         process_start_error = None
         try:
             log.info("[SCAN-DEBUG] REACT_START sequential_jobs=%d", len(crawlers))
-            react(lambda reactor: crawl_sequentially())
+            react(lambda reactor: crawl_sequentially(reactor))
             log.info("[SCAN-DEBUG] REACT_STOP")
         except Exception as exc:
             process_start_error = exc
