@@ -3,7 +3,7 @@
 {% block content %}
 <div class="head"><div><div class="eyebrow">WOHNUNGSRADAR</div><h1>Dashboard Login</h1></div></div>
 <form method="post" class="form" style="max-width:420px">
-  {{ csrf_token() }}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="next" value="{{next}}">
   <label>Passwort<input name="password" type="password" autocomplete="current-password" required autofocus></label>
   <button>ANMELDEN</button>
