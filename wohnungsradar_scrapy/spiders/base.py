@@ -158,6 +158,7 @@ class PortalSpider(scrapy.Spider):
         self._downloader_exceptions = 0
         self._requests_sent = 0
         self._playwright_failures = 0
+        self._pagination_failures = 0
         self._http_statuses = {}
         self._error_messages = []
         self._runner_error = None
@@ -583,21 +584,29 @@ class PortalSpider(scrapy.Spider):
             )
             return
         if ("playwright" in msg.casefold() or "timeout" in msg.casefold()) and self.use_playwright:
-            # A navigation/render timeout is a Playwright failure, not a
-            # generic downloader failure. Once a later pagination request has
-            # failed, there is no reason to keep the spider alive until
-            # CLOSESPIDER_TIMEOUT: page 1 may already contain valid listings.
+            page_number = int((getattr(request, "meta", {}) or {}).get("page_number", 1))
+            if page_number > 1 and self.result_page_valid:
+                # Pagination is best-effort. A slow/unstable second page must
+                # never invalidate listings that were already scraped from a
+                # valid first page. Simply stop pagination for this portal.
+                self._pagination_failures += 1
+                self._error_messages.append(f"PAGINATION_TIMEOUT: {msg}")
+                self.logger.warning(
+                    "[SCAN-DEBUG][%s] PAGINATION_TIMEOUT job_id=%s page=%s url=%s - "
+                    "bereits gefundene Treffer bleiben gültig",
+                    self.source_key, self.job_id, page_number, getattr(request, "url", None),
+                )
+                return
+
             self._playwright_failures += 1
             self._error_messages.append(f"PLAYWRIGHT_FAILURE: {msg}")
             self.logger.error(
                 "[SCAN-DEBUG][%s] PLAYWRIGHT_FAILURE job_id=%s url=%s error=%s",
                 self.source_key, self.job_id, getattr(request, "url", None), msg,
             )
-            try:
-                self.crawler.engine.close_spider(self, reason="playwright_failure")
-            except Exception:
-                self.logger.exception("[SCAN-DEBUG][%s] CLOSE_AFTER_PLAYWRIGHT_FAILURE_FAILED job_id=%s",
-                                      self.source_key, self.job_id)
+            # Do not force-close the spider here. Scrapy can finish naturally
+            # after a failed initial request, and a later request failure must
+            # not destroy items already written to the feed.
             return
         self._downloader_exceptions += 1
         self._error_messages.append(msg)

@@ -353,6 +353,16 @@ def run_once(profile_id=None):
         if storage_errors:
             source_errors.append({"source": "storage", "job_id": None, "failure_class": "STORAGE_FAILURE"})
 
+        # A source is successful when at least one genuine result page was
+        # validated. This is intentionally independent of whether page 2+
+        # timed out, because those later pages are best-effort.
+        successful_sources = {
+            str(d.get("source")) for d in get_last_run_status()
+            if d.get("source")
+            and not d.get("failure_class")
+            and d.get("result_page_valid") is True
+        }
+
         # Only a fully successful source may transition unseen listings to MISSING.
         seen_by_source=defaultdict(set)
         for _pids, listings in all_results:
@@ -364,13 +374,6 @@ def run_once(profile_id=None):
                 db.mark_listings_missing(source, seen_by_source.get(source,set()), scan_started_at)
             except Exception:
                 log.exception("Lifecycle-Missing-Markierung für %s fehlgeschlagen", source)
-
-        successful_sources = {
-            str(d.get("source")) for d in get_last_run_status()
-            if d.get("source")
-            and not d.get("failure_class")
-            and d.get("result_page_valid") is True
-        }
         # A valid empty source is still a successful source. Scan status must
         # not depend on whether any listing happened to match a profile.
         if source_errors:

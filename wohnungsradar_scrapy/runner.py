@@ -55,6 +55,11 @@ def _failure_class(debug):
         return "SOURCE_UNAVAILABLE"
     if debug.get("robots_blocked"):
         return "ROBOTS_BLOCKED"
+    # A valid first page is enough for a successful source. Pagination is
+    # deliberately best-effort; a timeout on page 2+ must not turn real
+    # results into a failed source.
+    if debug.get("result_page_valid") is True:
+        return None
     if debug.get("timeout"):
         return "TIMEOUT"
     if debug.get("playwright_failures", 0):
@@ -165,6 +170,7 @@ def _build_debug(job, crawler, process_start_error=None):
         "runner_error": None,
         "error_messages": list(getattr(spider, "_error_messages", []))[-10:],
         "playwright_failures": int(getattr(spider, "_playwright_failures", 0)),
+        "pagination_failures": int(getattr(spider, "_pagination_failures", 0)),
     }
     runner_error = getattr(spider, "_runner_error", None)
     if runner_error:
