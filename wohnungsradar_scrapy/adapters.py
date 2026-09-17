@@ -142,7 +142,8 @@ class ImmonetAdapter(ScrapyPortalAdapter):
     # HTTP 403 from the scraper environment. Hide this source until a stable
     # public search endpoint is available; otherwise scans report a misleading
     # successful zero-result source.
-    SOURCE_KEY="immonet"; SOURCE_LABEL="Immonet"; BASE_URL="https://www.immonet.de"; AVAILABLE=True
+    SOURCE_KEY="immonet"; SOURCE_LABEL="Immonet"; BASE_URL="https://www.immonet.de"; AVAILABLE=False
+    UNAVAILABLE_FAILURE_CLASS="SOURCE_UNAVAILABLE"
     def build_search_urls(self,p):
         if p.nationwide: return [f"{self.BASE_URL}/deutschland/wohnung-mieten.html"]
         return [f"{self.BASE_URL}/{slugify_city(x)}/wohnung-mieten.html" for x in _locations(p)][:8]
@@ -157,7 +158,8 @@ class MeinestadtAdapter(ScrapyPortalAdapter):
     # The current property search is disallowed by the site's robots.txt, so
     # do not present it as a selectable scraper source. Respecting robots is
     # preferable to bypassing the restriction merely to obtain listings.
-    SOURCE_KEY="meinestadt"; SOURCE_LABEL="meinestadt.de"; BASE_URL="https://immobilien.meinestadt.de"; AVAILABLE=True
+    SOURCE_KEY="meinestadt"; SOURCE_LABEL="meinestadt.de"; BASE_URL="https://immobilien.meinestadt.de"; AVAILABLE=False
+    UNAVAILABLE_FAILURE_CLASS="ROBOTS_BLOCKED"
     def build_search_urls(self,p):
         if p.nationwide: return [f"{self.BASE_URL}/deutschland/wohnung-mieten"]
         return [f"{self.BASE_URL}/{slugify_city(x)}/wohnung-mieten" for x in _locations(p)][:8]
@@ -264,34 +266,92 @@ ADAPTER_CLASSES=(
 ADAPTERS={c.SOURCE_KEY:c() for c in ADAPTER_CLASSES}
 
 def run_scrapy_jobs(work):
+    """Run configured sources while treating unavailable adapters as explicit,
+    non-scraping source states.
+
+    Existing profiles may still reference a source that was disabled after the
+    profile was created. Such a source gets a synthetic SOURCE_UNAVAILABLE
+    diagnostic entry, but no Scrapy crawler/request is created for it.
+    """
     global LAST_RUN_STATUS
-    LAST_RUN_STATUS=[]
-    jobs=[]; adapters={}
-    for idx,(source,regions,locations,profile_ids) in enumerate(work):
-        adapter=ADAPTERS[source]; jid=str(idx); adapters[jid]=adapter
-        params=SearchParams(nationwide=("DE" in regions and not locations),
-                            region_codes=[] if "DE" in regions else list(regions),
-                            locations=list(locations))
-        urls=adapter.build_search_urls(params)
-        jobs.append({"job_id":jid,"source":source,"urls":urls,
-                     "max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3"))})
-    for job in jobs:
-        if not job["urls"]:
-            LAST_RUN_STATUS.append({"source":job["source"],"job_id":job["job_id"],"status":"source unavailable"})
-            log.warning("[%s] source unavailable: keine verifizierte Such-URL", job["source"])
-    raw=run_jobs(jobs)
+    LAST_RUN_STATUS = []
+    jobs = []
+    adapters = {}
+    job_ids = {}
+
+    for idx, (source, regions, locations, profile_ids) in enumerate(work):
+        adapter = ADAPTERS[source]
+        jid = str(idx)
+        job_ids[jid] = idx
+        adapters[jid] = adapter
+        params = SearchParams(
+            nationwide=("DE" in regions and not locations),
+            region_codes=[] if "DE" in regions else list(regions),
+            locations=list(locations),
+        )
+        if not getattr(adapter, "AVAILABLE", True):
+            LAST_RUN_STATUS.append({
+                "source": source,
+                "job_id": jid,
+                "status": "unavailable",
+                "failure_class": getattr(adapter, "UNAVAILABLE_FAILURE_CLASS", "SOURCE_UNAVAILABLE"),
+                "adapter_available": False,
+                "start_urls": [],
+                "start_url_count": 0,
+                "requests_scheduled": 0,
+                "requests_sent": 0,
+                "responses_received": 0,
+                "items_scraped": 0,
+                "result_page_valid": False,
+                "error_messages": ["Quelle ist in der aktuellen Umgebung deaktiviert/unavailable."],
+            })
+            log.warning("[%s] %s - kein Scraper-Job erzeugt", source, getattr(adapter, "UNAVAILABLE_FAILURE_CLASS", "SOURCE_UNAVAILABLE"))
+            continue
+
+        try:
+            urls = adapter.build_search_urls(params)
+        except Exception as exc:
+            urls = []
+            LAST_RUN_STATUS.append({
+                "source": source, "job_id": jid, "status": "error",
+                "failure_class": "CONFIG_ERROR", "adapter_available": True,
+                "start_urls": [], "start_url_count": 0,
+                "error_messages": [f"{type(exc).__name__}: {exc}"],
+            })
+            continue
+
+        if not urls:
+            LAST_RUN_STATUS.append({
+                "source": source, "job_id": jid, "status": "error",
+                "failure_class": "NO_START_URLS", "adapter_available": True,
+                "start_urls": [], "start_url_count": 0,
+                "error_messages": ["Keine verifizierte Such-URL für die konfigurierte Region/Ort-Kombination."],
+            })
+            log.warning("[%s] NO_START_URLS - kein Scraper-Job erzeugt", source)
+            continue
+
+        jobs.append({
+            "job_id": jid,
+            "source": source,
+            "urls": urls,
+            "max_pages": int(os.getenv("SCRAPE_MAX_PAGES", "3")),
+        })
+
+    raw = run_jobs(jobs)
     LAST_RUN_STATUS.extend(get_last_run_debug())
-    grouped={str(i):[] for i in range(len(work))}
+
+    grouped = {str(i): [] for i in range(len(work))}
     for item in raw:
         if item.get("_runner_status") == "error":
             LAST_RUN_STATUS.append(item)
             continue
-        adapter=adapters.get(str(item.get("job_id","")))
+        adapter = adapters.get(str(item.get("job_id", "")))
         if adapter:
-            listing=adapter._to_listing(item)
-            if listing: grouped.setdefault(str(item.get("job_id")),[]).append(listing)
-    return [(work[i][3],grouped.get(str(i),[])) for i in range(len(work))]
+            listing = adapter._to_listing(item)
+            if listing:
+                grouped.setdefault(str(item.get("job_id")), []).append(listing)
 
+    return [(work[i][3], grouped.get(str(i), [])) for i in range(len(work))]
 
 def get_last_run_status():
     return list(LAST_RUN_STATUS)

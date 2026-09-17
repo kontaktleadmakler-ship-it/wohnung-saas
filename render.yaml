@@ -40,6 +40,8 @@ services:
         value: "true"
       - key: ENABLE_AUTO_SCAN
         value: "false"
+      - key: APP_VERSION
+        value: "wohnungsradar-v15"
       - key: DASHBOARD_LIMIT
         value: "300"
       - key: MIN_NOTIFY_SCORE
@@ -116,6 +118,8 @@ services:
         value: "true"
       - key: POLL_INTERVAL_SECONDS
         value: "600"
+      - key: APP_VERSION
+        value: "wohnungsradar-v15"
       - key: MIN_NOTIFY_SCORE
         value: "75"
       - key: LOG_LEVEL

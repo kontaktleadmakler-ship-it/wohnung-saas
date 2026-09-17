@@ -25,6 +25,8 @@ from scrapers.registry import list_sources, get_scraper
 from scrapers.regions import BUNDESLAENDER
 from scrapers.models import SearchParams
 
+APP_VERSION = os.getenv("APP_VERSION", "wohnungsradar-v15")
+
 app = Flask(__name__)
 
 # Environment-aware startup configuration. Importing the Flask module must never
@@ -574,6 +576,8 @@ def scan_diagnostics():
             jobs.append({"source":source,"profile_ids":sorted(profile_ids),"regions":list(regions),
                          "locations":list(locations),"urls":urls,"urls_count":len(urls),
                          "adapter_available":bool(getattr(adapter,"AVAILABLE",True)) if 'adapter' in locals() else False,
+                         "status":"available" if bool(getattr(adapter,"AVAILABLE",True)) else "unavailable",
+                         "failure_class":None if bool(getattr(adapter,"AVAILABLE",True)) else "SOURCE_UNAVAILABLE",
                          "url_error":url_error})
         last_completed_scan = db.get_last_scan_run() or {}
         current_scan = db.get_current_scan() or {}
@@ -622,10 +626,25 @@ def scan_diagnostics():
                 "scan_thread_running":bool(scan_thread and scan_thread.is_alive()),
                 "current_scan_pid": current_running_scan.get("pid") if current_running_scan else None,
                 "current_scan_status": current_running_scan.get("status") if current_running_scan else None,
+                "child_exit_code": current_running_scan.get("exit_code") if current_running_scan else None,
+                "child_timeout": current_running_scan.get("status") == "timeout" if current_running_scan else False,
+                "current_job": (
+                    next((j for j in (current_running_scan.get("jobs") or [])
+                          if j.get("status") in {"running", "pending"}), None)
+                    if current_running_scan else None
+                ),
+                "completed_jobs": (
+                    [j for j in (current_running_scan.get("jobs") or [])
+                     if j.get("status") in {"finished", "failed", "error", "unavailable"}]
+                    if current_running_scan else []
+                ),
             },
-            "config":{"log_level":os.getenv("LOG_LEVEL","INFO"),"scan_debug":os.getenv("SCAN_DEBUG","true"),
+            "config":{"app_version": APP_VERSION, "log_level":os.getenv("LOG_LEVEL","INFO"),"scan_debug":os.getenv("SCAN_DEBUG","true"),
                       "auto_scan_enabled":os.getenv("ENABLE_AUTO_SCAN","false").lower() in {"1","true","yes","on"},
                       "scrape_max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3")),
+                      "scrape_wait_ms":int(os.getenv("SCRAPE_WAIT_MS","1800")),
+                      "wg_gesucht_nav_timeout_ms":int(os.getenv("WG_GESUCHT_NAV_TIMEOUT_MS","10000")),
+                      "wg_gesucht_wait_ms":int(os.getenv("WG_GESUCHT_WAIT_MS","2500")),
                       "scan_process_timeout_seconds":int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS","1800")),
                       "scan_lock_lease_seconds":db.LOCK_LEASE_SECONDS,
                       "scan_lock_renew_interval_seconds":db.LOCK_RENEW_INTERVAL_SECONDS},

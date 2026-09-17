@@ -96,6 +96,6 @@ Offline-Tests benötigen die in `requirements.txt` definierten Abhängigkeiten. 
 ### v8 scraper reliability
 
 - WG-Gesucht uses a short `commit` navigation plus a bounded settle wait, avoiding long-lived page resources blocking `domcontentloaded`.
-- Immonet is temporarily hidden from selectable sources because its current search surface redirects to Immowelt and returns HTTP 403 in the scraper environment.
-- meinestadt.de is temporarily hidden because the current property search is disallowed by robots.txt; the scraper does not bypass that restriction.
+- Immonet is disabled (`AVAILABLE=False`) because its current search surface redirects to Immowelt and is not a stable scrape target in the current environment.
+- meinestadt.de is disabled (`AVAILABLE=False`) because the current property search is disallowed by robots.txt; the scraper does not bypass that restriction.
 - The JSONL feed pipeline is compatible with Scrapy 2.19's pipeline signatures, eliminating the old `open_spider`/`process_item` deprecation path.

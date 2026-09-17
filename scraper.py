@@ -281,7 +281,7 @@ def run_once(profile_id=None):
             debug_by_job = {str(x.get("job_id")): x for x in statuses if x.get("job_id") is not None}
             for status in statuses:
                 failure = status.get("failure_class")
-                if status.get("status") == "source unavailable":
+                if status.get("status") in {"source unavailable", "unavailable"} or failure == "SOURCE_UNAVAILABLE":
                     source_unavailable.append(status.get("source"))
                 elif failure:
                     source_errors.append({
@@ -309,7 +309,17 @@ def run_once(profile_id=None):
                         source_errors.append({"source":source,"job_id":debug.get("job_id"),"failure_class":"PARSER_FAILURE"})
                         db.update_source_health(source, status="failed", result_count=0, parser_ok=False, duration_seconds=debug.get("duration_seconds"), error="zero-results page not validated")
                 else:
-                    db.update_source_health(source, status="blocked" if failure in {"HTTP_403","HTTP_429"} or debug.get("blocked_pages",0) else "failed" if failure else "finished", result_count=total_for_source, parser_ok=not bool(failure), blocked=bool(debug.get("blocked_pages",0)), duration_seconds=debug.get("duration_seconds"), error=(failure or None))
+                    if failure == "SOURCE_UNAVAILABLE":
+                        health_status = "unavailable"
+                    elif failure in {"ROBOTS_BLOCKED", "HTTP_403", "HTTP_429"} or debug.get("blocked_pages", 0):
+                        health_status = "blocked"
+                    else:
+                        health_status = "failed" if failure else "finished"
+                    db.update_source_health(
+                        source, status=health_status, result_count=total_for_source,
+                        parser_ok=not bool(failure), blocked=bool(debug.get("blocked_pages", 0)),
+                        duration_seconds=debug.get("duration_seconds"), error=(failure or None),
+                    )
 
             job_snapshot = [
                 {**x, "status": "failed" if any(str(e.get("job_id")) == x["job_id"] for e in source_errors)
@@ -350,7 +360,6 @@ def run_once(profile_id=None):
             source_errors.append({"source": "storage", "job_id": None, "failure_class": "STORAGE_FAILURE"})
 
         # Only a fully successful source may transition unseen listings to MISSING.
-        successful_sources={str(d.get("source")) for d in get_last_run_status() if d.get("source") and not d.get("failure_class") and d.get("result_page_valid") is True}
         seen_by_source=defaultdict(set)
         for _pids, listings in all_results:
             for item in listings:
@@ -362,9 +371,21 @@ def run_once(profile_id=None):
             except Exception:
                 log.exception("Lifecycle-Missing-Markierung für %s fehlgeschlagen", source)
 
+        successful_sources = {
+            str(d.get("source")) for d in get_last_run_status()
+            if d.get("source")
+            and not d.get("failure_class")
+            and d.get("result_page_valid") is True
+        }
+        # A valid empty source is still a successful source. Scan status must
+        # not depend on whether any listing happened to match a profile.
+        if source_errors:
+            scan_status = "partial" if successful_sources else "failed"
+        else:
+            scan_status = "finished"
         funnel = _log_and_build_funnel(profiles_by_id, profile_stats, dict(source_counts))
         funnel.update({
-            "scan_status": "failed" if source_errors and not processed else "partial" if source_errors else "finished",
+            "scan_status": scan_status,
             "source_errors": sorted(source_errors, key=lambda x: (str(x.get("source")), str(x.get("job_id")))),
             "source_empty": sorted(set(source_empty)),
             "source_unavailable": sorted(set(source_unavailable)),

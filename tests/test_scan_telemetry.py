@@ -9,9 +9,16 @@ from scrapy.http import Request
 from wohnungsradar_scrapy.runner import _failure_class
 from wohnungsradar_scrapy.spiders.portals import KleinanzeigenSpider
 from wohnungsradar_scrapy.pipelines import JobFeedPipeline
+from wohnungsradar_scrapy.adapters import ADAPTERS
 
 
 class TelemetryTests(unittest.TestCase):
+    def test_disabled_sources_are_not_available(self):
+        self.assertFalse(ADAPTERS["immonet"].AVAILABLE)
+        self.assertFalse(ADAPTERS["meinestadt"].AVAILABLE)
+        self.assertEqual(ADAPTERS["immonet"].UNAVAILABLE_FAILURE_CLASS, "SOURCE_UNAVAILABLE")
+        self.assertEqual(ADAPTERS["meinestadt"].UNAVAILABLE_FAILURE_CLASS, "ROBOTS_BLOCKED")
+
     def test_one_url_start_yields_one_request(self):
         spider = KleinanzeigenSpider(
             start_urls=["https://example.test/search"], job_id="0"
@@ -75,12 +82,33 @@ class TelemetryTests(unittest.TestCase):
         from wohnungsradar_scrapy import runner
         self.assertFalse(runner.REMOTE_CONTROL_ENABLED)
 
+    def test_robots_and_unavailable_are_distinct(self):
+        self.assertEqual(_failure_class({"robots_blocked": True}), "ROBOTS_BLOCKED")
+        self.assertEqual(_failure_class({"source_unavailable": True}), "SOURCE_UNAVAILABLE")
+
+    def test_playwright_timeout_is_not_generic_download_failure(self):
+        debug = {
+            "start_url_count": 1, "start_entered": True, "start_yielded": 1,
+            "requests_scheduled": 1, "playwright_failures": 1,
+            "responses_received": 0,
+        }
+        self.assertEqual(_failure_class(debug), "PLAYWRIGHT_FAILURE")
+
+    def test_valid_empty_result_is_success(self):
+        debug = {
+            "start_url_count": 1, "start_entered": True, "start_yielded": 1,
+            "requests_scheduled": 1, "responses_received": 1,
+            "http_statuses": {"200": 1}, "items_scraped": 0,
+            "result_page_valid": True, "finish_reason": "finished",
+        }
+        self.assertIsNone(_failure_class(debug))
+
     def test_required_failure_classes_exist(self):
         from wohnungsradar_scrapy.runner import FAILURE_CLASSES
         for value in ("CONFIG_ERROR", "NO_START_URLS", "REQUEST_PIPELINE_FAILURE",
                       "DOWNLOAD_FAILURE", "HTTP_403", "HTTP_429", "HTTP_5XX",
                       "PLAYWRIGHT_FAILURE", "PARSER_FAILURE", "STORAGE_FAILURE",
-                      "TIMEOUT", "UNKNOWN_FAILURE"):
+                      "TIMEOUT", "ROBOTS_BLOCKED", "SOURCE_UNAVAILABLE", "UNKNOWN_FAILURE"):
             self.assertIn(value, FAILURE_CLASSES)
 
 

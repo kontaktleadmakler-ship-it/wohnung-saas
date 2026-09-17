@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging, os, random, re
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 import scrapy
+from scrapy.exceptions import IgnoreRequest
 from scrapy import signals
 from scrapy_playwright.page import PageMethod
 from ..items import ApartmentItem
@@ -140,6 +141,9 @@ class PortalSpider(scrapy.Spider):
         self._downloader_exceptions = 0
         self._http_statuses = {}
         self._error_messages = []
+        self._runner_error = None
+        self.robots_blocked = False
+        self.scan_timeout = False
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -537,10 +541,32 @@ class PortalSpider(scrapy.Spider):
     def errback(self, failure):
         self.page_errors += 1
         msg = failure.getErrorMessage()
+        exc = getattr(failure, "value", None)
+        request = getattr(failure, "request", None)
+        if isinstance(exc, IgnoreRequest) and "robots.txt" in msg.casefold():
+            self.robots_blocked = True
+            self._error_messages.append(f"ROBOTS_BLOCKED: {msg}")
+            self.logger.warning(
+                "[SCAN-DEBUG][%s] ROBOTS_BLOCKED job_id=%s url=%s error=%s",
+                self.source_key, self.job_id, getattr(request, "url", None), msg,
+            )
+            return
+        if "playwright" in msg.casefold() or "timeout" in msg.casefold() and self.use_playwright:
+            # A navigation/render timeout is a Playwright failure, not a
+            # generic downloader failure. The page may have emitted lifecycle
+            # events before the errback, but the request itself did not yield a
+            # usable response.
+            self._error_messages.append(f"PLAYWRIGHT_FAILURE: {msg}")
+            self.logger.error(
+                "[SCAN-DEBUG][%s] PLAYWRIGHT_FAILURE job_id=%s url=%s error=%s",
+                self.source_key, self.job_id, getattr(request, "url", None), msg,
+            )
+            return
+        self._downloader_exceptions += 1
         self._error_messages.append(msg)
         self.logger.error("[SCAN-DEBUG][%s] DOWNLOAD_FAILURE job_id=%s url=%s error=%s",
                           self.source_key, self.job_id,
-                          getattr(failure.request, "url", None), msg)
+                          getattr(request, "url", None), msg)
 
 def cards_continue(card_count,new_count):
     return card_count>0 and new_count>0
