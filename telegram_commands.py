@@ -1,7 +1,6 @@
 from __future__ import annotations
 import hmac, os, threading
 from flask import request, jsonify
-from flask_wtf.csrf import csrf
 import db
 
 COMMANDS={"/help","/status","/scan","/profiles","/matches","/errors","/sources","/pause","/resume"}
@@ -13,7 +12,6 @@ def _authorized(chat_id):
 def register(app, scan_callback):
     secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
     @app.post("/telegram/webhook")
-    @csrf.exempt
     def telegram_webhook():
         if secret:
             supplied=request.headers.get("X-Telegram-Bot-Api-Secret-Token","")
@@ -36,3 +34,9 @@ def register(app, scan_callback):
         if text=="/resume":
             db.set_auto_scan_enabled(True, source="telegram")
         return jsonify({"ok":True,"command":text})
+
+    # Telegram sends server-to-server POST requests and cannot provide a browser CSRF token.
+    # Exempt only this webhook from Flask-WTF CSRF protection.
+    csrf = app.extensions.get("csrf")
+    if csrf is not None:
+        csrf.exempt(telegram_webhook)
