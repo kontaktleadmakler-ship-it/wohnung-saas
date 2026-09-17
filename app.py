@@ -195,6 +195,11 @@ def _run_scan_once_embedded(profile_id=None, mode="auto"):
     env.setdefault("PYTHONUNBUFFERED", "1")
     env["SCAN_RUN_ID"] = run_id
     env["SCAN_STARTED_AT"] = started_iso
+    # The child process must know whether this invocation came from the
+    # dashboard or from the automatic scheduler. Without this flag a manual
+    # full scan was treated as a cron scan and skipped whenever
+    # ENABLE_AUTO_SCAN=false (the exact cause of the zero-result scans).
+    env["SCAN_TRIGGER"] = "manual" if mode == "manual" else "cron"
 
     proc = None
     returncode = 1

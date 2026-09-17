@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, re, unicodedata
 from urllib.parse import quote, quote_plus
 from scrapers.models import Listing, SearchParams
-from scrapers.regions import STATE_CITY_SAMPLES, BUNDESLAENDER, LOCATION_CITY_ALIASES
+from scrapers.regions import STATE_CITY_SAMPLES, BUNDESLAENDER
 from .runner import run_jobs, get_last_run_debug
 from .spiders.portals import SPIDER_CLASSES
 import logging
@@ -38,20 +38,21 @@ def _title_slug(name: str) -> str:
 _CITY_STATE_CODE={city.casefold():code for code,cities in STATE_CITY_SAMPLES.items() for city in cities}
 
 def _locations(params):
+    # `districts` in the UI may contain neighborhoods such as Moabit.
+    # Those are NOT valid portal city slugs. Use them only for matching and
+    # choose a real city as the search anchor.
     requested = [str(x).strip() for x in (params.locations or []) if str(x).strip()]
     known = {c.casefold(): c for cities in STATE_CITY_SAMPLES.values() for c in cities}
     cities = []
     for value in requested:
-        key = value.casefold()
-        city = known.get(key) or LOCATION_CITY_ALIASES.get(key) or value
-        if city.casefold() not in {c.casefold() for c in cities}:
-            cities.append(city)
+        if value.casefold() in known:
+            cities.append(known[value.casefold()])
     if cities:
-        return cities
+        return list(dict.fromkeys(cities))
     if params.region_codes:
         for code in params.region_codes:
             for city in STATE_CITY_SAMPLES.get(str(code).upper(), []):
-                if city.casefold() not in {c.casefold() for c in cities}:
+                if city not in cities:
                     cities.append(city)
     return cities
 
@@ -99,20 +100,14 @@ class ScrapyPortalAdapter:
 class KleinanzeigenAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="kleinanzeigen"; SOURCE_LABEL="Kleinanzeigen"; BASE_URL="https://www.kleinanzeigen.de"
     def build_search_urls(self,p):
-        # Current public result pages use /s-wohnung-mieten/<city>/.../k0c203l<location>.
-        # The older /c203 endpoint often redirects to a generic search page.
-        cities = _locations(p)
-        if p.nationwide:
-            cities = ["Berlin", "Hamburg", "München", "Köln", "Frankfurt am Main", "Düsseldorf"]
-        return [f"{self.BASE_URL}/s-wohnung-mieten/{slugify_city(x)}/wohnungen-mieten/k0c203" for x in cities][:8]
+        if p.nationwide: return [f"{self.BASE_URL}/s-wohnung-mieten/c203"]
+        return [f"{self.BASE_URL}/s-wohnung-mieten/{slugify_city(x)}/c203" for x in _locations(p)][:8]
 
 class ImmoScout24Adapter(ScrapyPortalAdapter):
     SOURCE_KEY="immoscout24"; SOURCE_LABEL="ImmoScout24"; BASE_URL="https://www.immobilienscout24.de"
     def build_search_urls(self,p):
-        cities = _locations(p)
-        if p.nationwide:
-            cities = ["Berlin", "Hamburg", "München", "Köln", "Frankfurt am Main", "Düsseldorf"]
-        return [f"{self.BASE_URL}/Suche/de/{slugify_city(x)}/{slugify_city(x)}/wohnung-mieten" for x in cities][:8]
+        if p.nationwide: return [f"{self.BASE_URL}/Suche/de/wohnung-mieten/"]
+        return [f"{self.BASE_URL}/Suche/de/{slugify_city(x)}/{slugify_city(x)}/wohnung-mieten/" for x in _locations(p)][:8]
 
 class ImmoweltAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="immowelt"; SOURCE_LABEL="Immowelt"; BASE_URL="https://www.immowelt.de"
@@ -127,9 +122,10 @@ class ImmoweltAdapter(ScrapyPortalAdapter):
         "koln": "/suche/mieten/wohnung/nordrhein-westfalen/koln-50769/ad08de2179",
     }
     def build_search_urls(self,p):
-        cities = _locations(p)
         if p.nationwide:
-            cities = ["Berlin", "Hamburg", "München", "Köln", "Frankfurt am Main", "Düsseldorf"]
+            # Use a broad current search endpoint rather than inventing a
+            # city fallback. It can be followed by the spider normally.
+            return [f"{self.BASE_URL}/suche/mieten/wohnung"]
         urls=[]
         for city in _locations(p)[:8]:
             anchor=self.CITY_ANCHORS.get(city.casefold())
@@ -155,10 +151,8 @@ class ImmonetAdapter(ScrapyPortalAdapter):
 class WgGesuchtAdapter(ScrapyPortalAdapter):
     SOURCE_KEY="wg_gesucht"; SOURCE_LABEL="WG-Gesucht"; BASE_URL="https://www.wg-gesucht.de"
     def build_search_urls(self,p):
-        cities = _locations(p)
-        if p.nationwide:
-            cities = ["Berlin", "Hamburg", "München", "Köln", "Frankfurt am Main", "Düsseldorf"]
-        return [f"{self.BASE_URL}/mietwohnungen/{slugify_city(x)}" for x in cities][:8]
+        if p.nationwide: return []
+        return [f"{self.BASE_URL}/mietwohnungen/{slugify_city(x)}" for x in _locations(p)][:8]
 
 class MeinestadtAdapter(ScrapyPortalAdapter):
     # The current property search is disallowed by the site's robots.txt, so

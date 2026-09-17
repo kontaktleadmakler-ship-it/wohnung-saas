@@ -26,28 +26,3 @@ STATE_CITY_SAMPLES={
     'SH':['Kiel','Lübeck','Flensburg'],
     'TH':['Erfurt','Jena','Gera'],
 }
-
-# Häufig in Profilen verwendete Bezirke/Stadtteile. Für die Portal-Suche
-# werden sie auf eine echte Stadt zurückgeführt; der Originalwert bleibt im
-# Profil-Matching erhalten.
-LOCATION_CITY_ALIASES = {
-    # Berlin
-    **{k: "Berlin" for k in [
-        "mitte", "friedrichshain", "kreuzberg", "friedrichshain-kreuzberg",
-        "pankow", "prenlauer berg", "neukölln", "neukoelln", "tempelhof",
-        "schöneberg", "schoeneberg", "tempelhof-schöneberg",
-        "charlottenburg", "wilmersdorf", "charlottenburg-wilmersdorf",
-        "spandau", "reinickendorf", "lichtenberg", "marzahn",
-        "marzahn-hellersdorf", "hellersdorf", "treptow", "köpenick",
-        "treptow-köpenick", "steglitz", "zehlendorf", "steglitz-zehlendorf",
-        "moabit", "wedding", "tiergarten", "kreuzberg", "schöneberg",
-    ]},
-    # München
-    **{k: "München" for k in ["münchen", "munchen", "maxvorstadt", "schwabing", "sendling", "glockenbachviertel", "haimhausen"]},
-    # Hamburg
-    **{k: "Hamburg" for k in ["hamburg", "altona", "eimsbüttel", "eimsbuettel", "wandsbek", "harburg", "hamburg-nord"]},
-    # Köln
-    **{k: "Köln" for k in ["köln", "koeln", "innenstadt", "ehrenfeld", "deutz", "lindenthal", "nippes"]},
-    # Frankfurt
-    **{k: "Frankfurt am Main" for k in ["frankfurt", "frankfurt am main", "sachsenhausen", "bornheim", "bockenheim"]},
-}

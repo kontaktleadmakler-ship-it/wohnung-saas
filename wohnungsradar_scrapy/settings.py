@@ -4,7 +4,7 @@ BOT_NAME = "wohnungsradar"
 SPIDER_MODULES = ["wohnungsradar_scrapy.spiders"]
 NEWSPIDER_MODULE = "wohnungsradar_scrapy.spiders"
 
-ROBOTSTXT_OBEY = os.getenv("ROBOTSTXT_OBEY", "false").strip().lower() in {"1", "true", "yes", "on"}
+ROBOTSTXT_OBEY = True
 COOKIES_ENABLED = True
 CONCURRENT_REQUESTS = 1
 CONCURRENT_REQUESTS_PER_DOMAIN = 1
@@ -52,7 +52,7 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
         "--renderer-process-limit=1",
     ],
 }
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = int(os.getenv("SCRAPE_NAV_TIMEOUT_MS", "30000"))
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = int(os.getenv("SCRAPE_NAV_TIMEOUT_MS", "15000"))
 
 # Large media assets do not contribute to listing extraction and can keep
 # Playwright navigations open on modern portals. Abort only resource types that
