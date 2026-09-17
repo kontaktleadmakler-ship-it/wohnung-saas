@@ -92,7 +92,16 @@ def init_db():
     d.listings.create_index([("source", ASCENDING), ("external_id", ASCENDING)], unique=True)
     d.listings.create_index([("last_seen", DESCENDING)])
     d.matches.create_index([("listing_id", ASCENDING), ("profile_id", ASCENDING)], unique=True)
-    d.matches.create_index([("score", DESCENDING)])
+    # Remove the former artificial profile-score index if it exists.
+    try:
+        d.matches.drop_index("score_-1")
+    except Exception:
+        pass
+    # Legacy score fields are no longer part of the application model.
+    try:
+        d.matches.update_many({}, {"$unset": {"score": "", "legacy_score": ""}})
+    except Exception:
+        pass
     d.matches.create_index([("profile_id", ASCENDING), ("created_at", DESCENDING)])
     d.matches.create_index([("notified", ASCENDING)])
     d.scan_runs.create_index([("started_at", DESCENDING)])
@@ -454,26 +463,22 @@ def update_source_health(source, *, status, result_count=0, error=None, duration
 def get_source_health():
     return list(_db().source_health.find({}, {"_id":0}).sort("source", ASCENDING))
 
-def save_match(listing_id, profile_id, score=None, components=(), reasons=None):
-    """Persist a deterministic profile match.
+def save_match(listing_id, profile_id, reasons=None):
+    """Persist a deterministic profile match with explicit reasons.
 
-    ``score`` and ``components`` are retained only for compatibility with old
-    documents/callers; new matches no longer calculate or depend on them.
+    A match is created only by the profile criteria; there is no ranking score
+    or score threshold in the persistence model.
     """
     now = _now()
     d = _db()
-    previous = d.matches.find_one({"listing_id": listing_id, "profile_id": profile_id}) or {}
-    update_fields = {
-        "match_status": "MATCH",
-        "reasons": list(reasons or []),
-        "updated_at": now,
-    }
-    if score is not None:
-        update_fields["legacy_score"] = score
     doc = d.matches.find_one_and_update(
         {"listing_id": listing_id, "profile_id": profile_id},
         {
-            "$set": update_fields,
+            "$set": {
+                "match_status": "MATCH",
+                "reasons": list(reasons or []),
+                "updated_at": now,
+            },
             "$setOnInsert": {
                 "listing_id": listing_id,
                 "profile_id": profile_id,
@@ -482,6 +487,7 @@ def save_match(listing_id, profile_id, score=None, components=(), reasons=None):
                 "email_notified": False,
                 "created_at": now,
             },
+            "$unset": {"score": "", "legacy_score": ""},
         },
         upsert=True,
         return_document=ReturnDocument.AFTER,
@@ -490,8 +496,6 @@ def save_match(listing_id, profile_id, score=None, components=(), reasons=None):
         "notified": doc.get("notified", False),
         "telegram_notified": doc.get("telegram_notified", False),
         "email_notified": doc.get("email_notified", False),
-        "previous_score": previous.get("legacy_score", previous.get("score")),
-        "score_improved": False,
     }
 
 
@@ -568,13 +572,8 @@ def get_worker_heartbeat():
 DASHBOARD_LIMIT = max(1, int(os.getenv("DASHBOARD_LIMIT", "300")))
 
 
-def get_dashboard_rows(min_score=0, profile_id=None, limit=None):
-    """Return profile matches without exposing/ranking by an artificial score.
-
-    ``min_score`` remains as a backwards-compatible argument for older callers,
-    but it is deliberately ignored. The profile itself is the matching rule;
-    dashboard ordering is by newest match/listing instead of score.
-    """
+def get_dashboard_rows(profile_id=None, limit=None):
+    """Return deterministic profile matches ordered by newest listing/match."""
     limit = DASHBOARD_LIMIT if limit is None else max(1, int(limit))
     d = _db()
     match_filter = {}
@@ -622,7 +621,6 @@ def get_dashboard_rows(min_score=0, profile_id=None, limit=None):
             "last_seen": listing.get("last_seen"),
             "last_changed": listing.get("last_changed"),
             "status": listing.get("status"),
-            "data_completeness_score": listing.get("data_completeness_score"),
             "warm_rent": listing.get("warm_rent"),
             "cold_rent": listing.get("cold_rent"),
             "profile_name": profile.get("name"),

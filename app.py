@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 import uuid
-from functools import wraps
 from config import settings
 
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
@@ -24,7 +23,7 @@ from scrapers.registry import list_sources, get_scraper
 from scrapers.regions import BUNDESLAENDER
 from scrapers.models import SearchParams
 
-APP_VERSION = os.getenv("APP_VERSION", "wohnungsradar-v17")
+APP_VERSION = os.getenv("APP_VERSION", "wohnungsradar-v18")
 
 app = Flask(__name__)
 
@@ -368,13 +367,6 @@ def _heartbeat_status():
     return hb, "down", _NO_HEARTBEAT_MESSAGE
 
 
-def auth(view):
-    """Compatibility decorator; the dashboard has no application password."""
-    @wraps(view)
-    def wrapper(*a, **kw):
-        return view(*a, **kw)
-    return wrapper
-
 
 @app.before_request
 def ensure_db():
@@ -409,16 +401,14 @@ register_telegram_commands(app, _telegram_scan_callback)
 _maybe_start_background_scanner()
 
 @app.route("/")
-@auth
 def home():
-    min_score = 0
     try:
         raw_profile_id = request.args.get("profile_id")
         profile_id = int(raw_profile_id) if raw_profile_id else None
     except (TypeError, ValueError):
         profile_id = None
     try:
-        rows = db.get_dashboard_rows(0, profile_id)
+        rows = db.get_dashboard_rows(profile_id)
     except Exception:
         rows = []
         flash("Datenbank konnte nicht gelesen werden.")
@@ -440,7 +430,7 @@ def home():
         "dashboard.html",
         rows=rows,
         profiles=profiles,
-        min_score=min_score,
+        app_version=APP_VERSION,
         selected_profile=str(profile_id) if profile_id is not None else "",
         scan_running=bool(scan_thread and scan_thread.is_alive()),
         last_scan=last_scan,
@@ -452,7 +442,6 @@ def home():
 
 
 @app.route("/diagnose")
-@auth
 def diagnose():
     try:
         setup_stats = db.get_setup_stats()
@@ -514,7 +503,6 @@ def diagnose():
 
 
 @app.route("/scan/diagnostics", methods=["GET"])
-@auth
 def scan_diagnostics():
     """Machine-readable end-to-end scan diagnostics. Secrets are never returned."""
     started=time.monotonic()
@@ -633,7 +621,6 @@ def scan_diagnostics():
 
 
 @app.route("/scan/run", methods=["POST"])
-@auth
 def run_scan():
     global scan_thread
     raw_profile_id = request.form.get("profile_id") or request.args.get("profile_id")
@@ -672,7 +659,6 @@ def _manual_scan(profile_id=None):
 
 
 @app.route("/profiles", methods=["GET", "POST"])
-@auth
 def profiles():
     if request.method == "POST":
         data, error = _profile_form()
@@ -697,7 +683,6 @@ def profiles():
 
 
 @app.route("/profiles/<int:pid>/edit", methods=["POST"])
-@auth
 def edit_profile(pid):
     data, error = _profile_form()
     if error:
@@ -712,7 +697,6 @@ def edit_profile(pid):
 
 
 @app.route("/profiles/<int:pid>/delete", methods=["POST"])
-@auth
 def delete_profile(pid):
     db.delete_profile(pid)
     flash("Profil gelöscht.")
@@ -755,7 +739,6 @@ def readyz():
 
 
 @app.route("/api/status")
-@auth
 def api_status():
     try:
         current=db.get_current_scan() or {}

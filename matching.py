@@ -8,9 +8,7 @@ from wohnungsradar_scrapy.parsing import parse_number
 
 TOLERANCE = 0.05
 
-# Reported when score_listing() rejects a listing outright, so scraper.py can
-# aggregate a per-profile funnel ("184 außerhalb Budget", "41 zu klein", ...)
-# instead of only ever reporting a final count of zero.
+# Explicit exclusion reasons are used for the profile-match funnel and diagnostics.
 REASON_EXCLUDED_KEYWORD = "excluded_keyword"
 REASON_OVER_BUDGET = "over_budget"
 REASON_TOO_SMALL = "too_small"
@@ -65,10 +63,8 @@ def listing_fingerprint(listing: dict) -> str:
 def _number(value):
     """Coerce a listing/profile field to float.
 
-    scraper.py hands score_listing() a dict built straight from the
-    scraper's Listing/adapter objects (`dict(item.__dict__)`), where
-    price/size/rooms have already been parsed into real Python floats by
-    wohnungsradar_scrapy/adapters.py (via parsing.py::parse_number()).
+    Scraper Listing/adapter objects already contain parsed numeric values,
+    while older/manual profile data may still contain strings.
     Profile numbers (max_price, min_size, ...) are floats too - see
     app.py's `num()` helper and db.py, which store them as such.
 
@@ -171,145 +167,3 @@ def match_listing(listing, profile):
     elif price_is_estimate and max_price and price <= max_price:
         reasons.append("Budget anhand Kaltmiete innerhalb Grenze; Warmmiete unbekannt")
     return reasons
-
-
-def score_listing(listing, profile):
-    """Return (score, components, reasons) or None if hard-excluded.
-
-    Also sets `listing['_exclude_reason']` as a side channel so callers that
-    need to know *why* a listing was excluded (for funnel logging) don't
-    have to duplicate the filtering logic. This never affects matching
-    itself and is popped/reset on every call.
-    """
-    listing.pop("_exclude_reason", None)
-
-    text = " ".join(
-        str(listing.get(k) or "")
-        for k in ("title", "description", "location", "address")
-    ).casefold()
-
-    # Hard exclusions: never notify on these.
-    excludes = _tokens(profile.get("keywords_exclude"))
-    if any(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text) for term in excludes):
-        listing["_exclude_reason"] = REASON_EXCLUDED_KEYWORD
-        return None
-
-    price, price_is_estimate = _effective_rent(listing)
-    max_price = _number(profile.get("max_price")) or 0
-    min_price = _number(profile.get("min_price")) or 0
-
-    size = _number(listing.get("size"))
-    min_size = _number(profile.get("min_size")) or 0
-
-    rooms = _number(listing.get("rooms"))
-    min_rooms = _number(profile.get("min_rooms")) or 0
-    max_rooms = _number(profile.get("max_rooms"))
-
-    # Budget is the strongest constraint. A small tolerance prevents losing
-    # borderline results because of minor warm/cold-rent differences or
-    # Nebenkosten estimates that are slightly off.
-    if max_price and price is not None and price > max_price:
-        listing["_exclude_reason"] = REASON_OVER_BUDGET
-        return None
-
-    if min_size and size is not None and size < min_size:
-        listing["_exclude_reason"] = REASON_TOO_SMALL
-        return None
-
-    if min_rooms and rooms is not None and rooms < min_rooms:
-        listing["_exclude_reason"] = REASON_TOO_FEW_ROOMS
-        return None
-
-    if max_rooms is not None and rooms is not None and rooms > max_rooms:
-        listing["_exclude_reason"] = REASON_TOO_MANY_ROOMS
-        return None
-
-    # Unknown values are neutral rather than automatically "perfect".
-    if price is None or max_price <= 0:
-        price_score = 55
-    elif price <= max_price:
-        # Full confidence only when we know the actual Warmmiete. A
-        # Kaltmiete estimate that happens to fit stays capped below
-        # "perfect" because unknown Nebenkosten could still push it over.
-        price_score = 90 if price_is_estimate else 100
-    else:
-        price_score = max(
-            0,
-            round(100 * (1 - (price - max_price) / (max_price * TOLERANCE))),
-        )
-
-    if rooms is None:
-        rooms_score = 55
-    elif min_rooms <= 0:
-        rooms_score = 70
-    elif rooms >= min_rooms:
-        rooms_score = 100
-    else:
-        rooms_score = max(0, round(100 * rooms / min_rooms))
-
-    if size is None:
-        size_score = 55
-    elif min_size <= 0:
-        size_score = 70
-    else:
-        size_score = min(100, round(100 * size / min_size))
-
-    districts = _tokens(profile.get("districts"))
-    if not districts:
-        location_score = 70
-    else:
-        location_score = 100 if any(re.search(r"(?<!\w)" + re.escape(d) + r"(?!\w)", text) for d in districts) else 35
-
-    completeness_fields = ("title", "url", "price_total", "price", "rooms", "size", "city", "postal_code", "address", "published_at")
-    known = sum(1 for f in completeness_fields if listing.get(f) not in (None, ""))
-    data_completeness_score = round(100 * known / len(completeness_fields))
-
-    score = round(
-        price_score * 0.35
-        + rooms_score * 0.20
-        + size_score * 0.25
-        + location_score * 0.20
-    )
-
-    reasons = []
-    reasons.append(f"Datenqualität: {data_completeness_score}/100")
-    if price is not None:
-        label = (
-            "Warmmiete (geschätzt aus Kaltmiete)"
-            if price_is_estimate
-            else "Warmmiete"
-        )
-        reasons.append(f"{label}: {price:.0f} €")
-    else:
-        reasons.append("Mietpreis nicht angegeben")
-
-    if rooms is not None:
-        reasons.append(f"{rooms:g} Zimmer")
-    else:
-        reasons.append("Zimmerzahl nicht angegeben")
-
-    if size is not None:
-        reasons.append(f"{size:g} m²")
-    else:
-        reasons.append("Fläche nicht angegeben")
-
-    if min_price and price is not None and price < min_price:
-        reasons.append(f"unter gewünschter Untergrenze {min_price:.0f} €")
-
-    if districts:
-        reasons.append(
-            "Lage passend"
-            if location_score == 100
-            else "Lage nicht eindeutig bestätigt"
-        )
-
-    return (
-        score,
-        (
-            round(price_score * 0.35),
-            round(rooms_score * 0.20),
-            round(size_score * 0.25),
-            round(location_score * 0.20),
-        ),
-        reasons,
-    )

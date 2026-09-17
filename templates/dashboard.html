@@ -4,11 +4,12 @@
 <div class="head"><div><div class="eyebrow">DEIN WOHNUNGSRADAR</div><h1>Treffer</h1></div><div><a href="{{url_for('profiles')}}">Profile verwalten</a> · <a href="{{url_for('diagnose')}}">Technische Diagnose</a></div></div>
 {% with messages=get_flashed_messages() %}{% if messages %}<div class="flash">{% for m in messages %}{{m}}{% endfor %}</div>{% endif %}{% endwith %}
 <div class="status-grid">
-  <div class="stat"><small>APP</small><b>ONLINE</b></div>
+  <div class="stat"><small>APP</small><b>ONLINE</b><em>{{ app_version }}</em></div>
   <div class="stat"><small>DB</small><b>{{'OK' if setup_stats else 'UNAVAILABLE'}}</b></div>
   <div class="stat"><small>SCAN</small><b>{{heartbeat_status|upper}}</b></div>
   <div class="stat"><small>PROFILE</small><b>{{setup_stats.active_profiles if setup_stats else 0}}</b></div>
-  <div class="stat"><small>SCAN-RUNS</small><b>{{setup_stats.scan_runs if setup_stats else 0}}</b></div>
+  <div class="stat"><small>TREFFER</small><b>{{ rows|length }}</b></div>
+  <div class="stat"><small>SCAN-LÄUFE</small><b>{{setup_stats.scan_runs if setup_stats else 0}}</b></div>
 </div>
 <div class="scan-summary {% if heartbeat_status != 'ok' %}source-error{% endif %}">{{heartbeat_message}} <form method="post" action="{{url_for('run_scan')}}" style="display:inline"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button>SCAN STARTEN</button></form></div>
 {% if setup_stats and setup_stats.profiles_with_sources == 0 %}<div class="scan-summary source-error">Noch kein Profil mit Quellen konfiguriert. <a href="{{url_for('profiles')}}">Profil anlegen</a>.</div>{% endif %}

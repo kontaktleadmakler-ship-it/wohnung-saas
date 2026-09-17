@@ -112,7 +112,7 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
             continue
 
         stats["matched"] += 1
-        notification_state = db.save_match(listing_id, pid, None, (), reasons)
+        notification_state = db.save_match(listing_id, pid, reasons)
 
         should_notify = (is_new or stored_listing.get("last_status") in {"UPDATED", "MISSING"})
         if should_notify and not is_new:
