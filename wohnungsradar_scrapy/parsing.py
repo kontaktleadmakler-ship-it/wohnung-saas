@@ -122,12 +122,24 @@ def parse_rooms(text: str):
         if m: return conv(m)
     if re.search(r"(?<![\w])(?:1½|½|1/2)\s*(?:zimmer|zi)\.?\b",s,re.I): return .5
     if re.search(r"(?<![\w])einhalb\s*(?:zimmer|zi)\.?\b",s,re.I): return .5
+    # Structured sources (JSON-LD ``numberOfRooms``, dedicated portal room
+    # fields) hand us a bare number with no "Zimmer" suffix at all. Only
+    # accept that when the *whole* field is just a number - never for the
+    # free-text ``combined`` fallback, where a lone number would almost
+    # certainly be something else (a price, a size, a postal code).
+    m=re.fullmatch(r"\s*(\d+(?:[.,]\d+)?)\s*",s)
+    if m: return parse_number(m.group(1))
     return None
 
 def parse_size(text: str):
     s=clean_text(text) or ""
     m=re.search(r"(?<![\d])(\d{1,4}(?:[.,]\d+)?)\s*(?:m²|m2|qm|m\s*²)\b",s,re.I)
-    return parse_number(m.group(1)) if m else None
+    if m: return parse_number(m.group(1))
+    # Same rationale as parse_rooms: a structured field (e.g. JSON-LD
+    # ``floorSize.value``) can be a bare number with no unit text at all.
+    m=re.fullmatch(r"\s*(\d{1,4}(?:[.,]\d+)?)\s*",s)
+    if m: return parse_number(m.group(1))
+    return None
 
 def parse_location(text: str):
     s=clean_text(text) or ""

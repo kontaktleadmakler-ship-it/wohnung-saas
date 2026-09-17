@@ -24,6 +24,72 @@ BLOCK_PAGE_MARKERS = (
     "automatisierte anfragen",
 )
 
+_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ"
+_LOWER = "abcdefghijklmnopqrstuvwxyzäöü"
+_CI_CSS_PART_RE = re.compile(
+    r"^(?P<tag>[a-zA-Z][a-zA-Z0-9]*)?"
+    r"\[(?P<attr>[a-zA-Z0-9_:-]+)\s*(?P<op>[*^$]?=)\s*'(?P<val>[^']*)'\s*(?P<ci>i)?\s*\]"
+    r"(?:::attr\((?P<pname>[a-zA-Z0-9_-]+)\))?$"
+)
+
+def _ci_css_to_xpath(selector):
+    """Translate a comma-separated list of simple ``tag[attr OP 'val' i]``
+    selectors (optionally with a trailing ``::attr(name)``) into an
+    equivalent XPath expression, or return ``None`` if any part doesn't
+    match that restricted shape.
+
+    This exists because several portal selectors use the CSS Selectors
+    Level 4 case-insensitive attribute flag (``i``) for resilience against
+    markup casing changes, but cssselect/parsel do not implement that flag
+    and raise ``SelectorSyntaxError`` instead of just ignoring it - which
+    previously crashed parsing outright rather than degrading gracefully.
+    """
+    parts = []
+    pnames = set()
+    for raw_part in selector.split(","):
+        m = _CI_CSS_PART_RE.match(raw_part.strip())
+        if not m:
+            return None
+        tag = m.group("tag") or "*"
+        attr, op, val = m.group("attr"), m.group("op"), m.group("val")
+        pnames.add(m.group("pname"))
+        if m.group("ci"):
+            lhs = f"translate(@{attr}, '{_UPPER}', '{_LOWER}')"
+            val = val.lower()
+        else:
+            lhs = f"@{attr}"
+        if op == "=":
+            cond = f"{lhs}='{val}'"
+        elif op == "^=":
+            cond = f"starts-with({lhs}, '{val}')"
+        elif op == "$=":
+            n = max(len(val) - 1, 0)
+            cond = f"substring({lhs}, string-length({lhs}) - {n}) = '{val}'"
+        else:  # '*=' (or bare, which we don't emit) -> substring match
+            cond = f"contains({lhs}, '{val}')"
+        parts.append(f".//{tag}[{cond}]")
+    if len(pnames) > 1:
+        return None  # mixed attr-extraction targets - not used in this codebase
+    pname = next(iter(pnames))
+    if pname:
+        return " | ".join(f"{p}/@{pname}" for p in parts)
+    return " | ".join(parts)
+
+def select(scope, selector):
+    """``scope.css(selector)`` with a fallback for the ``i`` flag.
+
+    Tries the selector as-is first (the fast, common path) and only falls
+    back to an equivalent XPath translation when cssselect actually rejects
+    the selector - so plain selectors behave exactly as before.
+    """
+    try:
+        return scope.css(selector)
+    except Exception:
+        xpath = _ci_css_to_xpath(selector)
+        if xpath is None:
+            raise
+        return scope.xpath(xpath)
+
 class PortalSpider(scrapy.Spider):
     source_key=""
     source_label=""
@@ -326,9 +392,7 @@ class PortalSpider(scrapy.Spider):
         if page_number>=self.max_pages or not cards_continue(card_count,new_count):
             return None
         # Portal subclasses can use real next links or path/query conventions.
-        href=response.css("a[rel='next']::attr(href)").get()
-        if href: return urljoin(response.url,href)
-        href=response.css("a[aria-label*='Weiter' i]::attr(href), a[aria-label*='next' i]::attr(href)").get()
+        href=select(response,",".join(self.pagination_selectors)).get()
         if href: return urljoin(response.url,href)
         return self.build_page_url(response.url,page_number+1)
 
@@ -338,7 +402,7 @@ class PortalSpider(scrapy.Spider):
         # the link-based adaptive extractor as a second pass.
         cards=[]; seen=set()
         for selector in self.card_selectors:
-            for card in response.css(selector):
+            for card in select(response,selector):
                 raw=self.extract_card(card,response.url)
                 href=raw.get("href")
                 if href:
@@ -372,7 +436,7 @@ class PortalSpider(scrapy.Spider):
     def first_text(node,selectors):
         for selector in selectors:
             try:
-                value=node.css(selector).xpath("string(.)").get()
+                value=select(node,selector).xpath("string(.)").get()
                 if value and clean_text(value): return clean_text(value)
             except Exception:
                 continue
