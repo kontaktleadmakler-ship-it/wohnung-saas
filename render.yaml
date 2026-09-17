@@ -156,3 +156,5 @@ services:
         value: "60"
       - key: SCAN_RETENTION_DAYS
         value: "90"
+
+# Wohnungsradar: set ENABLE_AUTO_SCAN=false only for manual-scan deployments.

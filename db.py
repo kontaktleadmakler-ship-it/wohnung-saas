@@ -290,7 +290,7 @@ def get_auto_scan_enabled(default=None):
     if doc and "auto_scan_enabled" in doc:
         return bool(doc["auto_scan_enabled"])
     if default is None:
-        default = os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
+        default = os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}
     _db().scan_state.update_one(
         {"_id": "settings"},
         {"$setOnInsert": {"auto_scan_enabled": bool(default), "updated_at": _now()}},

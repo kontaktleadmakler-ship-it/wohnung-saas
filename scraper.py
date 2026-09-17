@@ -484,7 +484,7 @@ def run_once_and_heartbeat(profile_id=None):
         # every manual full scan to exit successfully without scraping.
         scan_trigger = os.getenv("SCAN_TRIGGER", "manual").strip().lower()
         if profile_id is None and scan_trigger == "cron":
-            if not db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}):
+            if not db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}):
                 log.info("SCRAPER: automatic scan is paused; cron cycle skipped")
                 db.record_worker_heartbeat(duration_seconds=0, pid=os.getpid(), poll_interval_seconds=POLL_INTERVAL_SECONDS)
                 return {"jobs": 0, "listings": 0, "paused": True}

@@ -7,6 +7,7 @@ from scrapy import signals
 from scrapy_playwright.page import PageMethod
 from ..items import ApartmentItem
 from ..parsing import node_text, clean_text, canonical_url, external_id_from_url, parse_rents, parse_rooms, parse_size, parse_location, parse_number, jsonld_objects, jsonld_to_raw, parse_rent_details, validate_listing_dict
+from .scan_diagnostics import classify_http_status, result_is_valid
 
 # Text markers that indicate a bot-check/interstitial page rather than a
 # genuine "0 results" search page. Kept case-insensitive and portal-agnostic
@@ -353,6 +354,11 @@ class PortalSpider(scrapy.Spider):
         return any(marker in body for marker in BLOCK_PAGE_MARKERS)
 
     def parse(self,response):
+        status = getattr(response, "status", None)
+        self.logger.info("[SCAN-DEBUG][%s] HTTP_STATUS=%s CLASS=%s", self.name, status, classify_http_status(status))
+        if not result_is_valid(status):
+            self.logger.warning("[SCAN-DEBUG][%s] RESULT_PAGE_INVALID status=%s - not treating as genuine zero-result page", self.name, status)
+            return
         self.pages_seen += 1
         page_number=int(response.meta.get("page_number",1))
         cards=self.parse_listing_cards(response)

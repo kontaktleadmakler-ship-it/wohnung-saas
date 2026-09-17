@@ -301,7 +301,7 @@ def _background_scanner():
             continue
 
         try:
-            auto_enabled = db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"})
+            auto_enabled = db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"})
         except Exception:
             auto_enabled = True
             log.warning("AUTO-SCAN: shared state unavailable; keeping scheduler alive")
@@ -357,7 +357,7 @@ def _maybe_start_background_scanner():
     the HTTP port. The scanner retries database initialization in its own
     background thread once MongoDB becomes reachable again.
     """
-    env_enabled = os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
+    env_enabled = os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}
     try:
         enabled = db.get_auto_scan_enabled(default=env_enabled)
     except Exception:
@@ -639,7 +639,7 @@ def scan_diagnostics():
                 ),
             },
             "config":{"app_version": APP_VERSION, "log_level":os.getenv("LOG_LEVEL","INFO"),"scan_debug":os.getenv("SCAN_DEBUG","true"),
-                      "auto_scan_enabled": db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN","false").lower() in {"1","true","yes","on"}),
+                      "auto_scan_enabled": db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "true").lower() in {"1","true","yes","on"}),
                       "scrape_max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3")),
                       "scrape_wait_ms":int(os.getenv("SCRAPE_WAIT_MS","1800")),
                       "wg_gesucht_nav_timeout_ms":int(os.getenv("WG_GESUCHT_NAV_TIMEOUT_MS","10000")),
