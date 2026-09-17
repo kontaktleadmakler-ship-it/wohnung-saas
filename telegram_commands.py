@@ -1,6 +1,7 @@
 from __future__ import annotations
 import hmac, os, threading
 from flask import request, jsonify
+from flask_wtf.csrf import csrf
 import db
 
 COMMANDS={"/help","/status","/scan","/profiles","/matches","/errors","/sources","/pause","/resume"}
@@ -12,6 +13,7 @@ def _authorized(chat_id):
 def register(app, scan_callback):
     secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
     @app.post("/telegram/webhook")
+    @csrf.exempt
     def telegram_webhook():
         if secret:
             supplied=request.headers.get("X-Telegram-Bot-Api-Secret-Token","")
@@ -29,6 +31,8 @@ def register(app, scan_callback):
         if text=="/matches": return jsonify({"ok":True,"matches":db.get_dashboard_rows(0,None,20)})
         if text=="/sources": return jsonify({"ok":True,"sources":db.get_source_health()})
         if text=="/errors": return jsonify({"ok":True,"errors":[x for x in db.get_recent_scan_runs(10) if (x.get("summary") or {}).get("source_errors")]})
-        if text=="/pause": os.environ["ENABLE_AUTO_SCAN"]="false"
-        if text=="/resume": os.environ["ENABLE_AUTO_SCAN"]="true"
+        if text=="/pause":
+            db.set_auto_scan_enabled(False, source="telegram")
+        if text=="/resume":
+            db.set_auto_scan_enabled(True, source="telegram")
         return jsonify({"ok":True,"command":text})

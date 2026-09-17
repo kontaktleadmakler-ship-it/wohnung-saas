@@ -475,6 +475,13 @@ def run_once_and_heartbeat(profile_id=None):
     try:
         db.init_db()
         log.info("SCRAPER: DB initialized")
+        # The Render cron service is stateless. Respect the shared MongoDB
+        # pause/resume switch so Telegram /pause also stops future cron scans.
+        if profile_id is None and os.getenv("SCAN_TRIGGER", "cron") == "cron":
+            if not db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}):
+                log.info("SCRAPER: automatic scan is paused; cron cycle skipped")
+                db.record_worker_heartbeat(duration_seconds=0, pid=os.getpid(), poll_interval_seconds=POLL_INTERVAL_SECONDS)
+                return {"jobs": 0, "listings": 0, "paused": True}
         try:
             db.cleanup_scan_runs()
             deleted = db.cleanup_old_listings(days=int(os.getenv("LISTING_RETENTION_DAYS", "60")))

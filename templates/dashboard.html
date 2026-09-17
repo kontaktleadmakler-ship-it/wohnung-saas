@@ -1,7 +1,38 @@
 {% extends 'base.html' %}
-{% block title %}WohnungsRadar — Treffer{% endblock %}
+{% block title %}WohnungsRadar — Treffer<div id="live-status" class="scan-summary" aria-live="polite">Live-Status wird geladen …</div>
+<script>
+(async function () {
+  const box = document.getElementById('live-status');
+  async function refresh() {
+    try {
+      const r = await fetch('{{ url_for("api_status") }}', {cache: 'no-store', credentials: 'same-origin'});
+      if (r.status === 401 || r.status === 403) return;
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'Statusfehler');
+      const scan = data.current_scan || {};
+      const progress = scan.progress || {};
+      const jobs = Number(progress.jobs_total || 0);
+      const done = Number(progress.jobs_completed || 0);
+      const state = scan.status || 'idle';
+      const paused = data.config && data.config.auto_scan === false;
+      const sourceCount = Array.isArray(data.source_health) ? data.source_health.length : 0;
+      box.textContent = 'Live: Scan=' + state.toUpperCase() +
+        ' · Jobs ' + done + '/' + jobs +
+        ' · Quellen ' + sourceCount +
+        (paused ? ' · AUTO-SCAN PAUSIERT' : '');
+      box.classList.toggle('source-error', state === 'failed' || state === 'timeout');
+    } catch (e) {
+      box.textContent = 'Live-Status momentan nicht verfügbar.';
+      box.classList.add('source-error');
+    }
+  }
+  await refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
+{% endblock %}
 {% block content %}
-<div class="head"><div><div class="eyebrow">DEIN WOHNUNGSRADAR</div><h1>Treffer</h1></div><div><a href="{{url_for('profiles')}}">Profile verwalten</a> · <a href="{{url_for('diagnose')}}">Technische Diagnose</a></div></div>
+<div class="head"><div><div class="eyebrow">DEIN WOHNUNGSRADAR</div><h1>Treffer</h1></div><div><a href="{{url_for('profiles')}}">Profile verwalten</a> · <a href="{{url_for('diagnose')}}">Technische Diagnose</a> · <form method="post" action="{{url_for('logout')}}" style="display:inline"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button type="submit">ABMELDEN</button></form></div></div>
 {% with messages=get_flashed_messages() %}{% if messages %}<div class="flash">{% for m in messages %}{{m}}{% endfor %}</div>{% endif %}{% endwith %}
 <div class="status-grid">
   <div class="stat"><small>APP</small><b>ONLINE</b><em>{{ app_version }}</em></div>
@@ -28,4 +59,35 @@
 </article>
 {% else %}<div class="empty">Keine passenden Wohnungen gefunden. Prüfe dein Profil oder starte einen Scan.</div>{% endfor %}
 </section>
+<div id="live-status" class="scan-summary" aria-live="polite">Live-Status wird geladen …</div>
+<script>
+(async function () {
+  const box = document.getElementById('live-status');
+  async function refresh() {
+    try {
+      const r = await fetch('{{ url_for("api_status") }}', {cache: 'no-store', credentials: 'same-origin'});
+      if (r.status === 401 || r.status === 403) return;
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'Statusfehler');
+      const scan = data.current_scan || {};
+      const progress = scan.progress || {};
+      const jobs = Number(progress.jobs_total || 0);
+      const done = Number(progress.jobs_completed || 0);
+      const state = scan.status || 'idle';
+      const paused = data.config && data.config.auto_scan === false;
+      const sourceCount = Array.isArray(data.source_health) ? data.source_health.length : 0;
+      box.textContent = 'Live: Scan=' + state.toUpperCase() +
+        ' · Jobs ' + done + '/' + jobs +
+        ' · Quellen ' + sourceCount +
+        (paused ? ' · AUTO-SCAN PAUSIERT' : '');
+      box.classList.toggle('source-error', state === 'failed' || state === 'timeout');
+    } catch (e) {
+      box.textContent = 'Live-Status momentan nicht verfügbar.';
+      box.classList.add('source-error');
+    }
+  }
+  await refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
 {% endblock %}

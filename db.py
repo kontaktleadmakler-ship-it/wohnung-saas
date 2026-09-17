@@ -279,6 +279,37 @@ def clear_current_scan(run_id, *, status="finished", exit_code=0, error=None):
     )
     return result.matched_count == 1
 
+def get_auto_scan_enabled(default=None):
+    """Read the shared auto-scan switch from MongoDB.
+
+    The value is shared by the Render web and cron services, so Telegram
+    pause/resume survives restarts and applies to the cron service as well.
+    ``default`` is used only when the state document does not exist yet.
+    """
+    doc = _db().scan_state.find_one({"_id": "settings"}, {"auto_scan_enabled": 1})
+    if doc and "auto_scan_enabled" in doc:
+        return bool(doc["auto_scan_enabled"])
+    if default is None:
+        default = os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
+    _db().scan_state.update_one(
+        {"_id": "settings"},
+        {"$setOnInsert": {"auto_scan_enabled": bool(default), "updated_at": _now()}},
+        upsert=True,
+    )
+    return bool(default)
+
+
+def set_auto_scan_enabled(enabled, source="unknown"):
+    """Persist the shared automatic-scan switch."""
+    value = bool(enabled)
+    _db().scan_state.update_one(
+        {"_id": "settings"},
+        {"$set": {"auto_scan_enabled": value, "updated_at": _now(), "updated_by": str(source)}},
+        upsert=True,
+    )
+    return value
+
+
 def get_setup_stats():
     d = _db()
     active = d.profiles.count_documents({"active": True})

@@ -98,3 +98,12 @@ Offline-Tests benötigen die in `requirements.txt` definierten Abhängigkeiten. 
 - Immonet is disabled (`AVAILABLE=False`) because its current search surface redirects to Immowelt and is not a stable scrape target in the current environment.
 - meinestadt.de is disabled (`AVAILABLE=False`) because the current property search is disallowed by robots.txt; the scraper does not bypass that restriction.
 - The JSONL feed pipeline is compatible with Scrapy 2.19's pipeline signatures, eliminating the old `open_spider`/`process_item` deprecation path.
+
+
+## Production controls
+
+- The dashboard can be protected with the required production `DASHBOARD_PASSWORD`.
+- Telegram `/pause` and `/resume` persist in MongoDB and therefore apply across Render web/cron restarts.
+- The dashboard polls `/api/status` every 5 seconds for live scan progress.
+- `/healthz` is liveness-only; `/readyz` validates production configuration and MongoDB readiness.
+- Run `python selftest.py --runtime` inside the built container to validate installed runtime dependencies and Flask route registration.

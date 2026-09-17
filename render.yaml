@@ -14,6 +14,8 @@ services:
         value: wohnung_saas
       - key: SECRET_KEY
         sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
@@ -112,6 +114,8 @@ services:
         value: "true"
       - key: POLL_INTERVAL_SECONDS
         value: "600"
+      - key: SCAN_TRIGGER
+        value: "cron"
       - key: APP_VERSION
         value: "wohnungsradar-v18"
       - key: LOG_LEVEL
