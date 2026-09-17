@@ -7,7 +7,8 @@ from types import SimpleNamespace
 
 from scrapy.http import Request
 from wohnungsradar_scrapy.runner import _failure_class
-from wohnungsradar_scrapy.spiders.portals import KleinanzeigenSpider
+from wohnungsradar_scrapy.spiders.portals import KleinanzeigenSpider, HousingAnywhereSpider
+from wohnungsradar_scrapy.spiders.base import ScanRequestTelemetryMiddleware
 from wohnungsradar_scrapy.pipelines import JobFeedPipeline
 from wohnungsradar_scrapy.adapters import ADAPTERS
 
@@ -30,6 +31,23 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(requests[0].url, "https://example.test/search")
         self.assertEqual(spider._start_entered, True)
         self.assertEqual(spider._start_yielded, 1)
+
+    def test_playwright_uses_commit_as_default_load_state(self):
+        spider = HousingAnywhereSpider(start_urls=["https://example.test/s/Berlin--Germany"], job_id="ha")
+        request = next(spider.start())
+        self.assertEqual(request.meta["playwright_page_goto_kwargs"]["wait_until"], "commit")
+
+    def test_playwright_failure_is_counted(self):
+        spider = HousingAnywhereSpider(start_urls=[], job_id="ha")
+        spider._playwright_failures = 1
+        self.assertEqual(spider._playwright_failures, 1)
+
+    def test_request_sent_middleware_records_dispatch(self):
+        spider = KleinanzeigenSpider(start_urls=[], job_id="x")
+        middleware = ScanRequestTelemetryMiddleware()
+        request = Request("https://example.test/")
+        middleware.process_request(request, spider)
+        self.assertEqual(spider._requests_sent, 1)
 
     def test_no_urls_is_no_start_urls(self):
         debug = {"start_url_count": 0}

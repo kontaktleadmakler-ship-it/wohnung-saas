@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hmac
 import logging
 import os
 import secrets
@@ -11,7 +10,7 @@ import uuid
 from functools import wraps
 from config import settings
 
-from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_wtf.csrf import CSRFProtect
 
 from logging_setup import configure_logging
@@ -25,7 +24,7 @@ from scrapers.registry import list_sources, get_scraper
 from scrapers.regions import BUNDESLAENDER
 from scrapers.models import SearchParams
 
-APP_VERSION = os.getenv("APP_VERSION", "wohnungsradar-v15")
+APP_VERSION = os.getenv("APP_VERSION", "wohnungsradar-v17")
 
 app = Flask(__name__)
 
@@ -36,30 +35,10 @@ IS_RENDER = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
 APP_ENV = os.getenv("APP_ENV", "production" if IS_RENDER else "development").strip().lower()
 IS_PRODUCTION = APP_ENV in {"production", "prod"}
 
-APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
-SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
-
-if not SECRET_KEY:
-    # A generated key is safe for boot/liveness, but sessions are intentionally
-    # ephemeral until a persistent SECRET_KEY is configured.
-    SECRET_KEY = secrets.token_urlsafe(48)
-    logging.getLogger("web").warning(
-        "SECRET_KEY fehlt; es wurde ein temporärer Prozess-Key erzeugt. "
-        "Für persistente Sessions SECRET_KEY in Render setzen."
-    )
-
-# Password protection is enabled only when a password exists. This keeps a
-# misconfigured deployment reachable instead of causing a Gunicorn boot loop.
-# APP_AUTH_REQUIRED=true can explicitly require authentication; in that mode a
-# missing APP_PASSWORD is reported as a configuration warning and access stays
-# disabled rather than accepting an empty password.
-APP_AUTH_REQUIRED = os.getenv("APP_AUTH_REQUIRED", "true" if APP_PASSWORD else "false").strip().lower() in {"1", "true", "yes", "on"}
-if IS_PRODUCTION and not APP_PASSWORD:
-    logging.getLogger("web").warning(
-        "APP_PASSWORD fehlt: Web-Authentifizierung ist deaktiviert. "
-        "Für einen geschützten Produktionsbetrieb APP_PASSWORD setzen."
-    )
-
+# Das Dashboard ist bewusst öffentlich erreichbar. Es enthält keine
+# Zugangsschranke; sensible Betriebsgeheimnisse werden weiterhin ausschließlich
+# über Render-Environment-Variablen verwaltet.
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip() or secrets.token_urlsafe(48)
 app.secret_key = SECRET_KEY
 app.config.update(
     SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "true" if IS_PRODUCTION else "false").lower() in {"1","true","yes","on"},
@@ -390,10 +369,9 @@ def _heartbeat_status():
 
 
 def auth(view):
+    """Compatibility decorator; the dashboard has no application password."""
     @wraps(view)
     def wrapper(*a, **kw):
-        if APP_AUTH_REQUIRED and APP_PASSWORD and not session.get("logged_in"):
-            return redirect(url_for("login", next=request.path))
         return view(*a, **kw)
     return wrapper
 
@@ -430,36 +408,17 @@ register_telegram_commands(app, _telegram_scan_callback)
 # Start in Gunicorn as well as `python app.py`/`python main.py`.
 _maybe_start_background_scanner()
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        if APP_PASSWORD and hmac.compare_digest(request.form.get("password", ""), APP_PASSWORD):
-            session["logged_in"] = True
-            return redirect(request.args.get("next") or url_for("home"))
-        return render_template("login.html", error="Falsches Passwort")
-    return render_template("login.html", error=None)
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
 @app.route("/")
 @auth
 def home():
-    try:
-        min_score = int(request.args.get("min_score", 0))
-    except (TypeError, ValueError):
-        min_score = 0
+    min_score = 0
     try:
         raw_profile_id = request.args.get("profile_id")
         profile_id = int(raw_profile_id) if raw_profile_id else None
     except (TypeError, ValueError):
         profile_id = None
     try:
-        rows = db.get_dashboard_rows(min_score, profile_id)
+        rows = db.get_dashboard_rows(0, profile_id)
     except Exception:
         rows = []
         flash("Datenbank konnte nicht gelesen werden.")
@@ -804,7 +763,7 @@ def api_status():
         health=db.get_source_health()
         return jsonify({"ok":True,"database":"ok","current_scan":current,"last_scan":last,"source_health":health,
                         "profiles":db.get_setup_stats(),"config":{"auto_scan":settings.enable_auto_scan,"poll_interval_seconds":settings.poll_interval_seconds,
-                        "max_pages":settings.max_pages,"min_notify_score":settings.min_notify_score}})
+                        "max_pages":settings.max_pages}})
     except Exception as exc:
         return jsonify({"ok":False,"error":type(exc).__name__}),503
 

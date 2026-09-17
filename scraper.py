@@ -8,7 +8,7 @@ from collections import defaultdict
 
 import db
 from logging_setup import configure_logging
-from matching import listing_fingerprint, score_listing
+from matching import listing_fingerprint, match_listing
 from telegram import send_telegram, format_match_message
 from email_notifier import send_email, format_match_email, is_configured as email_configured
 from scrapers.registry import get_scraper
@@ -20,12 +20,8 @@ configure_logging()
 log = logging.getLogger("worker")
 
 POLL_INTERVAL_SECONDS = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
-# Beeinflusst nur, ob eine Telegram-Benachrichtigung verschickt wird - nicht,
-# ob ein Match in der DB gespeichert wird. Ein Match mit Score < MIN_NOTIFY_SCORE
-# landet trotzdem in `matches` und erscheint im Dashboard (Default min_score=0
-# dort zeigt alle). "Keine Treffer" im Dashboard trotz gesetzter MIN_NOTIFY_SCORE
-# deutet daher eher auf einen leeren Scan als auf diese Schwelle hin.
-MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
+# Benachrichtigungen werden für jedes Listing verschickt, das die expliziten
+# Profilkriterien erfüllt. Es gibt keine zusätzliche Score-Schwelle.
 # Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
 # aus einem Portal auf einmal in Playwright/Python weiterreichen.
 MAX_CANDIDATES_PER_SOURCE = max(0, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "0")))
@@ -109,25 +105,23 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
 
         profile = profiles_by_id[pid]
         payload = dict(item.__dict__)
-        result = score_listing(payload, profile)
-        if result is None:
+        reasons = match_listing(payload, profile)
+        if reasons is None:
             reason = payload.get("_exclude_reason", "other")
             stats["excluded"][reason] += 1
             continue
 
         stats["matched"] += 1
-        score, components, reasons = result
-        notification_state = db.save_match(listing_id, pid, score, components, reasons)
+        notification_state = db.save_match(listing_id, pid, None, (), reasons)
 
-        should_notify = (is_new or notification_state.get("score_improved") or stored_listing.get("last_status") in {"UPDATED", "MISSING"})
+        should_notify = (is_new or stored_listing.get("last_status") in {"UPDATED", "MISSING"})
         if should_notify and not is_new:
             db.reset_match_notifications(listing_id, pid)
             notification_state["telegram_notified"] = False
             notification_state["email_notified"] = False
-        if score >= MIN_NOTIFY_SCORE and (should_notify or not notification_state.get("notified")):
+        if should_notify or not notification_state.get("notified"):
             msg = format_match_message(
                 profile["name"],
-                score,
                 item.title,
                 item.price_total or item.price,
                 item.rooms,
@@ -147,7 +141,7 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
 
             if email_configured() and not notification_state.get("email_notified"):
                 subject, text, html_body = format_match_email(
-                    profile["name"], score, item.title,
+                    profile["name"], item.title,
                     item.price_total or item.price, item.rooms,
                     item.size, item.address, item.url, item.source,
                     price_total=item.price_total,
@@ -419,16 +413,15 @@ def run_once(profile_id=None):
 
 def worker_loop():
     log.info(
-        "Konfiguration: MONGODB_URI=%s, TELEGRAM=%s, POLL=%ss, MIN_NOTIFY_SCORE=%s",
+        "Konfiguration: MONGODB_URI=%s, TELEGRAM=%s, EMAIL=%s, POLL=%ss",
         "gesetzt" if os.getenv("MONGODB_URI") else "FEHLT",
         "gesetzt" if os.getenv("TELEGRAM_BOT_TOKEN") else "nicht gesetzt",
         "gesetzt" if email_configured() else "nicht gesetzt",
-        POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
+        POLL_INTERVAL_SECONDS,
     )
     log.info(
-        "Worker gestartet (pid=%s): poll_interval=%ss, min_notify_score=%s, log_level=%s",
-        os.getpid(), POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
-        os.getenv("LOG_LEVEL", "INFO"),
+        "Worker gestartet (pid=%s): poll_interval=%ss, log_level=%s",
+        os.getpid(), POLL_INTERVAL_SECONDS, os.getenv("LOG_LEVEL", "INFO"),
     )
     db.init_db()
     db.cleanup_scan_runs()

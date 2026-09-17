@@ -1,7 +1,7 @@
 {% extends 'base.html' %}
-{% block title %}Dashboard — WohnungsRadar{% endblock %}
+{% block title %}WohnungsRadar — Treffer{% endblock %}
 {% block content %}
-<div class="head"><div><div class="eyebrow">PRODUCTION MONITOR</div><h1>WohnungsRadar</h1></div><div><a href="{{url_for('diagnose')}}">Diagnose</a> · <a href="{{url_for('profiles')}}">Profile</a></div></div>
+<div class="head"><div><div class="eyebrow">DEIN WOHNUNGSRADAR</div><h1>Treffer</h1></div><div><a href="{{url_for('profiles')}}">Profile verwalten</a> · <a href="{{url_for('diagnose')}}">Technische Diagnose</a></div></div>
 {% with messages=get_flashed_messages() %}{% if messages %}<div class="flash">{% for m in messages %}{{m}}{% endfor %}</div>{% endif %}{% endwith %}
 <div class="status-grid">
   <div class="stat"><small>APP</small><b>ONLINE</b></div>
@@ -10,27 +10,21 @@
   <div class="stat"><small>PROFILE</small><b>{{setup_stats.active_profiles if setup_stats else 0}}</b></div>
   <div class="stat"><small>SCAN-RUNS</small><b>{{setup_stats.scan_runs if setup_stats else 0}}</b></div>
 </div>
-<div class="scan-summary {% if heartbeat_status != 'ok' %}source-error{% endif %}">{{heartbeat_message}}
-<form method="post" action="{{url_for('run_scan')}}" style="display:inline"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button>SCAN STARTEN</button></form>
-</div>
+<div class="scan-summary {% if heartbeat_status != 'ok' %}source-error{% endif %}">{{heartbeat_message}} <form method="post" action="{{url_for('run_scan')}}" style="display:inline"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button>SCAN STARTEN</button></form></div>
 {% if setup_stats and setup_stats.profiles_with_sources == 0 %}<div class="scan-summary source-error">Noch kein Profil mit Quellen konfiguriert. <a href="{{url_for('profiles')}}">Profil anlegen</a>.</div>{% endif %}
 {% if last_scan %}
-<div class="scan-summary">
-<b>Letzter Scan:</b> {{last_scan.started_at.strftime('%d.%m.%Y %H:%M')}} · {{last_scan.summary.scraped_total or 0}} Kandidaten · {{last_scan.summary.unique_total or 0}} eindeutig · {{last_scan.summary.scan_status or 'finished'}}
-{% if last_scan.summary.source_errors %}<div class="source-error">Fehler: {{last_scan.summary.source_errors|join(', ')}}</div>{% endif %}
-{% if last_scan.summary.source_empty %}<div>Valide leere Quellen: {{last_scan.summary.source_empty|join(', ')}}</div>{% endif %}
-</div>
+<div class="scan-summary"><b>Letzter Scan:</b> {{last_scan.started_at.strftime('%d.%m.%Y %H:%M')}} · {{last_scan.summary.scraped_total or 0}} Kandidaten · {{last_scan.summary.unique_total or 0}} eindeutig · <b>{{last_scan.summary.scan_status or 'finished'}}</b>{% if last_scan.summary.source_errors %}<div class="source-error">Probleme: {{last_scan.summary.source_errors|join(', ')}}</div>{% endif %}{% if last_scan.summary.source_empty %}<div>Valide leere Quellen: {{last_scan.summary.source_empty|join(', ')}}</div>{% endif %}</div>
 {% endif %}
-<form class="filters"><select name="profile_id" onchange="this.form.submit()"><option value="">Alle Profile</option>{% for p in profiles %}<option value="{{p.id}}" {% if selected_profile|string==p.id|string %}selected{% endif %}>{{p.name}}</option>{% endfor %}</select><input name="min_score" type="number" min="0" max="100" value="{{min_score}}" onchange="this.form.submit()"><span>Mindest-Score</span></form>
+<form class="filters"><label>Profil <select name="profile_id" onchange="this.form.submit()"><option value="">Alle Profile</option>{% for p in profiles %}<option value="{{p.id}}" {% if selected_profile|string==p.id|string %}selected{% endif %}>{{p.name}}</option>{% endfor %}</select></label><span>Es werden nur Listings angezeigt, die die Kriterien des gewählten Profils als Treffer erfüllen.</span></form>
 <section class="grid">
 {% for r in rows %}
 <article class="listing">
-  <div class="score">{{r.score}}<small>/100</small></div>
+  <div class="match-badge">✓<small>PASSEND</small></div>
   <div><div class="source">{{r.source}} · {{r.profile_name}} · {{r.status or 'ACTIVE'}}</div><h2><a href="{{r.url}}" target="_blank" rel="noopener noreferrer">{{r.title}}</a></h2><p>{{r.location or 'Lage nicht angegeben'}}</p></div>
-  <dl><div><dt>WARMMIETE</dt><dd>{{r.warm_rent|int if r.warm_rent is not none else '–'}}{% if r.warm_rent is not none %} €{% endif %}</dd></div><div><dt>KALTMIETE</dt><dd>{{r.cold_rent|int if r.cold_rent is not none else '–'}}{% if r.cold_rent is not none %} €{% endif %}</dd></div><div><dt>ZI.</dt><dd>{{r.rooms or '–'}}</dd></div><div><dt>M²</dt><dd>{{r.size or '–'}}</dd></div><div><dt>DATEN</dt><dd>{{r.data_completeness_score or 0}}%</dd></div></dl>
+  <dl><div><dt>WARMMIETE</dt><dd>{{r.warm_rent|int if r.warm_rent is not none else '–'}}{% if r.warm_rent is not none %} €{% endif %}</dd></div><div><dt>KALTMIETE</dt><dd>{{r.cold_rent|int if r.cold_rent is not none else '–'}}{% if r.cold_rent is not none %} €{% endif %}</dd></div><div><dt>ZI.</dt><dd>{{r.rooms or '–'}}</dd></div><div><dt>M²</dt><dd>{{r.size or '–'}}</dd></div></dl>
   {% if r.reasons %}<ul class="reasons">{% for reason in r.reasons %}<li>{{reason}}</li>{% endfor %}</ul>{% endif %}
   <small>first seen: {{r.first_seen}} · last seen: {{r.last_seen}}{% if r.last_changed %} · geändert: {{r.last_changed}}{% endif %}</small>
 </article>
-{% else %}<div class="empty">Keine Treffer mit diesen Filtern.</div>{% endfor %}
+{% else %}<div class="empty">Keine passenden Wohnungen gefunden. Prüfe dein Profil oder starte einen Scan.</div>{% endfor %}
 </section>
 {% endblock %}

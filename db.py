@@ -454,24 +454,22 @@ def update_source_health(source, *, status, result_count=0, error=None, duration
 def get_source_health():
     return list(_db().source_health.find({}, {"_id":0}).sort("source", ASCENDING))
 
-def save_match(listing_id, profile_id, score, components, reasons):
-    price_score, rooms_score, size_score, location_score = components
+def save_match(listing_id, profile_id, score=None, components=(), reasons=None):
+    """Persist a deterministic profile match.
+
+    ``score`` and ``components`` are retained only for compatibility with old
+    documents/callers; new matches no longer calculate or depend on them.
+    """
     now = _now()
     d = _db()
     previous = d.matches.find_one({"listing_id": listing_id, "profile_id": profile_id}) or {}
-    previous_score = previous.get("score")
     update_fields = {
-        "score": score,
-        "price_score": price_score,
-        "rooms_score": rooms_score,
-        "size_score": size_score,
-        "location_score": location_score,
-        "reasons": reasons,
+        "match_status": "MATCH",
+        "reasons": list(reasons or []),
         "updated_at": now,
     }
-    # One atomic operation avoids the find-then-insert race when two workers
-    # process the same listing/profile concurrently. Existing notification
-    # flags are preserved.
+    if score is not None:
+        update_fields["legacy_score"] = score
     doc = d.matches.find_one_and_update(
         {"listing_id": listing_id, "profile_id": profile_id},
         {
@@ -492,8 +490,8 @@ def save_match(listing_id, profile_id, score, components, reasons):
         "notified": doc.get("notified", False),
         "telegram_notified": doc.get("telegram_notified", False),
         "email_notified": doc.get("email_notified", False),
-        "previous_score": previous_score,
-        "score_improved": previous_score is not None and score >= previous_score + 10,
+        "previous_score": previous.get("legacy_score", previous.get("score")),
+        "score_improved": False,
     }
 
 
@@ -571,15 +569,21 @@ DASHBOARD_LIMIT = max(1, int(os.getenv("DASHBOARD_LIMIT", "300")))
 
 
 def get_dashboard_rows(min_score=0, profile_id=None, limit=None):
+    """Return profile matches without exposing/ranking by an artificial score.
+
+    ``min_score`` remains as a backwards-compatible argument for older callers,
+    but it is deliberately ignored. The profile itself is the matching rule;
+    dashboard ordering is by newest match/listing instead of score.
+    """
     limit = DASHBOARD_LIMIT if limit is None else max(1, int(limit))
     d = _db()
-    match_filter = {"score": {"$gte": min_score}}
+    match_filter = {}
     if profile_id:
         match_filter["profile_id"] = profile_id
 
     pipeline = [
         {"$match": match_filter},
-        {"$sort": {"score": DESCENDING, "created_at": DESCENDING}},
+        {"$sort": {"created_at": DESCENDING, "updated_at": DESCENDING}},
         {"$limit": limit},
         {"$lookup": {
             "from": "listings", "localField": "listing_id",
@@ -599,12 +603,8 @@ def get_dashboard_rows(min_score=0, profile_id=None, limit=None):
         rows.append({
             "listing_id": doc["listing_id"],
             "profile_id": doc["profile_id"],
-            "score": doc.get("score"),
-            "price_score": doc.get("price_score"),
-            "rooms_score": doc.get("rooms_score"),
-            "size_score": doc.get("size_score"),
-            "location_score": doc.get("location_score"),
-            "reasons": doc.get("reasons"),
+            "match_status": doc.get("match_status", "MATCH"),
+            "reasons": doc.get("reasons") or [],
             "notified": doc.get("notified"),
             "telegram_notified": doc.get("telegram_notified"),
             "email_notified": doc.get("email_notified"),

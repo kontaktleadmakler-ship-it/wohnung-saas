@@ -91,6 +91,19 @@ def select(scope, selector):
             raise
         return scope.xpath(xpath)
 
+class ScanRequestTelemetryMiddleware:
+    """Record the point at which Scrapy hands a request to the downloader."""
+    def process_request(self, request, spider):
+        if hasattr(spider, "_requests_sent"):
+            spider._requests_sent += 1
+            spider.logger.info(
+                "[SCAN-DEBUG][%s] REQUEST_SENT job_id=%s url=%s",
+                getattr(spider, "source_key", spider.name),
+                getattr(spider, "job_id", None), request.url,
+            )
+        return None
+
+
 class PortalSpider(scrapy.Spider):
     source_key=""
     source_label=""
@@ -99,7 +112,10 @@ class PortalSpider(scrapy.Spider):
     # Portal-specific Playwright navigation tuning. A few portals keep
     # long-lived requests open; subclasses can use ``commit`` so navigation
     # itself does not hold the crawl hostage while the page is already usable.
-    playwright_wait_until="domcontentloaded"
+    # ``commit`` is sufficient for crawler parsing and avoids waiting for
+    # client-side pages whose DOM is usable while secondary resources remain
+    # open. Portal-specific spiders may override this when needed.
+    playwright_wait_until="commit"
     playwright_nav_timeout_env="SCRAPE_NAV_TIMEOUT_MS"
     playwright_wait_ms_env="SCRAPE_WAIT_MS"
     max_pages_env="SCRAPE_MAX_PAGES"
@@ -139,6 +155,8 @@ class PortalSpider(scrapy.Spider):
         self._responses_5xx = 0
         self._spider_errors = 0
         self._downloader_exceptions = 0
+        self._requests_sent = 0
+        self._playwright_failures = 0
         self._http_statuses = {}
         self._error_messages = []
         self._runner_error = None
@@ -187,6 +205,13 @@ class PortalSpider(scrapy.Spider):
             return
         self._requests_scheduled += 1
         self.logger.info("[SCAN-DEBUG][%s] REQUEST_SCHEDULED job_id=%s url=%s",
+                         self.source_key, self.job_id, request.url)
+
+    def _on_request_sent(self, request, spider):
+        if spider is not self:
+            return
+        self._requests_sent += 1
+        self.logger.info("[SCAN-DEBUG][%s] REQUEST_SENT job_id=%s url=%s",
                          self.source_key, self.job_id, request.url)
 
     def _on_request_dropped(self, request, spider):
@@ -551,16 +576,22 @@ class PortalSpider(scrapy.Spider):
                 self.source_key, self.job_id, getattr(request, "url", None), msg,
             )
             return
-        if "playwright" in msg.casefold() or "timeout" in msg.casefold() and self.use_playwright:
+        if ("playwright" in msg.casefold() or "timeout" in msg.casefold()) and self.use_playwright:
             # A navigation/render timeout is a Playwright failure, not a
-            # generic downloader failure. The page may have emitted lifecycle
-            # events before the errback, but the request itself did not yield a
-            # usable response.
+            # generic downloader failure. Once a later pagination request has
+            # failed, there is no reason to keep the spider alive until
+            # CLOSESPIDER_TIMEOUT: page 1 may already contain valid listings.
+            self._playwright_failures += 1
             self._error_messages.append(f"PLAYWRIGHT_FAILURE: {msg}")
             self.logger.error(
                 "[SCAN-DEBUG][%s] PLAYWRIGHT_FAILURE job_id=%s url=%s error=%s",
                 self.source_key, self.job_id, getattr(request, "url", None), msg,
             )
+            try:
+                self.crawler.engine.close_spider(self, reason="playwright_failure")
+            except Exception:
+                self.logger.exception("[SCAN-DEBUG][%s] CLOSE_AFTER_PLAYWRIGHT_FAILURE_FAILED job_id=%s",
+                                      self.source_key, self.job_id)
             return
         self._downloader_exceptions += 1
         self._error_messages.append(msg)

@@ -139,7 +139,7 @@ def _build_debug(job, crawler, process_start_error=None):
         "start_yielded": start_yielded,
         "requests_scheduled": scheduled,
         "requests_dropped": dropped,
-        "requests_sent": int(stats.get("downloader/request_count", 0)),
+        "requests_sent": int(getattr(spider, "_requests_sent", stats.get("downloader/request_count", 0))),
         "responses_received": responses,
         "responses_2xx": int(getattr(spider, "_responses_2xx", 0)),
         "responses_3xx": int(getattr(spider, "_responses_3xx", 0)),
@@ -164,10 +164,7 @@ def _build_debug(job, crawler, process_start_error=None):
         "duration_seconds": duration,
         "runner_error": None,
         "error_messages": list(getattr(spider, "_error_messages", []))[-10:],
-        "playwright_failures": sum(
-            1 for m in getattr(spider, "_error_messages", [])
-            if "playwright" in str(m).casefold() or "browser" in str(m).casefold()
-        ),
+        "playwright_failures": int(getattr(spider, "_playwright_failures", 0)),
     }
     runner_error = getattr(spider, "_runner_error", None)
     if runner_error:
@@ -233,10 +230,14 @@ def run_jobs(jobs):
             "USER_AGENT": USER_AGENT,
             "USER_AGENT_POOL": USER_AGENT_POOL,
             "DOWNLOAD_HANDLERS": DOWNLOAD_HANDLERS,
+            "DOWNLOADER_MIDDLEWARES": {
+                "wohnungsradar_scrapy.spiders.base.ScanRequestTelemetryMiddleware": 350,
+            },
             "TWISTED_REACTOR": TWISTED_REACTOR,
             "PLAYWRIGHT_BROWSER_TYPE": PLAYWRIGHT_BROWSER_TYPE,
             "PLAYWRIGHT_LAUNCH_OPTIONS": PLAYWRIGHT_LAUNCH_OPTIONS,
             "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT,
+            "PLAYWRIGHT_ABORT_REQUEST": PLAYWRIGHT_ABORT_REQUEST,
             "PLAYWRIGHT_MAX_CONTEXTS": 1,
             "PLAYWRIGHT_MAX_PAGES_PER_CONTEXT": 1,
             "ITEM_PIPELINES": ITEM_PIPELINES,

@@ -62,17 +62,17 @@ def send_email(subject: str, text: str, html_body: str | None = None) -> bool:
         return False
 
 
-def format_match_email(profile_name, score, title, price, rooms, size, location, url, source, price_total=None):
+def format_match_email(profile_name, title, price, rooms, size, location, url, source, price_total=None):
     warm = price_total is not None
     amount = price_total if warm else price
     label = "Warm-/Gesamtmiete" if warm else "Kaltmiete (Warmmiete unbekannt)"
-    subject = f"Neue Wohnung: {title} ({score}/100)"
+    subject = f"Neue Wohnung: {title}"
     text = (
         f"Neuer Wohnungstreffer für das Profil: {profile_name}\n\n{title}\n"
         f"Quelle: {source}\nLage: {location or 'unbekannt'}\n"
         f"{label}: {amount if amount is not None else '–'} €\n"
         f"Zimmer: {rooms if rooms is not None else '–'}\n"
-        f"Fläche: {size if size is not None else '–'} m²\nScore: {score}/100\n"
+        f"Fläche: {size if size is not None else '–'} m²\nProfil erfüllt\n"
         f"Inserat: {url}\n"
     )
     safe_url=html.escape(str(url),quote=True)
@@ -84,7 +84,7 @@ def format_match_email(profile_name, score, title, price, rooms, size, location,
         f"{html.escape(label)}: {html.escape(str(amount if amount is not None else '–'))} €<br>"
         f"Zimmer: {html.escape(str(rooms if rooms is not None else '–'))}<br>"
         f"Fläche: {html.escape(str(size if size is not None else '–'))} m²<br>"
-        f"Score: {int(score)}/100</p>"
+        f"Profil erfüllt</p>"
         f'<p><a href="{safe_url}">Inserat öffnen</a></p>'
     )
     return subject, text, html_body

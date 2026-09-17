@@ -52,7 +52,15 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
         "--renderer-process-limit=1",
     ],
 }
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 15000
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = int(os.getenv("SCRAPE_NAV_TIMEOUT_MS", "15000"))
+
+# Large media assets do not contribute to listing extraction and can keep
+# Playwright navigations open on modern portals. Abort only resource types that
+# are safe to omit; HTML, scripts, stylesheets and XHR/fetch remain available.
+def _abort_playwright_request(request):
+    return request.resource_type in {"image", "media", "font"}
+
+PLAYWRIGHT_ABORT_REQUEST = _abort_playwright_request
 
 ITEM_PIPELINES = {
     "wohnungsradar_scrapy.pipelines.NormalizePipeline": 100,
