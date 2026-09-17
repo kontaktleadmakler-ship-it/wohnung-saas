@@ -29,14 +29,6 @@ def register(app, scan_callback):
         if text=="/matches": return jsonify({"ok":True,"matches":db.get_dashboard_rows(0,None,20)})
         if text=="/sources": return jsonify({"ok":True,"sources":db.get_source_health()})
         if text=="/errors": return jsonify({"ok":True,"errors":[x for x in db.get_recent_scan_runs(10) if (x.get("summary") or {}).get("source_errors")]})
-        if text=="/pause":
-            db.set_auto_scan_enabled(False, source="telegram")
-        if text=="/resume":
-            db.set_auto_scan_enabled(True, source="telegram")
+        if text=="/pause": os.environ["ENABLE_AUTO_SCAN"]="false"
+        if text=="/resume": os.environ["ENABLE_AUTO_SCAN"]="true"
         return jsonify({"ok":True,"command":text})
-
-    # Telegram sends server-to-server POST requests and cannot provide a browser CSRF token.
-    # Exempt only this webhook from Flask-WTF CSRF protection.
-    csrf = app.extensions.get("csrf")
-    if csrf is not None:
-        csrf.exempt(telegram_webhook)

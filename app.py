@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import secrets
@@ -7,9 +8,10 @@ import sys
 import threading
 import time
 import uuid
+from functools import wraps
 from config import settings
 
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 from flask_wtf.csrf import CSRFProtect
 
 from logging_setup import configure_logging
@@ -23,8 +25,6 @@ from scrapers.registry import list_sources, get_scraper
 from scrapers.regions import BUNDESLAENDER
 from scrapers.models import SearchParams
 
-APP_VERSION = os.getenv("APP_VERSION", "wohnungsradar-v18")
-
 app = Flask(__name__)
 
 # Environment-aware startup configuration. Importing the Flask module must never
@@ -34,11 +34,30 @@ IS_RENDER = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
 APP_ENV = os.getenv("APP_ENV", "production" if IS_RENDER else "development").strip().lower()
 IS_PRODUCTION = APP_ENV in {"production", "prod"}
 
-# Das Dashboard ist bewusst öffentlich erreichbar. Es enthält keine
-# Zugangsschranke; sensible Betriebsgeheimnisse werden weiterhin ausschließlich
-# über Render-Environment-Variablen verwaltet.
-SECRET_KEY = os.getenv("SECRET_KEY", "").strip() or secrets.token_urlsafe(48)
-DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
+APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+
+if not SECRET_KEY:
+    # A generated key is safe for boot/liveness, but sessions are intentionally
+    # ephemeral until a persistent SECRET_KEY is configured.
+    SECRET_KEY = secrets.token_urlsafe(48)
+    logging.getLogger("web").warning(
+        "SECRET_KEY fehlt; es wurde ein temporärer Prozess-Key erzeugt. "
+        "Für persistente Sessions SECRET_KEY in Render setzen."
+    )
+
+# Password protection is enabled only when a password exists. This keeps a
+# misconfigured deployment reachable instead of causing a Gunicorn boot loop.
+# APP_AUTH_REQUIRED=true can explicitly require authentication; in that mode a
+# missing APP_PASSWORD is reported as a configuration warning and access stays
+# disabled rather than accepting an empty password.
+APP_AUTH_REQUIRED = os.getenv("APP_AUTH_REQUIRED", "true" if APP_PASSWORD else "false").strip().lower() in {"1", "true", "yes", "on"}
+if IS_PRODUCTION and not APP_PASSWORD:
+    logging.getLogger("web").warning(
+        "APP_PASSWORD fehlt: Web-Authentifizierung ist deaktiviert. "
+        "Für einen geschützten Produktionsbetrieb APP_PASSWORD setzen."
+    )
+
 app.secret_key = SECRET_KEY
 app.config.update(
     SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "true" if IS_PRODUCTION else "false").lower() in {"1","true","yes","on"},
@@ -49,9 +68,6 @@ app.config.update(
 CSRFProtect(app)
 
 config_errors = settings.validate(production=IS_PRODUCTION)
-if IS_PRODUCTION and not DASHBOARD_PASSWORD:
-    config_errors.append("DASHBOARD_PASSWORD fehlt (Produktions-Dashboard muss geschützt sein)")
-
 if config_errors:
     # Do not raise during module import. Gunicorn must remain alive so Render
     # can observe /healthz and /readyz instead of entering a restart loop.
@@ -195,11 +211,6 @@ def _run_scan_once_embedded(profile_id=None, mode="auto"):
     env.setdefault("PYTHONUNBUFFERED", "1")
     env["SCAN_RUN_ID"] = run_id
     env["SCAN_STARTED_AT"] = started_iso
-    # The child process must know whether this invocation came from the
-    # dashboard or from the automatic scheduler. Without this flag a manual
-    # full scan was treated as a cron scan and skipped whenever
-    # ENABLE_AUTO_SCAN=false (the exact cause of the zero-result scans).
-    env["SCAN_TRIGGER"] = "manual" if mode == "manual" else "cron"
 
     proc = None
     returncode = 1
@@ -300,20 +311,6 @@ def _background_scanner():
             time.sleep(retry_seconds)
             continue
 
-        try:
-            auto_enabled = db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"})
-        except Exception:
-            auto_enabled = True
-            log.warning("AUTO-SCAN: shared state unavailable; keeping scheduler alive")
-        if not auto_enabled:
-            log.info("AUTO-SCAN: paused in shared state; no scan started")
-            try:
-                db.record_worker_heartbeat(duration_seconds=0, pid=os.getpid(), poll_interval_seconds=poll_interval)
-            except Exception:
-                log.exception("Heartbeat im Pause-Zustand konnte nicht gespeichert werden")
-            time.sleep(max(15, poll_interval))
-            continue
-
         log.info("AUTO-SCAN: launching scraper.py --once")
         started = time.monotonic()
         with scan_lock:
@@ -357,12 +354,7 @@ def _maybe_start_background_scanner():
     the HTTP port. The scanner retries database initialization in its own
     background thread once MongoDB becomes reachable again.
     """
-    env_enabled = os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        enabled = db.get_auto_scan_enabled(default=env_enabled)
-    except Exception:
-        enabled = env_enabled
-        log.warning("AUTO-SCAN: shared state unavailable; using environment fallback")
+    enabled = os.getenv("ENABLE_AUTO_SCAN", "false").strip().lower() in {"1", "true", "yes", "on"}
     if enabled:
         log.info("AUTO-SCAN: enabled during app import (pid=%s)", os.getpid())
         _start_background_scanner_once()
@@ -395,16 +387,22 @@ def _heartbeat_status():
     return hb, "down", _NO_HEARTBEAT_MESSAGE
 
 
+def auth(view):
+    @wraps(view)
+    def wrapper(*a, **kw):
+        if APP_AUTH_REQUIRED and APP_PASSWORD and not session.get("logged_in"):
+            return redirect(url_for("login", next=request.path))
+        return view(*a, **kw)
+    return wrapper
+
 
 @app.before_request
 def ensure_db():
     # Render probes these endpoints during boot. They must never wait for
     # MongoDB, otherwise a transient Atlas/network delay can prevent the
     # Gunicorn worker from becoming healthy.
-    if request.endpoint in {"static", "healthz", "readyz", "login", "telegram_webhook"}:
+    if request.endpoint in {"static", "healthz", "readyz"}:
         return None
-    if IS_PRODUCTION and DASHBOARD_PASSWORD and not session.get("dashboard_authenticated"):
-        return redirect(url_for("login", next=request.full_path))
     _ensure_db_initialized()
 
 
@@ -432,35 +430,34 @@ _maybe_start_background_scanner()
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if not IS_PRODUCTION or not DASHBOARD_PASSWORD:
-        session["dashboard_authenticated"] = True
-        return redirect(request.args.get("next") or url_for("home"))
     if request.method == "POST":
-        supplied = request.form.get("password", "")
-        if secrets.compare_digest(supplied, DASHBOARD_PASSWORD):
-            session.clear()
-            session["dashboard_authenticated"] = True
-            session.permanent = True
-            return redirect(request.form.get("next") or url_for("home"))
-        flash("Ungültiges Passwort.")
-    return render_template("login.html", next=request.args.get("next", ""))
+        if APP_PASSWORD and hmac.compare_digest(request.form.get("password", ""), APP_PASSWORD):
+            session["logged_in"] = True
+            return redirect(request.args.get("next") or url_for("home"))
+        return render_template("login.html", error="Falsches Passwort")
+    return render_template("login.html", error=None)
 
 
-@app.post("/logout")
+@app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
 
 
 @app.route("/")
+@auth
 def home():
+    try:
+        min_score = int(request.args.get("min_score", 0))
+    except (TypeError, ValueError):
+        min_score = 0
     try:
         raw_profile_id = request.args.get("profile_id")
         profile_id = int(raw_profile_id) if raw_profile_id else None
     except (TypeError, ValueError):
         profile_id = None
     try:
-        rows = db.get_dashboard_rows(profile_id)
+        rows = db.get_dashboard_rows(min_score, profile_id)
     except Exception:
         rows = []
         flash("Datenbank konnte nicht gelesen werden.")
@@ -482,7 +479,7 @@ def home():
         "dashboard.html",
         rows=rows,
         profiles=profiles,
-        app_version=APP_VERSION,
+        min_score=min_score,
         selected_profile=str(profile_id) if profile_id is not None else "",
         scan_running=bool(scan_thread and scan_thread.is_alive()),
         last_scan=last_scan,
@@ -494,6 +491,7 @@ def home():
 
 
 @app.route("/diagnose")
+@auth
 def diagnose():
     try:
         setup_stats = db.get_setup_stats()
@@ -555,6 +553,7 @@ def diagnose():
 
 
 @app.route("/scan/diagnostics", methods=["GET"])
+@auth
 def scan_diagnostics():
     """Machine-readable end-to-end scan diagnostics. Secrets are never returned."""
     started=time.monotonic()
@@ -575,8 +574,6 @@ def scan_diagnostics():
             jobs.append({"source":source,"profile_ids":sorted(profile_ids),"regions":list(regions),
                          "locations":list(locations),"urls":urls,"urls_count":len(urls),
                          "adapter_available":bool(getattr(adapter,"AVAILABLE",True)) if 'adapter' in locals() else False,
-                         "status":"available" if bool(getattr(adapter,"AVAILABLE",True)) else "unavailable",
-                         "failure_class":None if bool(getattr(adapter,"AVAILABLE",True)) else "SOURCE_UNAVAILABLE",
                          "url_error":url_error})
         last_completed_scan = db.get_last_scan_run() or {}
         current_scan = db.get_current_scan() or {}
@@ -625,25 +622,11 @@ def scan_diagnostics():
                 "scan_thread_running":bool(scan_thread and scan_thread.is_alive()),
                 "current_scan_pid": current_running_scan.get("pid") if current_running_scan else None,
                 "current_scan_status": current_running_scan.get("status") if current_running_scan else None,
-                "child_exit_code": current_running_scan.get("exit_code") if current_running_scan else None,
-                "child_timeout": current_running_scan.get("status") == "timeout" if current_running_scan else False,
-                "current_job": (
-                    next((j for j in (current_running_scan.get("jobs") or [])
-                          if j.get("status") in {"running", "pending"}), None)
-                    if current_running_scan else None
-                ),
-                "completed_jobs": (
-                    [j for j in (current_running_scan.get("jobs") or [])
-                     if j.get("status") in {"finished", "failed", "error", "unavailable"}]
-                    if current_running_scan else []
-                ),
             },
-            "config":{"app_version": APP_VERSION, "log_level":os.getenv("LOG_LEVEL","INFO"),"scan_debug":os.getenv("SCAN_DEBUG","true"),
-                      "auto_scan_enabled": db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "true").lower() in {"1","true","yes","on"}),
+            "app_version": settings.app_version,
+            "config":{"log_level":os.getenv("LOG_LEVEL","INFO"),"scan_debug":os.getenv("SCAN_DEBUG","true"),
+                      "auto_scan_enabled":os.getenv("ENABLE_AUTO_SCAN","false").lower() in {"1","true","yes","on"},
                       "scrape_max_pages":int(os.getenv("SCRAPE_MAX_PAGES","3")),
-                      "scrape_wait_ms":int(os.getenv("SCRAPE_WAIT_MS","1800")),
-                      "wg_gesucht_nav_timeout_ms":int(os.getenv("WG_GESUCHT_NAV_TIMEOUT_MS","10000")),
-                      "wg_gesucht_wait_ms":int(os.getenv("WG_GESUCHT_WAIT_MS","2500")),
                       "scan_process_timeout_seconds":int(os.getenv("SCAN_PROCESS_TIMEOUT_SECONDS","1800")),
                       "scan_lock_lease_seconds":db.LOCK_LEASE_SECONDS,
                       "scan_lock_renew_interval_seconds":db.LOCK_RENEW_INTERVAL_SECONDS},
@@ -673,6 +656,7 @@ def scan_diagnostics():
 
 
 @app.route("/scan/run", methods=["POST"])
+@auth
 def run_scan():
     global scan_thread
     raw_profile_id = request.form.get("profile_id") or request.args.get("profile_id")
@@ -711,6 +695,7 @@ def _manual_scan(profile_id=None):
 
 
 @app.route("/profiles", methods=["GET", "POST"])
+@auth
 def profiles():
     if request.method == "POST":
         data, error = _profile_form()
@@ -735,6 +720,7 @@ def profiles():
 
 
 @app.route("/profiles/<int:pid>/edit", methods=["POST"])
+@auth
 def edit_profile(pid):
     data, error = _profile_form()
     if error:
@@ -742,18 +728,14 @@ def edit_profile(pid):
         return redirect(url_for("profiles"))
     data["active"] = request.form.get("active") == "1"
     db.update_profile(pid, data)
-    selected_sources = [x for x in request.form.getlist("sources") if any(s["key"] == x for s in list_sources())]
-    db.set_profile_sources(pid, selected_sources)
-    regions = request.form.getlist("regions") or ["DE"]
-    regions = [r for r in regions if r == "DE" or r in BUNDESLAENDER]
-    if "DE" in regions:
-        regions = ["DE"]
-    db.set_profile_regions(pid, regions)
+    db.set_profile_sources(pid, request.form.getlist("sources"))
+    db.set_profile_regions(pid, request.form.getlist("regions"))
     flash("Profil gespeichert.")
     return redirect(url_for("profiles"))
 
 
 @app.route("/profiles/<int:pid>/delete", methods=["POST"])
+@auth
 def delete_profile(pid):
     db.delete_profile(pid)
     flash("Profil gelöscht.")
@@ -766,6 +748,7 @@ def healthz():
     return jsonify({
         "ok": True,
         "environment": APP_ENV,
+        "app_version": settings.app_version,
         "configuration": "ok" if not config_errors else "degraded",
         "database": "not_checked",
     }), 200
@@ -796,14 +779,15 @@ def readyz():
 
 
 @app.route("/api/status")
+@auth
 def api_status():
     try:
         current=db.get_current_scan() or {}
         last=db.get_last_scan_run() or {}
         health=db.get_source_health()
         return jsonify({"ok":True,"database":"ok","current_scan":current,"last_scan":last,"source_health":health,
-                        "profiles":db.get_setup_stats(),"config":{"auto_scan":db.get_auto_scan_enabled(default=settings.enable_auto_scan),"poll_interval_seconds":settings.poll_interval_seconds,
-                        "max_pages":settings.max_pages}})
+                        "profiles":db.get_setup_stats(),"config":{"auto_scan":settings.enable_auto_scan,"poll_interval_seconds":settings.poll_interval_seconds,
+                        "max_pages":settings.max_pages,"min_notify_score":settings.min_notify_score}})
     except Exception as exc:
         return jsonify({"ok":False,"error":type(exc).__name__}),503
 

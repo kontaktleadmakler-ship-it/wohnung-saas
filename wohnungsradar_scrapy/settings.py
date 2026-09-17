@@ -52,15 +52,23 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
         "--renderer-process-limit=1",
     ],
 }
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = int(os.getenv("SCRAPE_NAV_TIMEOUT_MS", "15000"))
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 15000
 
-# Large media assets do not contribute to listing extraction and can keep
-# Playwright navigations open on modern portals. Abort only resource types that
-# are safe to omit; HTML, scripts, stylesheets and XHR/fetch remain available.
-def _abort_playwright_request(request):
+
+def _playwright_should_abort(request):
+    """Skip loading images/media/fonts during Playwright navigation.
+
+    Listing data is extracted from the DOM text/attributes and JSON-LD, never
+    from images or fonts, so blocking them saves bandwidth/CPU/memory on
+    small Render instances without affecting extraction. Stylesheets are
+    deliberately NOT blocked: some portals gate content behind CSS-driven
+    lazy-loading/visibility, so abort only the resource types that are
+    genuinely never needed.
+    """
     return request.resource_type in {"image", "media", "font"}
 
-PLAYWRIGHT_ABORT_REQUEST = _abort_playwright_request
+
+PLAYWRIGHT_ABORT_REQUEST = _playwright_should_abort
 
 ITEM_PIPELINES = {
     "wohnungsradar_scrapy.pipelines.NormalizePipeline": 100,

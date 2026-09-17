@@ -2,12 +2,10 @@ from __future__ import annotations
 import logging, os, random, re
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 import scrapy
-from scrapy.exceptions import IgnoreRequest
 from scrapy import signals
 from scrapy_playwright.page import PageMethod
 from ..items import ApartmentItem
 from ..parsing import node_text, clean_text, canonical_url, external_id_from_url, parse_rents, parse_rooms, parse_size, parse_location, parse_number, jsonld_objects, jsonld_to_raw, parse_rent_details, validate_listing_dict
-from .scan_diagnostics import classify_http_status, result_is_valid
 
 # Text markers that indicate a bot-check/interstitial page rather than a
 # genuine "0 results" search page. Kept case-insensitive and portal-agnostic
@@ -92,19 +90,6 @@ def select(scope, selector):
             raise
         return scope.xpath(xpath)
 
-class ScanRequestTelemetryMiddleware:
-    """Record the point at which Scrapy hands a request to the downloader."""
-    def process_request(self, request, spider):
-        if hasattr(spider, "_requests_sent"):
-            spider._requests_sent += 1
-            spider.logger.info(
-                "[SCAN-DEBUG][%s] REQUEST_SENT job_id=%s url=%s",
-                getattr(spider, "source_key", spider.name),
-                getattr(spider, "job_id", None), request.url,
-            )
-        return None
-
-
 class PortalSpider(scrapy.Spider):
     source_key=""
     source_label=""
@@ -113,10 +98,7 @@ class PortalSpider(scrapy.Spider):
     # Portal-specific Playwright navigation tuning. A few portals keep
     # long-lived requests open; subclasses can use ``commit`` so navigation
     # itself does not hold the crawl hostage while the page is already usable.
-    # ``commit`` is sufficient for crawler parsing and avoids waiting for
-    # client-side pages whose DOM is usable while secondary resources remain
-    # open. Portal-specific spiders may override this when needed.
-    playwright_wait_until="commit"
+    playwright_wait_until="domcontentloaded"
     playwright_nav_timeout_env="SCRAPE_NAV_TIMEOUT_MS"
     playwright_wait_ms_env="SCRAPE_WAIT_MS"
     max_pages_env="SCRAPE_MAX_PAGES"
@@ -156,14 +138,8 @@ class PortalSpider(scrapy.Spider):
         self._responses_5xx = 0
         self._spider_errors = 0
         self._downloader_exceptions = 0
-        self._requests_sent = 0
-        self._playwright_failures = 0
-        self._pagination_failures = 0
         self._http_statuses = {}
         self._error_messages = []
-        self._runner_error = None
-        self.robots_blocked = False
-        self.scan_timeout = False
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -207,13 +183,6 @@ class PortalSpider(scrapy.Spider):
             return
         self._requests_scheduled += 1
         self.logger.info("[SCAN-DEBUG][%s] REQUEST_SCHEDULED job_id=%s url=%s",
-                         self.source_key, self.job_id, request.url)
-
-    def _on_request_sent(self, request, spider):
-        if spider is not self:
-            return
-        self._requests_sent += 1
-        self.logger.info("[SCAN-DEBUG][%s] REQUEST_SENT job_id=%s url=%s",
                          self.source_key, self.job_id, request.url)
 
     def _on_request_dropped(self, request, spider):
@@ -355,11 +324,6 @@ class PortalSpider(scrapy.Spider):
         return any(marker in body for marker in BLOCK_PAGE_MARKERS)
 
     def parse(self,response):
-        status = getattr(response, "status", None)
-        self.logger.info("[SCAN-DEBUG][%s] HTTP_STATUS=%s CLASS=%s", self.name, status, classify_http_status(status))
-        if not result_is_valid(status):
-            self.logger.warning("[SCAN-DEBUG][%s] RESULT_PAGE_INVALID status=%s - not treating as genuine zero-result page", self.name, status)
-            return
         self.pages_seen += 1
         page_number=int(response.meta.get("page_number",1))
         cards=self.parse_listing_cards(response)
@@ -573,46 +537,10 @@ class PortalSpider(scrapy.Spider):
     def errback(self, failure):
         self.page_errors += 1
         msg = failure.getErrorMessage()
-        exc = getattr(failure, "value", None)
-        request = getattr(failure, "request", None)
-        if isinstance(exc, IgnoreRequest) and "robots.txt" in msg.casefold():
-            self.robots_blocked = True
-            self._error_messages.append(f"ROBOTS_BLOCKED: {msg}")
-            self.logger.warning(
-                "[SCAN-DEBUG][%s] ROBOTS_BLOCKED job_id=%s url=%s error=%s",
-                self.source_key, self.job_id, getattr(request, "url", None), msg,
-            )
-            return
-        if ("playwright" in msg.casefold() or "timeout" in msg.casefold()) and self.use_playwright:
-            page_number = int((getattr(request, "meta", {}) or {}).get("page_number", 1))
-            if page_number > 1 and self.result_page_valid:
-                # Pagination is best-effort. A slow/unstable second page must
-                # never invalidate listings that were already scraped from a
-                # valid first page. Simply stop pagination for this portal.
-                self._pagination_failures += 1
-                self._error_messages.append(f"PAGINATION_TIMEOUT: {msg}")
-                self.logger.warning(
-                    "[SCAN-DEBUG][%s] PAGINATION_TIMEOUT job_id=%s page=%s url=%s - "
-                    "bereits gefundene Treffer bleiben gültig",
-                    self.source_key, self.job_id, page_number, getattr(request, "url", None),
-                )
-                return
-
-            self._playwright_failures += 1
-            self._error_messages.append(f"PLAYWRIGHT_FAILURE: {msg}")
-            self.logger.error(
-                "[SCAN-DEBUG][%s] PLAYWRIGHT_FAILURE job_id=%s url=%s error=%s",
-                self.source_key, self.job_id, getattr(request, "url", None), msg,
-            )
-            # Do not force-close the spider here. Scrapy can finish naturally
-            # after a failed initial request, and a later request failure must
-            # not destroy items already written to the feed.
-            return
-        self._downloader_exceptions += 1
         self._error_messages.append(msg)
         self.logger.error("[SCAN-DEBUG][%s] DOWNLOAD_FAILURE job_id=%s url=%s error=%s",
                           self.source_key, self.job_id,
-                          getattr(request, "url", None), msg)
+                          getattr(failure.request, "url", None), msg)
 
 def cards_continue(card_count,new_count):
     return card_count>0 and new_count>0

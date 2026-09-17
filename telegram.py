@@ -20,7 +20,7 @@ def send_telegram(message):
         log.exception("Telegram-Versand fehlgeschlagen")
         return False
 
-def format_match_message(profile_name,title,price,rooms,size,location,url,source,price_total=None):
+def format_match_message(profile_name,score,title,price,rooms,size,location,url,source,price_total=None):
     warm=price_total is not None
     amount=price_total if warm else price
     price_label="Warm-/Gesamtmiete" if warm else "Kaltmiete (Warmmiete unbekannt)"
@@ -32,6 +32,6 @@ def format_match_message(profile_name,title,price,rooms,size,location,url,source
         f"{html.escape(price_label)}: {html.escape(str(amount if amount is not None else '–'))} € · "
         f"{html.escape(str(rooms if rooms is not None else '–'))} Zi. · "
         f"{html.escape(str(size if size is not None else '–'))} m²\n"
-        f"Profil erfüllt\n"
+        f"Score: <b>{int(score)}/100</b>\n"
         f'<a href="{safe_url}">Inserat öffnen</a>'
     )

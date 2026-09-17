@@ -14,8 +14,10 @@ services:
         value: wohnung_saas
       - key: SECRET_KEY
         sync: false
-      - key: DASHBOARD_PASSWORD
+      - key: APP_PASSWORD
         sync: false
+      - key: APP_AUTH_REQUIRED
+        value: "true"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
@@ -38,10 +40,10 @@ services:
         value: "true"
       - key: ENABLE_AUTO_SCAN
         value: "false"
-      - key: APP_VERSION
-        value: "wohnungsradar-v18"
       - key: DASHBOARD_LIMIT
         value: "300"
+      - key: MIN_NOTIFY_SCORE
+        value: "75"
       - key: LOG_LEVEL
         value: INFO
       - key: PYTHONUNBUFFERED
@@ -114,10 +116,8 @@ services:
         value: "true"
       - key: POLL_INTERVAL_SECONDS
         value: "600"
-      - key: SCAN_TRIGGER
-        value: "cron"
-      - key: APP_VERSION
-        value: "wohnungsradar-v18"
+      - key: MIN_NOTIFY_SCORE
+        value: "75"
       - key: LOG_LEVEL
         value: INFO
       - key: PYTHONUNBUFFERED
@@ -156,5 +156,3 @@ services:
         value: "60"
       - key: SCAN_RETENTION_DAYS
         value: "90"
-
-# Wohnungsradar: set ENABLE_AUTO_SCAN=false only for manual-scan deployments.

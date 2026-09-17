@@ -1,20 +1,12 @@
-"""Deployment self-check.
-
-Default mode is offline/static and needs no network or database.  ``--runtime``
-also verifies that every production Python dependency can be imported and that
-Flask can build the application.  It deliberately never contacts portals or
-MongoDB.
-"""
+"""Offline deployment self-check; does not contact portals or the database."""
 from pathlib import Path
 import ast
-import importlib
 import sys
 
 ROOT = Path(__file__).resolve().parent
 required = [
     "app.py", "main.py", "scraper.py", "db.py", "matching.py",
-    "requirements.txt", "render.yaml", "Dockerfile",
-    "templates/base.html", "templates/dashboard.html", "templates/login.html",
+    "requirements.txt", "render.yaml",
     "wohnungsradar_scrapy/runner.py",
     "wohnungsradar_scrapy/spiders/base.py",
     "wohnungsradar_scrapy/spiders/portals.py",
@@ -26,34 +18,11 @@ if missing:
     raise SystemExit(1)
 
 for path in ROOT.rglob("*.py"):
-    if "__pycache__" in path.parts or ".pytest_cache" in path.parts:
+    if "__pycache__" in path.parts:
         continue
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 print("OK: required files present and Python syntax valid")
-
-if "--runtime" in sys.argv:
-    modules = [
-        "flask", "flask_wtf", "pymongo", "requests", "bs4", "scrapy",
-        "scrapy_playwright", "playwright", "twisted", "gunicorn", "certifi",
-    ]
-    failed = []
-    for name in modules:
-        try:
-            importlib.import_module(name)
-        except Exception as exc:
-            failed.append(f"{name}: {type(exc).__name__}: {exc}")
-    if failed:
-        print("RUNTIME IMPORT FAILURES:")
-        print("\n".join(f"- {x}" for x in failed))
-        raise SystemExit(2)
-    try:
-        import app
-        routes = {rule.rule for rule in app.app.url_map.iter_rules()}
-        for route in ("/", "/login", "/healthz", "/readyz", "/api/status", "/scan/run", "/telegram/webhook"):
-            if route not in routes:
-                raise RuntimeError(f"Flask route missing: {route}")
-    except Exception as exc:
-        print(f"FLASK APP CHECK FAILED: {type(exc).__name__}: {exc}")
-        raise SystemExit(3)
-    print("OK: runtime dependencies import and Flask routes register")
+print("Render start: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120")
+print("Scanner: Render Cron (ENABLE_AUTO_SCAN=false im Web-Service; Scrapy-Jobs seriell)")
+print("Startup: fehlende optionale Web-Secrets verursachen keinen Gunicorn-Import-Crash; /readyz meldet Konfigurations-/DB-Probleme.")

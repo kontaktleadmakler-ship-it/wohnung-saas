@@ -7,19 +7,11 @@ from types import SimpleNamespace
 
 from scrapy.http import Request
 from wohnungsradar_scrapy.runner import _failure_class
-from wohnungsradar_scrapy.spiders.portals import KleinanzeigenSpider, HousingAnywhereSpider
-from wohnungsradar_scrapy.spiders.base import ScanRequestTelemetryMiddleware
+from wohnungsradar_scrapy.spiders.portals import KleinanzeigenSpider
 from wohnungsradar_scrapy.pipelines import JobFeedPipeline
-from wohnungsradar_scrapy.adapters import ADAPTERS
 
 
 class TelemetryTests(unittest.TestCase):
-    def test_disabled_sources_are_not_available(self):
-        self.assertFalse(ADAPTERS["immonet"].AVAILABLE)
-        self.assertFalse(ADAPTERS["meinestadt"].AVAILABLE)
-        self.assertEqual(ADAPTERS["immonet"].UNAVAILABLE_FAILURE_CLASS, "SOURCE_UNAVAILABLE")
-        self.assertEqual(ADAPTERS["meinestadt"].UNAVAILABLE_FAILURE_CLASS, "ROBOTS_BLOCKED")
-
     def test_one_url_start_yields_one_request(self):
         spider = KleinanzeigenSpider(
             start_urls=["https://example.test/search"], job_id="0"
@@ -31,23 +23,6 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(requests[0].url, "https://example.test/search")
         self.assertEqual(spider._start_entered, True)
         self.assertEqual(spider._start_yielded, 1)
-
-    def test_playwright_uses_commit_as_default_load_state(self):
-        spider = HousingAnywhereSpider(start_urls=["https://example.test/s/Berlin--Germany"], job_id="ha")
-        request = next(spider.start())
-        self.assertEqual(request.meta["playwright_page_goto_kwargs"]["wait_until"], "commit")
-
-    def test_playwright_failure_is_counted(self):
-        spider = HousingAnywhereSpider(start_urls=[], job_id="ha")
-        spider._playwright_failures = 1
-        self.assertEqual(spider._playwright_failures, 1)
-
-    def test_request_sent_middleware_records_dispatch(self):
-        spider = KleinanzeigenSpider(start_urls=[], job_id="x")
-        middleware = ScanRequestTelemetryMiddleware()
-        request = Request("https://example.test/")
-        middleware.process_request(request, spider)
-        self.assertEqual(spider._requests_sent, 1)
 
     def test_no_urls_is_no_start_urls(self):
         debug = {"start_url_count": 0}
@@ -100,34 +75,58 @@ class TelemetryTests(unittest.TestCase):
         from wohnungsradar_scrapy import runner
         self.assertFalse(runner.REMOTE_CONTROL_ENABLED)
 
-    def test_robots_and_unavailable_are_distinct(self):
-        self.assertEqual(_failure_class({"robots_blocked": True}), "ROBOTS_BLOCKED")
-        self.assertEqual(_failure_class({"source_unavailable": True}), "SOURCE_UNAVAILABLE")
-
-    def test_playwright_timeout_is_not_generic_download_failure(self):
-        debug = {
-            "start_url_count": 1, "start_entered": True, "start_yielded": 1,
-            "requests_scheduled": 1, "playwright_failures": 1,
-            "responses_received": 0,
-        }
-        self.assertEqual(_failure_class(debug), "PLAYWRIGHT_FAILURE")
-
-    def test_valid_empty_result_is_success(self):
-        debug = {
-            "start_url_count": 1, "start_entered": True, "start_yielded": 1,
-            "requests_scheduled": 1, "responses_received": 1,
-            "http_statuses": {"200": 1}, "items_scraped": 0,
-            "result_page_valid": True, "finish_reason": "finished",
-        }
-        self.assertIsNone(_failure_class(debug))
-
     def test_required_failure_classes_exist(self):
         from wohnungsradar_scrapy.runner import FAILURE_CLASSES
         for value in ("CONFIG_ERROR", "NO_START_URLS", "REQUEST_PIPELINE_FAILURE",
-                      "DOWNLOAD_FAILURE", "HTTP_403", "HTTP_429", "HTTP_5XX",
+                      "DOWNLOAD_FAILURE", "ROBOTS_BLOCKED", "HTTP_403", "HTTP_429", "HTTP_5XX",
                       "PLAYWRIGHT_FAILURE", "PARSER_FAILURE", "STORAGE_FAILURE",
-                      "TIMEOUT", "ROBOTS_BLOCKED", "SOURCE_UNAVAILABLE", "UNKNOWN_FAILURE"):
+                      "TIMEOUT", "UNKNOWN_FAILURE"):
             self.assertIn(value, FAILURE_CLASSES)
+
+    def test_robots_forbidden_is_its_own_failure_class(self):
+        # robots.txt blocked every request before any response came back -
+        # must be ROBOTS_BLOCKED, never DOWNLOAD_FAILURE/UNKNOWN_FAILURE, and
+        # never a silent "empty" success.
+        debug = {"start_url_count": 1, "start_entered": True,
+                 "start_yielded": 1, "requests_scheduled": 1,
+                 "responses_received": 0, "robots_forbidden": 1}
+        self.assertEqual(_failure_class(debug), "ROBOTS_BLOCKED")
+
+    def test_robots_forbidden_does_not_mask_a_real_response(self):
+        # If some requests still got a real response (e.g. only one of
+        # several start URLs was robots-blocked), classify normally instead
+        # of hiding a genuine parser/HTTP problem behind ROBOTS_BLOCKED.
+        debug = {"start_url_count": 2, "start_entered": True,
+                 "start_yielded": 2, "requests_scheduled": 2,
+                 "responses_received": 1, "items_scraped": 0,
+                 "http_statuses": {"200": 1}, "robots_forbidden": 1,
+                 "result_page_valid": False}
+        self.assertEqual(_failure_class(debug), "PARSER_FAILURE")
+
+    def test_run_jobs_survives_unexpected_crash_before_react(self):
+        # A crash outside the already-guarded react()/crawl_sequentially
+        # block (simulated here by monkeypatching _run_normalized_jobs) must
+        # not raise out of run_jobs() and must not silently return nothing
+        # without any diagnostic trace - every job still gets a debug entry.
+        from wohnungsradar_scrapy import runner as runner_module
+
+        def boom(_normalized):
+            raise RuntimeError("kaputt")
+
+        original = runner_module._run_normalized_jobs
+        runner_module._run_normalized_jobs = boom
+        try:
+            result = runner_module.run_jobs([
+                {"job_id": "0", "source": "kleinanzeigen", "urls": ["https://example.test/a"]},
+            ])
+        finally:
+            runner_module._run_normalized_jobs = original
+
+        self.assertEqual(result, [])
+        debug = runner_module.get_last_run_debug()
+        self.assertEqual(len(debug), 1)
+        self.assertEqual(debug[0]["failure_class"], "UNKNOWN_FAILURE")
+        self.assertIn("kaputt", debug[0]["runner_error"])
 
 
 if __name__ == "__main__":

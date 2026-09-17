@@ -92,16 +92,7 @@ def init_db():
     d.listings.create_index([("source", ASCENDING), ("external_id", ASCENDING)], unique=True)
     d.listings.create_index([("last_seen", DESCENDING)])
     d.matches.create_index([("listing_id", ASCENDING), ("profile_id", ASCENDING)], unique=True)
-    # Remove the former artificial profile-score index if it exists.
-    try:
-        d.matches.drop_index("score_-1")
-    except Exception:
-        pass
-    # Legacy score fields are no longer part of the application model.
-    try:
-        d.matches.update_many({}, {"$unset": {"score": "", "legacy_score": ""}})
-    except Exception:
-        pass
+    d.matches.create_index([("score", DESCENDING)])
     d.matches.create_index([("profile_id", ASCENDING), ("created_at", DESCENDING)])
     d.matches.create_index([("notified", ASCENDING)])
     d.scan_runs.create_index([("started_at", DESCENDING)])
@@ -279,37 +270,6 @@ def clear_current_scan(run_id, *, status="finished", exit_code=0, error=None):
     )
     return result.matched_count == 1
 
-def get_auto_scan_enabled(default=None):
-    """Read the shared auto-scan switch from MongoDB.
-
-    The value is shared by the Render web and cron services, so Telegram
-    pause/resume survives restarts and applies to the cron service as well.
-    ``default`` is used only when the state document does not exist yet.
-    """
-    doc = _db().scan_state.find_one({"_id": "settings"}, {"auto_scan_enabled": 1})
-    if doc and "auto_scan_enabled" in doc:
-        return bool(doc["auto_scan_enabled"])
-    if default is None:
-        default = os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}
-    _db().scan_state.update_one(
-        {"_id": "settings"},
-        {"$setOnInsert": {"auto_scan_enabled": bool(default), "updated_at": _now()}},
-        upsert=True,
-    )
-    return bool(default)
-
-
-def set_auto_scan_enabled(enabled, source="unknown"):
-    """Persist the shared automatic-scan switch."""
-    value = bool(enabled)
-    _db().scan_state.update_one(
-        {"_id": "settings"},
-        {"$set": {"auto_scan_enabled": value, "updated_at": _now(), "updated_by": str(source)}},
-        upsert=True,
-    )
-    return value
-
-
 def get_setup_stats():
     d = _db()
     active = d.profiles.count_documents({"active": True})
@@ -480,7 +440,7 @@ def mark_listings_missing(source: str, seen_external_ids: set[str], scan_started
 def update_source_health(source, *, status, result_count=0, error=None, duration_seconds=None, parser_ok=True, blocked=False):
     d=_db(); now=_now(); previous=d.source_health.find_one({"source":source}) or {}
     failures=int(previous.get("consecutive_failures",0)); empties=int(previous.get("consecutive_empty_results",0))
-    if status in {"failed","blocked","unavailable","timeout"}: failures+=1
+    if status in {"failed","blocked","unavailable","timeout","robots_blocked"}: failures+=1
     else: failures=0
     if status=="empty": empties+=1
     else: empties=0
@@ -494,22 +454,28 @@ def update_source_health(source, *, status, result_count=0, error=None, duration
 def get_source_health():
     return list(_db().source_health.find({}, {"_id":0}).sort("source", ASCENDING))
 
-def save_match(listing_id, profile_id, reasons=None):
-    """Persist a deterministic profile match with explicit reasons.
-
-    A match is created only by the profile criteria; there is no ranking score
-    or score threshold in the persistence model.
-    """
+def save_match(listing_id, profile_id, score, components, reasons):
+    price_score, rooms_score, size_score, location_score = components
     now = _now()
     d = _db()
+    previous = d.matches.find_one({"listing_id": listing_id, "profile_id": profile_id}) or {}
+    previous_score = previous.get("score")
+    update_fields = {
+        "score": score,
+        "price_score": price_score,
+        "rooms_score": rooms_score,
+        "size_score": size_score,
+        "location_score": location_score,
+        "reasons": reasons,
+        "updated_at": now,
+    }
+    # One atomic operation avoids the find-then-insert race when two workers
+    # process the same listing/profile concurrently. Existing notification
+    # flags are preserved.
     doc = d.matches.find_one_and_update(
         {"listing_id": listing_id, "profile_id": profile_id},
         {
-            "$set": {
-                "match_status": "MATCH",
-                "reasons": list(reasons or []),
-                "updated_at": now,
-            },
+            "$set": update_fields,
             "$setOnInsert": {
                 "listing_id": listing_id,
                 "profile_id": profile_id,
@@ -518,7 +484,6 @@ def save_match(listing_id, profile_id, reasons=None):
                 "email_notified": False,
                 "created_at": now,
             },
-            "$unset": {"score": "", "legacy_score": ""},
         },
         upsert=True,
         return_document=ReturnDocument.AFTER,
@@ -527,6 +492,8 @@ def save_match(listing_id, profile_id, reasons=None):
         "notified": doc.get("notified", False),
         "telegram_notified": doc.get("telegram_notified", False),
         "email_notified": doc.get("email_notified", False),
+        "previous_score": previous_score,
+        "score_improved": previous_score is not None and score >= previous_score + 10,
     }
 
 
@@ -603,17 +570,16 @@ def get_worker_heartbeat():
 DASHBOARD_LIMIT = max(1, int(os.getenv("DASHBOARD_LIMIT", "300")))
 
 
-def get_dashboard_rows(profile_id=None, limit=None):
-    """Return deterministic profile matches ordered by newest listing/match."""
+def get_dashboard_rows(min_score=0, profile_id=None, limit=None):
     limit = DASHBOARD_LIMIT if limit is None else max(1, int(limit))
     d = _db()
-    match_filter = {}
+    match_filter = {"score": {"$gte": min_score}}
     if profile_id:
         match_filter["profile_id"] = profile_id
 
     pipeline = [
         {"$match": match_filter},
-        {"$sort": {"created_at": DESCENDING, "updated_at": DESCENDING}},
+        {"$sort": {"score": DESCENDING, "created_at": DESCENDING}},
         {"$limit": limit},
         {"$lookup": {
             "from": "listings", "localField": "listing_id",
@@ -633,8 +599,12 @@ def get_dashboard_rows(profile_id=None, limit=None):
         rows.append({
             "listing_id": doc["listing_id"],
             "profile_id": doc["profile_id"],
-            "match_status": doc.get("match_status", "MATCH"),
-            "reasons": doc.get("reasons") or [],
+            "score": doc.get("score"),
+            "price_score": doc.get("price_score"),
+            "rooms_score": doc.get("rooms_score"),
+            "size_score": doc.get("size_score"),
+            "location_score": doc.get("location_score"),
+            "reasons": doc.get("reasons"),
             "notified": doc.get("notified"),
             "telegram_notified": doc.get("telegram_notified"),
             "email_notified": doc.get("email_notified"),
@@ -652,6 +622,7 @@ def get_dashboard_rows(profile_id=None, limit=None):
             "last_seen": listing.get("last_seen"),
             "last_changed": listing.get("last_changed"),
             "status": listing.get("status"),
+            "data_completeness_score": listing.get("data_completeness_score"),
             "warm_rent": listing.get("warm_rent"),
             "cold_rent": listing.get("cold_rent"),
             "profile_name": profile.get("name"),

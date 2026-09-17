@@ -30,6 +30,7 @@ FAILURE_CLASSES = {
     "NO_START_URLS",
     "REQUEST_PIPELINE_FAILURE",
     "DOWNLOAD_FAILURE",
+    "ROBOTS_BLOCKED",
     "HTTP_403",
     "HTTP_429",
     "HTTP_5XX",
@@ -37,8 +38,6 @@ FAILURE_CLASSES = {
     "PARSER_FAILURE",
     "STORAGE_FAILURE",
     "TIMEOUT",
-    "SOURCE_UNAVAILABLE",
-    "ROBOTS_BLOCKED",
     "UNKNOWN_FAILURE",
 }
 
@@ -51,25 +50,17 @@ def _failure_class(debug):
     """Classify a crawl from lifecycle telemetry, never from item count alone."""
     if debug.get("config_error"):
         return "CONFIG_ERROR"
-    if debug.get("source_unavailable"):
-        return "SOURCE_UNAVAILABLE"
-    if debug.get("robots_blocked"):
-        return "ROBOTS_BLOCKED"
-    # A valid first page is enough for a successful source. Pagination is
-    # deliberately best-effort; a timeout on page 2+ must not turn real
-    # results into a failed source.
-    if debug.get("result_page_valid") is True:
-        return None
-    if debug.get("timeout"):
-        return "TIMEOUT"
-    if debug.get("playwright_failures", 0):
-        return "PLAYWRIGHT_FAILURE"
     if debug.get("start_url_count", 0) == 0:
         return "NO_START_URLS"
     if not debug.get("start_entered"):
         return "REQUEST_PIPELINE_FAILURE"
     if debug.get("start_yielded", 0) == 0 or debug.get("requests_scheduled", 0) == 0:
         return "REQUEST_PIPELINE_FAILURE"
+    # robots.txt blocked every request before any response was downloaded.
+    # This is a distinct, expected state - never a parser/download bug - and
+    # must never be reported as UNKNOWN_FAILURE or a silent empty success.
+    if debug.get("responses_received", 0) == 0 and debug.get("robots_forbidden", 0) > 0:
+        return "ROBOTS_BLOCKED"
     statuses = {int(k): int(v) for k, v in (debug.get("http_statuses") or {}).items()}
     if statuses.get(403, 0):
         return "HTTP_403"
@@ -77,6 +68,8 @@ def _failure_class(debug):
         return "HTTP_429"
     if any(code >= 500 for code in statuses):
         return "HTTP_5XX"
+    if debug.get("playwright_failures", 0):
+        return "PLAYWRIGHT_FAILURE"
     if debug.get("responses_received", 0) == 0:
         return "DOWNLOAD_FAILURE"
     if debug.get("spider_errors", 0) or debug.get("downloader_exceptions", 0):
@@ -85,8 +78,6 @@ def _failure_class(debug):
         return None
     if debug.get("responses_received", 0) > 0 and debug.get("items_scraped", 0) == 0:
         return "PARSER_FAILURE"
-    if debug.get("runner_error"):
-        return "UNKNOWN_FAILURE"
     if debug.get("finish_reason") not in (None, "finished"):
         return "UNKNOWN_FAILURE"
     return None
@@ -127,6 +118,10 @@ def _build_debug(job, crawler, process_start_error=None):
     spider_errors = int(getattr(spider, "_spider_errors", 0) + getattr(spider, "page_errors", 0))
     downloader_exceptions = int(getattr(spider, "_downloader_exceptions", stats.get("downloader/exception_count", 0)))
     retries = int(stats.get("retry/count", 0))
+    # Incremented by Scrapy's own RobotsTxtMiddleware (robotstxt/forbidden)
+    # whenever a request is refused because robots.txt disallows it. This is
+    # the reliable, message-independent signal for the ROBOTS_BLOCKED class.
+    robots_forbidden = int(stats.get("robotstxt/forbidden", 0))
 
     result_page_valid = bool(
         getattr(spider, "result_page_valid", False)
@@ -136,15 +131,14 @@ def _build_debug(job, crawler, process_start_error=None):
     debug = {
         "source": job["source"],
         "job_id": str(job.get("job_id", "")),
-        "url": (job.get("urls") or [None])[0],
-        "start_urls": list(job.get("urls") or []),
-        "start_url_count": int(len(job.get("urls") or [])),
         "status": "finished",
+        "start_urls": int(len(job.get("urls") or [])),
+        "start_url_count": int(len(job.get("urls") or [])),
         "start_entered": start_entered,
         "start_yielded": start_yielded,
         "requests_scheduled": scheduled,
         "requests_dropped": dropped,
-        "requests_sent": int(getattr(spider, "_requests_sent", stats.get("downloader/request_count", 0))),
+        "requests_sent": int(stats.get("downloader/request_count", 0)),
         "responses_received": responses,
         "responses_2xx": int(getattr(spider, "_responses_2xx", 0)),
         "responses_3xx": int(getattr(spider, "_responses_3xx", 0)),
@@ -156,26 +150,22 @@ def _build_debug(job, crawler, process_start_error=None):
         "spider_errors": spider_errors,
         "downloader_exceptions": downloader_exceptions,
         "retries": retries,
+        "robots_forbidden": robots_forbidden,
         "download_errors": int(stats.get("downloader/exception_count", 0)),
         "blocked_pages": int(getattr(spider, "blocked_pages", 0)),
-        "robots_blocked": bool(getattr(spider, "robots_blocked", False)),
-        "timeout": bool(getattr(spider, "scan_timeout", False)),
         "pages_seen": int(getattr(spider, "pages_seen", 0)),
-        "parser_status": (
-            "valid" if result_page_valid else
-            "invalid" if responses > 0 else "not_run"
-        ),
         "finish_reason": stats.get("finish_reason"),
         "duration_seconds": duration,
-        "runner_error": None,
+        "runner_error": str(process_start_error) if process_start_error else None,
         "error_messages": list(getattr(spider, "_error_messages", []))[-10:],
-        "playwright_failures": int(getattr(spider, "_playwright_failures", 0)),
-        "pagination_failures": int(getattr(spider, "_pagination_failures", 0)),
+        "playwright_failures": sum(
+            1 for m in getattr(spider, "_error_messages", [])
+            if "playwright" in str(m).casefold() or "browser" in str(m).casefold()
+        ),
     }
-    runner_error = getattr(spider, "_runner_error", None)
-    if runner_error:
-        debug["runner_error"] = runner_error
     debug["failure_class"] = _failure_class(debug)
+    if process_start_error and debug["failure_class"] is None:
+        debug["failure_class"] = "UNKNOWN_FAILURE"
     if debug["failure_class"]:
         debug["status"] = "error"
     return debug
@@ -213,6 +203,32 @@ def run_jobs(jobs):
     if not normalized:
         return []
 
+    try:
+        return _run_normalized_jobs(normalized)
+    except Exception as exc:
+        # Anything unexpected that happens outside the already-guarded
+        # react()/crawl_sequentially block (e.g. CrawlerRunner/settings
+        # construction, a bug while assembling a job's debug report) must
+        # still surface real, per-job telemetry instead of vanishing and
+        # forcing the caller to blanket-relabel every source as
+        # UNKNOWN_FAILURE. Jobs that a partial run already reported keep
+        # their real failure_class; only genuinely unreported jobs fall
+        # back to UNKNOWN_FAILURE, and even those carry the real exception.
+        log.exception("[SCAN-DEBUG] RUN_JOBS_FATAL unerwarteter Fehler im Runner")
+        reported = {d.get("job_id") for d in LAST_RUN_DEBUG}
+        for job in normalized:
+            if job["job_id"] in reported:
+                continue
+            err = f"{type(exc).__name__}: {exc}"
+            LAST_RUN_DEBUG.append({
+                "source": job["source"], "job_id": job["job_id"], "status": "error",
+                "failure_class": "UNKNOWN_FAILURE", "runner_error": err,
+                "error_messages": [err],
+            })
+        return []
+
+
+def _run_normalized_jobs(normalized):
     with tempfile.TemporaryDirectory(prefix="wohnungsradar-scrapy-") as tmp:
         tmp_path = Path(tmp)
         settings = {
@@ -236,9 +252,6 @@ def run_jobs(jobs):
             "USER_AGENT": USER_AGENT,
             "USER_AGENT_POOL": USER_AGENT_POOL,
             "DOWNLOAD_HANDLERS": DOWNLOAD_HANDLERS,
-            "DOWNLOADER_MIDDLEWARES": {
-                "wohnungsradar_scrapy.spiders.base.ScanRequestTelemetryMiddleware": 350,
-            },
             "TWISTED_REACTOR": TWISTED_REACTOR,
             "PLAYWRIGHT_BROWSER_TYPE": PLAYWRIGHT_BROWSER_TYPE,
             "PLAYWRIGHT_LAUNCH_OPTIONS": PLAYWRIGHT_LAUNCH_OPTIONS,
@@ -296,12 +309,6 @@ def run_jobs(jobs):
                     log.info("[SCAN-DEBUG][%s] CRAWL_DONE job_id=%s",
                              job["source"], job["job_id"])
                 except Exception as exc:
-                    spider = getattr(crawler, "spider", None)
-                    if spider is not None:
-                        spider._runner_error = f"{type(exc).__name__}: {exc}"
-                        if "timeout" in type(exc).__name__.casefold() or "timeout" in str(exc).casefold():
-                            spider.scan_timeout = True
-                        spider._error_messages.append(spider._runner_error)
                     log.error("[SCAN-DEBUG][%s] CRAWL_ABORT timeout=%ss error=%s",
                               job.get("source"), timeout_s, exc)
                     try:
@@ -334,10 +341,7 @@ def run_jobs(jobs):
 
             if feed_missing:
                 if debug["failure_class"] is None:
-                    if not debug.get("start_entered"):
-                        debug["failure_class"] = "REQUEST_PIPELINE_FAILURE"
-                    else:
-                        debug["failure_class"] = "STORAGE_FAILURE"
+                    debug["failure_class"] = "UNKNOWN_FAILURE"
                 debug["status"] = "error"
                 debug["error_messages"].append("feed_missing")
             else:
@@ -354,20 +358,6 @@ def run_jobs(jobs):
             LAST_RUN_DEBUG.append(debug)
             log.info("[SCAN-DEBUG][%s] DEBUG_REPORT %s",
                      job["source"], json.dumps(debug, ensure_ascii=False, default=str))
-
-        # A reactor-level failure is one infrastructure failure, not a failure
-        # of every source. Keep it as one explicit diagnostic entry instead of
-        # copying UNKNOWN_FAILURE to all crawlers that happened to be prepared.
-        if process_start_error:
-            LAST_RUN_DEBUG.append({
-                "source": "scrapy_runner",
-                "job_id": None,
-                "status": "error",
-                "failure_class": "UNKNOWN_FAILURE",
-                "runner_scope": "reactor",
-                "runner_error": f"{type(process_start_error).__name__}: {process_start_error}",
-                "error_messages": [f"{type(process_start_error).__name__}: {process_start_error}"],
-            })
 
         # Attach explicit runner errors only when a crawler itself has failed.
         # This keeps valid items from one crawler usable if another crawler dies.

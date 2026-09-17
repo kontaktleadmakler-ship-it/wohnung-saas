@@ -8,7 +8,7 @@ from collections import defaultdict
 
 import db
 from logging_setup import configure_logging
-from matching import listing_fingerprint, match_listing
+from matching import listing_fingerprint, score_listing
 from telegram import send_telegram, format_match_message
 from email_notifier import send_email, format_match_email, is_configured as email_configured
 from scrapers.registry import get_scraper
@@ -20,8 +20,12 @@ configure_logging()
 log = logging.getLogger("worker")
 
 POLL_INTERVAL_SECONDS = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
-# Benachrichtigungen werden für jedes Listing verschickt, das die expliziten
-# Profilkriterien erfüllt. Es gibt keine zusätzliche Score-Schwelle.
+# Beeinflusst nur, ob eine Telegram-Benachrichtigung verschickt wird - nicht,
+# ob ein Match in der DB gespeichert wird. Ein Match mit Score < MIN_NOTIFY_SCORE
+# landet trotzdem in `matches` und erscheint im Dashboard (Default min_score=0
+# dort zeigt alle). "Keine Treffer" im Dashboard trotz gesetzter MIN_NOTIFY_SCORE
+# deutet daher eher auf einen leeren Scan als auf diese Schwelle hin.
+MIN_NOTIFY_SCORE = max(0, min(100, int(os.getenv("MIN_NOTIFY_SCORE", "75"))))
 # Sicherheitslimit für kleine Render-Instanzen: nicht hunderte Listings
 # aus einem Portal auf einmal in Playwright/Python weiterreichen.
 MAX_CANDIDATES_PER_SOURCE = max(0, int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "0")))
@@ -105,23 +109,25 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
 
         profile = profiles_by_id[pid]
         payload = dict(item.__dict__)
-        reasons = match_listing(payload, profile)
-        if reasons is None:
+        result = score_listing(payload, profile)
+        if result is None:
             reason = payload.get("_exclude_reason", "other")
             stats["excluded"][reason] += 1
             continue
 
         stats["matched"] += 1
-        notification_state = db.save_match(listing_id, pid, reasons)
+        score, components, reasons = result
+        notification_state = db.save_match(listing_id, pid, score, components, reasons)
 
-        should_notify = (is_new or stored_listing.get("last_status") in {"UPDATED", "MISSING"})
+        should_notify = (is_new or notification_state.get("score_improved") or stored_listing.get("last_status") in {"UPDATED", "MISSING"})
         if should_notify and not is_new:
             db.reset_match_notifications(listing_id, pid)
             notification_state["telegram_notified"] = False
             notification_state["email_notified"] = False
-        if should_notify or not notification_state.get("notified"):
+        if score >= MIN_NOTIFY_SCORE and (should_notify or not notification_state.get("notified")):
             msg = format_match_message(
                 profile["name"],
+                score,
                 item.title,
                 item.price_total or item.price,
                 item.rooms,
@@ -141,7 +147,7 @@ def process_listing(item, profiles_by_id, profile_ids, profile_stats):
 
             if email_configured() and not notification_state.get("email_notified"):
                 subject, text, html_body = format_match_email(
-                    profile["name"], item.title,
+                    profile["name"], score, item.title,
                     item.price_total or item.price, item.rooms,
                     item.size, item.address, item.url, item.source,
                     price_total=item.price_total,
@@ -256,9 +262,9 @@ def run_once(profile_id=None):
         _update_scan_state(scan_run_id, progress={"jobs_total": len(work), "jobs_completed": 0, "jobs": job_snapshot})
 
         if not work:
-            funnel = {"per_source": {}, "per_profile": {}, "source_errors": [],
-                      "source_empty": [], "source_unavailable": [], "scraped_total": 0,
-                      "unique_total": 0, "stored_items": 0, "storage_errors": 0,
+            funnel = {"per_source": {}, "per_profile": {}, "scan_status": "finished", "source_errors": [],
+                      "source_empty": [], "source_unavailable": [], "source_robots_blocked": [],
+                      "scraped_total": 0, "unique_total": 0, "stored_items": 0, "storage_errors": 0,
                       "profiles_count": len(profiles), "jobs_count": 0, "scrapy_debug": []}
             db.save_scan_run(funnel, time.monotonic() - started, started_at=scan_started_at)
             return {"jobs": 0, "listings": 0}
@@ -267,6 +273,11 @@ def run_once(profile_id=None):
         source_errors = []
         source_empty = []
         source_unavailable = []
+        # robots.txt-blocked sources are a distinct, expected state, not a
+        # scraper bug: they must never look like a successful empty source,
+        # but they also must not count as a "real" failure that drags the
+        # whole scan down to scan_status="failed" (see below).
+        source_robots_blocked = []
         all_results = []
 
         try:
@@ -275,8 +286,10 @@ def run_once(profile_id=None):
             debug_by_job = {str(x.get("job_id")): x for x in statuses if x.get("job_id") is not None}
             for status in statuses:
                 failure = status.get("failure_class")
-                if status.get("status") in {"source unavailable", "unavailable"} or failure == "SOURCE_UNAVAILABLE":
+                if status.get("status") == "SOURCE_UNAVAILABLE":
                     source_unavailable.append(status.get("source"))
+                elif failure == "ROBOTS_BLOCKED":
+                    source_robots_blocked.append(status.get("source"))
                 elif failure:
                     source_errors.append({
                         "source": status.get("source"), "job_id": status.get("job_id"),
@@ -291,7 +304,12 @@ def run_once(profile_id=None):
                          source, len(listings), failure)
                 total_for_source = len(listings)
                 source_counts[source] += total_for_source
-                if not listings and not failure:
+                if failure == "ROBOTS_BLOCKED":
+                    # Already recorded in source_robots_blocked above; do not
+                    # also reclassify this as PARSER_FAILURE or a generic
+                    # "failed" source_health entry.
+                    db.update_source_health(source, status="robots_blocked", result_count=0, parser_ok=True, duration_seconds=debug.get("duration_seconds"), error=failure)
+                elif not listings and not failure:
                     # An empty result is only legitimate when the spider
                     # completed a real result page and its parser reported a
                     # healthy page structure. The runner encodes that as
@@ -303,32 +321,57 @@ def run_once(profile_id=None):
                         source_errors.append({"source":source,"job_id":debug.get("job_id"),"failure_class":"PARSER_FAILURE"})
                         db.update_source_health(source, status="failed", result_count=0, parser_ok=False, duration_seconds=debug.get("duration_seconds"), error="zero-results page not validated")
                 else:
-                    if failure == "SOURCE_UNAVAILABLE":
-                        health_status = "unavailable"
-                    elif failure in {"ROBOTS_BLOCKED", "HTTP_403", "HTTP_429"} or debug.get("blocked_pages", 0):
-                        health_status = "blocked"
-                    else:
-                        health_status = "failed" if failure else "finished"
-                    db.update_source_health(
-                        source, status=health_status, result_count=total_for_source,
-                        parser_ok=not bool(failure), blocked=bool(debug.get("blocked_pages", 0)),
-                        duration_seconds=debug.get("duration_seconds"), error=(failure or None),
-                    )
+                    db.update_source_health(source, status="blocked" if failure in {"HTTP_403","HTTP_429"} or debug.get("blocked_pages",0) else "failed" if failure else "finished", result_count=total_for_source, parser_ok=not bool(failure), blocked=bool(debug.get("blocked_pages",0)), duration_seconds=debug.get("duration_seconds"), error=(failure or None))
 
-            job_snapshot = [
-                {**x, "status": "failed" if any(str(e.get("job_id")) == x["job_id"] for e in source_errors)
-                 else "finished"}
-                for x in job_snapshot
-            ]
+            def _job_status(x):
+                if any(str(e.get("job_id")) == x["job_id"] for e in source_errors):
+                    return "failed"
+                if x.get("source") in set(source_robots_blocked):
+                    return "robots_blocked"
+                if x.get("source") in set(source_unavailable):
+                    return "unavailable"
+                return "finished"
+            job_snapshot = [{**x, "status": _job_status(x)} for x in job_snapshot]
             _update_scan_state(scan_run_id, progress={"jobs_total": len(work),
                                                        "jobs_completed": len(work),
                                                        "jobs": job_snapshot})
-        except Exception:
+        except Exception as exc:
             log.exception("Scrapy-Gesamtlauf fehlgeschlagen")
-            source_errors.extend(
-                {"source": job[0], "job_id": str(i), "failure_class": "UNKNOWN_FAILURE"}
-                for i, job in enumerate(work)
-            )
+            # A crash in run_scrapy_jobs() itself (before it could return its
+            # per-source results) must NOT discard whatever granular failure
+            # telemetry individual crawlers already produced before the
+            # crash - overwriting everything with a blanket UNKNOWN_FAILURE
+            # is exactly the bug that made /scan/diagnostics show
+            # UNKNOWN_FAILURE for every source regardless of the real,
+            # already-known cause (robots block, HTTP 403, parser failure,
+            # ...). Reuse get_last_run_status(): the runner appends each
+            # crawler's debug report as soon as that crawler finishes, so it
+            # can hold real data even if a later job or the aggregation step
+            # afterwards is what actually raised.
+            known = {
+                str(x.get("job_id")): x
+                for x in get_last_run_status()
+                if x.get("job_id") is not None and (x.get("failure_class") or x.get("status") == "SOURCE_UNAVAILABLE")
+            }
+            for i, job in enumerate(work):
+                jid = str(i)
+                prior = known.get(jid)
+                if prior and prior.get("status") == "SOURCE_UNAVAILABLE":
+                    source_unavailable.append(job[0])
+                elif prior and prior.get("failure_class") == "ROBOTS_BLOCKED":
+                    source_robots_blocked.append(job[0])
+                elif prior and prior.get("failure_class"):
+                    source_errors.append({"source": job[0], "job_id": jid, "failure_class": prior["failure_class"]})
+                else:
+                    # Genuinely no telemetry exists for this job - it never
+                    # started, or the crash happened before any crawler for
+                    # it ran. UNKNOWN_FAILURE is correct here, but also
+                    # record the runner exception itself so the real crash
+                    # is visible instead of just the label.
+                    source_errors.append({
+                        "source": job[0], "job_id": jid, "failure_class": "UNKNOWN_FAILURE",
+                        "runner_error": f"{type(exc).__name__}: {exc}",
+                    })
             all_results = []
 
         total = sum(len(listings) for _profile_ids, listings in all_results)
@@ -353,17 +396,8 @@ def run_once(profile_id=None):
         if storage_errors:
             source_errors.append({"source": "storage", "job_id": None, "failure_class": "STORAGE_FAILURE"})
 
-        # A source is successful when at least one genuine result page was
-        # validated. This is intentionally independent of whether page 2+
-        # timed out, because those later pages are best-effort.
-        successful_sources = {
-            str(d.get("source")) for d in get_last_run_status()
-            if d.get("source")
-            and not d.get("failure_class")
-            and d.get("result_page_valid") is True
-        }
-
         # Only a fully successful source may transition unseen listings to MISSING.
+        successful_sources={str(d.get("source")) for d in get_last_run_status() if d.get("source") and not d.get("failure_class") and d.get("result_page_valid") is True}
         seen_by_source=defaultdict(set)
         for _pids, listings in all_results:
             for item in listings:
@@ -374,18 +408,40 @@ def run_once(profile_id=None):
                 db.mark_listings_missing(source, seen_by_source.get(source,set()), scan_started_at)
             except Exception:
                 log.exception("Lifecycle-Missing-Markierung für %s fehlgeschlagen", source)
-        # A valid empty source is still a successful source. Scan status must
-        # not depend on whether any listing happened to match a profile.
-        if source_errors:
-            scan_status = "partial" if successful_sources else "failed"
+
+        # Per-source classification for scan_status, matching the spec:
+        # finished = every attempted source succeeded; partial = at least
+        # one succeeded and at least one failed/unavailable/robots-blocked;
+        # failed = no attempted (i.e. not unavailable) source succeeded.
+        # SOURCE_UNAVAILABLE sources are never "attempted" - a permanently
+        # disabled/robots-forbidden source must not drag a scan from
+        # "finished" to "partial" just because it exists in a profile.
+        failed_job_ids = {str(e.get("job_id")) for e in source_errors if e.get("job_id") is not None}
+        robots_blocked_job_ids = {
+            str(idx) for idx, (source, *_r) in enumerate(work)
+            if source in set(source_robots_blocked)
+        }
+        unavailable_job_ids = {
+            str(idx) for idx, (source, *_r) in enumerate(work)
+            if source in set(source_unavailable)
+        }
+        attempted_job_ids = {str(idx) for idx in range(len(work))} - unavailable_job_ids
+        not_ok_job_ids = (failed_job_ids | robots_blocked_job_ids) & attempted_job_ids
+        succeeded_job_ids = attempted_job_ids - not_ok_job_ids
+        if not attempted_job_ids or not succeeded_job_ids:
+            scan_status = "failed"
+        elif not_ok_job_ids:
+            scan_status = "partial"
         else:
             scan_status = "finished"
+
         funnel = _log_and_build_funnel(profiles_by_id, profile_stats, dict(source_counts))
         funnel.update({
             "scan_status": scan_status,
             "source_errors": sorted(source_errors, key=lambda x: (str(x.get("source")), str(x.get("job_id")))),
             "source_empty": sorted(set(source_empty)),
             "source_unavailable": sorted(set(source_unavailable)),
+            "source_robots_blocked": sorted(set(source_robots_blocked)),
             "scraped_total": total,
             "unique_total": processed,
             "stored_items": processed - storage_errors,
@@ -416,15 +472,16 @@ def run_once(profile_id=None):
 
 def worker_loop():
     log.info(
-        "Konfiguration: MONGODB_URI=%s, TELEGRAM=%s, EMAIL=%s, POLL=%ss",
+        "Konfiguration: MONGODB_URI=%s, TELEGRAM=%s, POLL=%ss, MIN_NOTIFY_SCORE=%s",
         "gesetzt" if os.getenv("MONGODB_URI") else "FEHLT",
         "gesetzt" if os.getenv("TELEGRAM_BOT_TOKEN") else "nicht gesetzt",
         "gesetzt" if email_configured() else "nicht gesetzt",
-        POLL_INTERVAL_SECONDS,
+        POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
     )
     log.info(
-        "Worker gestartet (pid=%s): poll_interval=%ss, log_level=%s",
-        os.getpid(), POLL_INTERVAL_SECONDS, os.getenv("LOG_LEVEL", "INFO"),
+        "Worker gestartet (pid=%s): poll_interval=%ss, min_notify_score=%s, log_level=%s",
+        os.getpid(), POLL_INTERVAL_SECONDS, MIN_NOTIFY_SCORE,
+        os.getenv("LOG_LEVEL", "INFO"),
     )
     db.init_db()
     db.cleanup_scan_runs()
@@ -478,19 +535,6 @@ def run_once_and_heartbeat(profile_id=None):
     try:
         db.init_db()
         log.info("SCRAPER: DB initialized")
-        # The Render cron service is stateless. Respect the shared MongoDB
-        # pause/resume switch so Telegram /pause also stops future cron scans.
-        # Only scheduled/cron scans obey the automatic-scan pause switch.
-        # Dashboard-triggered manual scans must ALWAYS run, including a manual
-        # scan for all profiles (profile_id=None). Previously the missing
-        # SCAN_TRIGGER defaulted to "cron", so ENABLE_AUTO_SCAN=false caused
-        # every manual full scan to exit successfully without scraping.
-        scan_trigger = os.getenv("SCAN_TRIGGER", "manual").strip().lower()
-        if profile_id is None and scan_trigger == "cron":
-            if not db.get_auto_scan_enabled(default=os.getenv("ENABLE_AUTO_SCAN", "true").strip().lower() in {"1", "true", "yes", "on"}):
-                log.info("SCRAPER: automatic scan is paused; cron cycle skipped")
-                db.record_worker_heartbeat(duration_seconds=0, pid=os.getpid(), poll_interval_seconds=POLL_INTERVAL_SECONDS)
-                return {"jobs": 0, "listings": 0, "paused": True}
         try:
             db.cleanup_scan_runs()
             deleted = db.cleanup_old_listings(days=int(os.getenv("LISTING_RETENTION_DAYS", "60")))
