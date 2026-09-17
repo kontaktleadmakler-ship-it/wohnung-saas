@@ -320,7 +320,7 @@ class PortalSpider(scrapy.Spider):
             meta.update({"playwright":True,
                          "playwright_page_goto_kwargs": {
                              "wait_until": self.playwright_wait_until,
-                             "timeout": int(os.getenv(self.playwright_nav_timeout_env, "15000")),
+                             "timeout": int(os.getenv(self.playwright_nav_timeout_env, "30000")),
                          },
                          "playwright_page_methods":[
                 PageMethod("evaluate", """
@@ -337,7 +337,7 @@ class PortalSpider(scrapy.Spider):
                         }
                     }
                 """),
-                PageMethod("wait_for_timeout", int(os.getenv(self.playwright_wait_ms_env, "1200"))),
+                PageMethod("wait_for_timeout", int(os.getenv(self.playwright_wait_ms_env, "10000"))),
             ]})
         return scrapy.Request(url,callback=self.parse,errback=self.errback,meta=meta,headers=headers,dont_filter=True)
 

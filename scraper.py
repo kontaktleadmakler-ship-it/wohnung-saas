@@ -14,7 +14,7 @@ from email_notifier import send_email, format_match_email, is_configured as emai
 from scrapers.registry import get_scraper
 from wohnungsradar_scrapy.adapters import run_scrapy_jobs, get_last_run_status
 from scrapers.models import SearchParams
-from scrapers.regions import STATE_CITY_SAMPLES
+from scrapers.regions import STATE_CITY_SAMPLES, LOCATION_CITY_ALIASES
 
 configure_logging()
 log = logging.getLogger("worker")
@@ -39,19 +39,28 @@ def _locations(profile):
     raw = profile.get("districts") or ""
     vals = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
     if vals:
-        return vals
+        # A profile field named "Bezirke/Ort" may contain a district rather
+        # than a city. Never turn such a value into a broken portal slug.
+        locations = []
+        seen = set()
+        for value in vals:
+            key = value.casefold()
+            city = LOCATION_CITY_ALIASES.get(key, value)
+            if city.casefold() not in seen:
+                seen.add(city.casefold())
+                locations.append(city)
+        return locations
+
     regions = [str(code).strip().upper() for code in (profile.get("regions") or []) if str(code).strip()]
     if not regions or "DE" in regions:
-        # Bei DE bleibt der Standort leer; _run_job setzt nationwide=True und die
-        # jeweiligen Scraper wählen dafür ihre deutschlandweiten Portal-URLs.
         return []
 
     locations = []
     seen = set()
     for code in regions:
         for city in STATE_CITY_SAMPLES.get(code, []):
-            if city not in seen:
-                seen.add(city)
+            if city.casefold() not in seen:
+                seen.add(city.casefold())
                 locations.append(city)
     return locations
 
@@ -82,9 +91,12 @@ def _update_scan_state(run_id, **fields):
 def _run_job(job):
     source, regions, locations, profile_ids = job
     log.info("[%s] Scan startet: Profile=%s, Regionen=%s, Orte=%s", source, sorted(profile_ids), sorted(regions), sorted(locations))
-    if db.source_circuit_state(source) == "OPEN":
-        log.warning("[%s] Circuit breaker OPEN - Quelle vorübergehend pausiert", source)
-        return source, profile_ids, []
+    circuit = db.source_circuit_state(source)
+    if circuit == "OPEN":
+        # Ein Portal darf nach transienten Fehlern nicht dauerhaft aus der
+        # Wohnungssuche verschwinden. Wir versuchen die Quelle erneut; die
+        # Health-Metriken bleiben erhalten und zeigen weiterhin die Fehler.
+        log.warning("[%s] Circuit breaker OPEN - Quelle wird für diesen Scan erneut versucht", source)
     scraper = get_scraper(source)
     params = SearchParams(
         nationwide=("DE" in regions and not locations),
@@ -353,24 +365,25 @@ def run_once(profile_id=None):
         if storage_errors:
             source_errors.append({"source": "storage", "job_id": None, "failure_class": "STORAGE_FAILURE"})
 
-        # Only a fully successful source may transition unseen listings to MISSING.
-        seen_by_source=defaultdict(set)
-        for _pids, listings in all_results:
-            for item in listings:
-                if item.source in successful_sources:
-                    seen_by_source[item.source].add(item.external_id)
-        for source in successful_sources:
-            try:
-                db.mark_listings_missing(source, seen_by_source.get(source,set()), scan_started_at)
-            except Exception:
-                log.exception("Lifecycle-Missing-Markierung für %s fehlgeschlagen", source)
-
         successful_sources = {
             str(d.get("source")) for d in get_last_run_status()
             if d.get("source")
             and not d.get("failure_class")
             and d.get("result_page_valid") is True
         }
+
+        # Only a fully successful source may transition unseen listings to MISSING.
+        seen_by_source = defaultdict(set)
+        for _pids, listings in all_results:
+            for item in listings:
+                if item.source in successful_sources:
+                    seen_by_source[item.source].add(item.external_id)
+        for source in successful_sources:
+            try:
+                db.mark_listings_missing(source, seen_by_source.get(source, set()), scan_started_at)
+            except Exception:
+                log.exception("Lifecycle-Missing-Markierung für %s fehlgeschlagen", source)
+
         # A valid empty source is still a successful source. Scan status must
         # not depend on whether any listing happened to match a profile.
         if source_errors:
